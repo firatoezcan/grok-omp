@@ -187,11 +187,13 @@ grok-build/                       # our fork
 ├── upstream/                     # remote tracking xai-org/grok-build
 ├── HEAD                          # our commits on top of an upstream snapshot
 ├── crates/codegen/xai-grok-pager/src/acp/external.rs     # ours, new path
-├── crates/…/bridge/ or bridge/   # ours
-└── patches/
-    ├── MANIFEST.md               # the §6 intervention table, machine-checked
-    └── check-drift.sh            # CI gate: our diff surface == allowlist
+├── bridge/                       # ours
+└── scripts/
+    └── check-drift.sh            # CI gate: our diff surface == allowlist (§6)
 ```
+
+The §6 intervention table is the manifest; `scripts/check-drift.sh` enforces it and fails
+on a file outside the allowlist or a hook file over its line budget.
 
 Rules:
 - **Never touch the generated root `Cargo.toml`.**
@@ -206,7 +208,7 @@ Rules:
 git fetch upstream main
 git log --oneline HEAD..upstream/main | head        # what changed
 git merge --no-commit upstream/main                 # or: rebase our commits
-bash patches/check-drift.sh                         # our surface must still match MANIFEST
+bash scripts/check-drift.sh                         # our surface must still match the §6 manifest
 cargo check -p xai-grok-pager -p xai-grok-pager-bin
 ```
 
@@ -232,7 +234,9 @@ Everything we add or change. Nothing else may differ from upstream.
 
 Note: an alternative "separate crate" design was evaluated and rejected — it needs a pager `Cargo.toml` dependency line *and* cannot reach `AgentEndpoint`/`initialize_connection` (both `pub(in crate::acp)`), forcing ~110 lines of duplicated bridge code.
 
-`patches/check-drift.sh` asserts: `git diff --stat upstream/main` lists only files #1–#7, and `git diff upstream/main -- <each upstream file>` contains no hunk outside the recorded line ranges.
+`scripts/check-drift.sh` asserts that every path differing from `upstream/main` is either one of the
+files #1–#7, an owned path (`bridge/`, `tapes/`, `scripts/`, `SPEC.md`), or the new `acp/external.rs`,
+and that the hook files stay inside their line budget. It currently reports `+18/-1` against a budget of 40.
 
 ---
 
@@ -262,27 +266,31 @@ Note: an alternative "separate crate" design was evaluated and rejected — it n
 
 ### 7.3 Landmines
 
-1. **Client delegation.** OMP calls `fs/read_text_file`, `fs/write_text_file` and `terminal/*` **when the client advertises those capabilities**. The Grok pager advertises `terminal` but `acp_handler` handles only five variants and swallows the rest with `_ => false` (`acp_handler/mod.rs:468`), dropping `response_tx` → the agent's request fails. **The adapter must rewrite the client capabilities in `initialize` so OMP never delegates.** Do not rely on OMP-side config for this.
-2. **No `_meta` on `initialize`.** `meta.modelState` / `meta.availableCommands` are absent; OMP carries models in `session/new.configOptions` and commands in a later `available_commands_update`. The pager degrades gracefully, but `/model` and command autocomplete will be empty. Adapter-side translation is the cheap fix.
-3. **No `_meta["x.ai/tool"]` on tool calls.** Grok's exact-identity decode (`tool_taxonomy.rs:186`, strict `version == TOOL_META_VERSION`) needs it; absence degrades to generic rows.
-4. **Frame correlation.** ACP is JSON-RPC 2.0; a rewriting proxy is safe **only if** it preserves `id` values and forwards unrecognised frames verbatim, keeps whole lines (never buffers across lines), and preserves cross-direction interleaving. OMP uses newline-delimited JSON with per-side numeric ids.
+1. **Client delegation.** ✅ **Resolved by the adapter, measured with a control group (2026-09-11).** OMP calls `fs/read_text_file`, `fs/write_text_file` and `terminal/*` **when the client advertises those capabilities** (`src/session/client-bridge.ts:31-33` gates each bridge method on exactly that). The Grok pager advertises `terminal` but its `acp_handler` handles only five variants and swallows the rest with `_ => false` (`acp_handler/mod.rs:468`), dropping `response_tx` → the agent's request fails.
+   - Evidence (`bridge/drive.mjs`, one recorded turn: read + bash): with the hostile capability set advertised and hygiene **off**, the agent delegated `fs/read_text_file` + `terminal/{create,wait_for_exit,output,release}` twice, ran 5 tool calls instead of 2, and its bash tool reported an internal error while the read came back empty — the client's answer, not the file. With hygiene **on**: zero delegations, 2 tool calls, a clean turn. 588 frames vs 59.
+   - The adapter deletes `fs`, `terminal` and `auth.terminal` from the client's `initialize` capabilities. Dropping `auth.terminal` also removes OMP's terminal auth method, leaving the single non-interactive `agent` method that §8.2a requires. Do not rely on OMP-side config for this.
+2. **No `_meta` on `initialize`.** `meta.modelState` / `meta.availableCommands` are absent; OMP carries models in `session/new.configOptions`. The pager degrades gracefully, but `/model` and command autocomplete stay empty — see §7.4 for why the adapter does **not** synthesize them.
+3. **No `_meta["x.ai/tool"]` on tool calls.** ✅ Injected by the adapter. Grok's exact-identity decode (`tool_taxonomy.rs:186`, strict `version == TOOL_META_VERSION`) needs the envelope; OMP emits nothing, so the adapter stamps `CanonicalToolMeta` v1. Note for anyone chasing render bugs: the **TUI** does not read this key — `tracker.rs` dispatches on `kind`, `title` and `raw_input` — only the headless reducer does (`headless/reducer/mod.rs:201-247`). The stamp is for `grok --headless`, not for the pane.
+4. **Frame correlation.** ACP is JSON-RPC 2.0; a rewriting proxy is safe **only if** it preserves `id` values and forwards unrecognised frames verbatim, keeps whole lines (never buffers across lines), and preserves cross-direction interleaving. OMP uses newline-delimited JSON with per-side numeric ids. The adapter honours all four; `createReplay` re-emits recorded frames in `seq` order gated on the client's own progress, so a replayed stream keeps the original interleaving instead of flattening it into "everything on prompt".
 
-### 7.4 Fidelity matrix (target, to be measured in Stage 3)
+### 7.4 Fidelity matrix (measured 2026-09-11, live `omp acp` + adapter + fork TUI)
 
-| Surface | Day 1 | Gap → fix |
+| Surface | State | Evidence / reason |
 |---|---|---|
-| Assistant text stream | ✅ | — |
-| Thinking stream | ✅ | — |
-| Tool rows: read / edit / bash / grep / fetch | ✅ by `kind` | — |
-| Edit diff hunks | ✅ via `ToolCallContent::Diff` | prefer Grok's `raw_output` shape if hunks are richer |
-| Permission cards | ✅ | — |
-| Plan pane | ✅ (`SessionUpdate::Plan` — pager ignores it in tracker, renders elsewhere; verify) | confirm |
-| Model picker | ⚠️ empty | adapter: synthesize `meta.modelState` from `configOptions` |
-| Slash-command autocomplete | ⚠️ empty | adapter: synthesize `meta.availableCommands` |
-| Tool identity / icons | ⚠️ generic | adapter: `_meta["x.ai/tool"]` v1 |
-| list_dir, memory search, MCP search/use_tool, subagent message | ⚠️ `Other` blocks | adapter: Grok-shaped `raw_input.variant` |
-| Subagent panes | ❌ | needs child-session `x.ai/session_notification` + `run_in_background` Task shaping |
-| Workflows, goals, background tasks, hooks UI, memory UI, recap, DiffReview, AutoCompact | ❌ | Grok's private `x.ai/session/update` rail (~70 variants) — **no OMP producer at any layer**. Out of scope; panels stay empty. |
+| Assistant text stream | ✅ | rendered live ("done") |
+| Thinking stream | ✅ | 4155 chars of `agent_thought_chunk` in the shapes probe |
+| Tool rows: read / execute / search / edit | ✅ by `kind` | OMP's `mapToolKind` already yields `read`/`execute`/`search`/`edit` for the builtins; Grok's tracker dispatches on the same values |
+| Whole-file writes | ✅ | `write` → `raw_input.variant = "Write"`; the TUI renders `◆ Creating bridge-probe.txt` instead of an edit row |
+| Web search | ✅ | `web_search` → `kind: "search"` + `variant: "WebSearch"`; OMP's native `fetch` would have rendered as a URL fetch |
+| Edit diff hunks | ✅ | `ToolCallContent::Diff` from OMP feeds Grok's `extract_edit_hunks` |
+| Permission cards | ✅ | `session/request_permission` arrives and is answered |
+| Model picker | ⚠️ empty | OMP puts models in `session/new.configOptions` (2 models, one current); `meta.modelState` is absent. **Not synthesized**: `configOptions` is an ACP v2-shaped surface and a wrong translation would silently pin the wrong model. The picker reads "unknown"; `/model` in OMP still works |
+| Slash-command autocomplete | ⚠️ empty | no producer at all: OMP never emits `available_commands_update` in a recorded session and rejects `x.ai/commands/list`. Nothing truthful to relay — the adapter relays rather than invents |
+| Tool identity (`_meta["x.ai/tool"]` v1) | ✅ | stamped on every classified tool call (headless path; the TUI ignores it — see landmine 3) |
+| `todo` / `task` rows | ⚠️ visible as generic rows | deliberately **not** tagged. Grok suppresses `todo_write` and `Task` rows from scrollback and renders them in a todo pane / subagent pane; nothing in OMP feeds those private panes, so tagging would hide the call entirely. A visible row is the better degradation |
+| Entitlement probes (`x.ai/billing`, `auth/check_subscription`, `bundle/status`, `marketplace/list`, `prompt_history`, `suggestPrompt`) | ❌ not answered | OMP rejects all nine `x.ai/*` ext methods with `-32603`. **Deliberately not intercepted**: the pager decodes a successful `check_subscription` reply into `xai_grok_login::AuthMeta` and applies it as authoritative (`dispatch/billing.rs:375-395`), so a fabricated empty result would assert an entitlement state rather than report "unknown". Measured benign: in the live run the check failed twice, the gate stayed `gated:false`, and the turn completed. An error while a turn is *pending* does fail that turn — reachable in practice only with sub-millisecond turn latency, which is how the replay lane triggers it |
+| `list_dir`, memory, MCP search/use-tool, subagent message | ⚠️ generic `Other` blocks | shaping here would need per-payload Grok shapes; not attempted, and no signature was observed for them in the recorded turns |
+| Subagent panes, workflows, goals, background tasks, hooks UI, memory UI, recap, DiffReview, AutoCompact | ❌ | Grok's private `x.ai/session/update` rail (~70 variants) — **no OMP producer at any layer**. Out of scope; panels stay empty |
 
 ---
 
@@ -367,7 +375,10 @@ grok-omp/                      # our repo (private) — upstream tree at the roo
 ├── crates/ …                  # upstream crates, ≤5 files carry a hook (see §6)
 ├── crates/codegen/xai-grok-pager/src/acp/external.rs   # ours, new path
 ├── SPEC.md                    # this document
-├── bridge/                    # adapter + recorder + replay agent (Bun)
+├── bridge/
+│   ├── adapter.mjs            # the ACP adapter: hygiene, shaping, tape, replay
+│   ├── drive.mjs              # scripted ACP client: answers §7.3 questions from observation
+│   └── test-agent.mjs         # minimal stub agent for the transport seam (M2)
 ├── tapes/                     # *.acptape fixtures
 └── scripts/                   # run-omp-grok.sh, check-drift.sh, sync-upstream.sh
 ```
@@ -481,7 +492,11 @@ A **tee inside our own path** is primary (the adapter records what it forwards),
 - [x] **M2** `acp/external.rs` + `AgentKind::External` + `--agent-command` landed; replay agent renders a full recorded session in the TUI; with the flag unset → byte-identical to upstream
   - verified 2026-09-10: pager spawns the child, `initialize` round-trips, `Connected use_leader=false embedded_fallback=false`, prompt → streamed text + a tool row rendered in the TUI, footer `Logged in with API key`, **no sign-in card**
 - [x] **M2** `AgentKind` match enumeration documented (all match sites, not a sample): the enum lives in `xai-grok-telemetry/src/startup.rs`; the only exhaustive match is `app/startup_failure/render.rs`. Dispatch sites are `app/mod.rs` (connect + fallback) and `headless.rs`.
-- [ ] **M3** adapter wired to real `omp acp`; live end-to-end prompt rendered
+- [x] **M3** adapter wired to real `omp acp`; live end-to-end prompt rendered
+  - `bridge/adapter.mjs` (capability hygiene, `x.ai/tool` v1 stamping, kind/variant precision, tape record, replay) driven by `--agent-command`; verified 2026-09-11 against the real model: read row, `◆ Creating bridge-probe.txt` (the write variant reaching Grok's "Creating" path), streamed text, "Worked for 4.9s", artifact written, **zero** `fs/*`/`terminal/*` delegations in the pager log
+  - fidelity matrix §7.4 filled in from observation; the gaps that remain are recorded with the reason they are left alone, including two deliberate non-fixes (todo/task suppression, entitlement probes)
+- [x] **M3** C0 green: `bun bridge/adapter.mjs --replay tapes/live-tools.acptape --selfcheck` → 27 client-bound frames replayed byte-identically; proven to fail on a missing reply (id mismatch) and on duplicate/non-contiguous `seq`
+- [x] **M3** replay lane verified end to end: the pager booted against `--replay tapes/live-tools.acptape` in 94 ms with no model and rendered the recorded turn
 - [ ] **M3** C1/C2/C3 green under termctrl; C4 golden frame committed
 - [ ] **M4** fidelity backlog worked in §7.4 order; one upstream sync performed and timed
 
@@ -489,9 +504,9 @@ A **tee inside our own path** is primary (the adapter records what it forwards),
 
 ## 13. Open questions
 
-1. Does `omp acp` advertise `fs`/`terminal` client capabilities today, and can that be turned off without an OMP change? (Stage 1 must answer from observation.)
-2. Does the pager render `SessionUpdate::Plan`, or is plan UI driven only by the private rail? (`tracker.rs` explicitly ignores `Plan`.)
-3. Can OMP's `session/new.configOptions` be translated into Grok's `meta.modelState` shape losslessly (model list, current model, reasoning effort)?
-4. Are OMP's per-tool `rawInput` shapes close enough to Grok's expectations that adapter rewriting is small, or does each tool need bespoke shaping?
-5. Does upstream write `~/.grok/requirements.toml` on a plain install? (Determines whether the version-policy hook is needed at all.)
-6. Is `ffmpeg` installed? (Affects the optional video evidence lane only.)
+1. ~~Does `omp acp` advertise `fs`/`terminal` client capabilities today, and can that be turned off without an OMP change?~~ **Answered 2026-09-11.** It does not advertise them — it *consumes* them. `createAcpClientBridge` enables each bridge method only when the **client** advertises `fs.readTextFile` / `fs.writeTextFile` / `terminal` (`src/modes/acp/acp-client-bridge.ts:31-33`), and there is no OMP-side switch. So the adapter strips them from the client's `initialize`; measured: 9 delegations in the control turn, 0 with hygiene on (§7.3.1).
+2. Does the pager render `SessionUpdate::Plan`, or is plan UI driven only by the private rail? (`tracker.rs` explicitly ignores `Plan`.) — still open; no `Plan` update appeared in the recorded turns, so it is unmeasured rather than answered.
+3. Can OMP's `session/new.configOptions` be translated into Grok's `meta.modelState` shape losslessly (model list, current model, reasoning effort)? — **deferred, not attempted.** The picker stays empty (§7.4) on purpose: a wrong translation would pin the wrong model, and the values differ in kind (`configOptions` is a flat select list; `modelState` carries a chosen model plus reasoning effort).
+4. Are OMP's per-tool `rawInput` shapes close enough to Grok's expectations that adapter rewriting is small, or does each tool need bespoke shaping? — **Answered.** Close: `read`/`edit`/`write` use `path`, `bash` uses `command`, which is exactly what `tracker.rs` reads. Two overrides were needed in total (`write` variant, `web_search` kind+variant); everything else keeps OMP's `kind`. Signatures are matched on `(kind, rawInput shape)` because the ACP frame carries no tool name — OMP's `title` is a human intent sentence whenever the model supplies one.
+5. Does upstream write `~/.grok/requirements.toml` on a plain install? (Determines whether the version-policy hook is needed at all.) — still open.
+6. Is `ffmpeg` installed? (Affects the optional video evidence lane only.) — still open.
