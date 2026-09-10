@@ -27,3 +27,14 @@ use_leader = false
 [diagnostics]
 # Local crash files only; independent of Sentry, which stays inert without a DSN.
 crash_handler = false
+
+[auth]
+# Pin auth to API-key only. With no x.ai key present, `build_auth_methods()`
+# returns an EMPTY list instead of falling through to the interactive
+# `grok.com` / OIDC method, and the pager's `startup_auth_metadata()` derives
+# `needs_login = false` from an empty list — so no sign-in screen is ever shown
+# (app/event_loop.rs:1368 skips the whole login branch).
+#
+# Config-file only: upstream documents that this key cannot be set by remote
+# settings or environment.
+preferred_method = "api_key"

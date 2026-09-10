@@ -14,9 +14,9 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Isolated config/session/cache home, so this never touches a real ~/.grok install.
 export GROK_HOME="${GROK_HOME:-$HOME/.local/share/grok-omp}"
 mkdir -p "$GROK_HOME"
-if [[ ! -f "$GROK_HOME/config.toml" ]]; then
+if [[ ! -f "$GROK_HOME/config.toml" ]] || ! cmp -s "$here/config/config.toml" "$GROK_HOME/config.toml"; then
   install -m 600 "$here/config/config.toml" "$GROK_HOME/config.toml"
-  echo "run-omp-grok: seeded $GROK_HOME/config.toml" >&2
+  echo "run-omp-grok: refreshed $GROK_HOME/config.toml from config/config.toml" >&2
 fi
 
 # Belt and braces: the leader child (if ever spawned) re-reads the environment,
@@ -28,12 +28,19 @@ export GROK_TELEMETRY_TRACE_UPLOAD=false
 export GROK_FEEDBACK_ENABLED=false
 unset SENTRY_DSN GROK_EXTERNAL_OTEL || true
 
-binary="${GROK_PAGER_BINARY:-$here/target/release/xai-grok-pager}"
-if [[ ! -x "$binary" ]]; then
-  echo "run-omp-grok: no binary at $binary" >&2
-  echo "  build it:  cargo build -p xai-grok-pager-bin --release" >&2
+binary="${GROK_PAGER_BINARY:-}"
+if [[ -z "$binary" ]]; then
+  for candidate in "$here/target/release/xai-grok-pager" "$here/target/debug/xai-grok-pager"; do
+    [[ -x "$candidate" ]] && { binary="$candidate"; break; }
+  done
+fi
+if [[ -z "$binary" || ! -x "$binary" ]]; then
+  echo "run-omp-grok: no pager binary found." >&2
+  echo "  build one:  cargo build -p xai-grok-pager-bin --release   (or without --release)" >&2
   exit 1
 fi
+echo "run-omp-grok: $binary" >&2
+echo "run-omp-grok: GROK_HOME=$GROK_HOME" >&2
 
 # --no-leader: never auto-spawn the leader process (a second phone-home process).
 exec "$binary" --no-leader "$@"

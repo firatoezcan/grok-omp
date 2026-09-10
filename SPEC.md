@@ -303,9 +303,31 @@ Ship these as the fork's default config + wrapper script. Collectively they kill
 | A7 | leader auto-spawn (a second phone-home process) | `--no-leader` and `[cli] use_leader = false` (default is already off) |
 | A8 | feedback | `[features] feedback = false`, `GROK_FEEDBACK_ENABLED=false` |
 | A9 | crash files (local only) | `[diagnostics] crash_handler = false` |
-| A10 | **login screen** | OMP returns `authMethods: []` — pager is fail-closed on an empty list (`app/event_loop.rs:1411`: *"do not invent grok.com / auto-start OIDC"*). **Server-side, no pager patch.** |
+| A10 | **login screen** | **Not achievable by config — see §8.2a.** Pinning `[auth] preferred_method = "api_key"` removes the interactive method (`authMethods: []` observed on the wire, no browser, no device flow), but the pager's `eager_auth_or_login_fallback` *forces* `needs_login = true` when the list is empty, so the welcome screen still renders the `PREFERRED_API_KEY_UNAVAILABLE` card. Auth must be neutralized on the agent side, not the config side. |
 | A11 | config isolation | `GROK_HOME=<dir>` |
 | A12 | leader socket isolation | `GROK_LEADER_SOCKET` / `--leader-socket` |
+
+### 8.2a Auth is an agent-side concern (measured, not assumed)
+
+The pager's auth state machine, in order:
+
+1. `startup_auth_metadata(auth_methods)` — `needs_login = methods.first().needs_interactive_login()`, `false` for an empty list (`acp/mod.rs:539-568`).
+2. `bounded_eager_auth(...)` → `eager_auth_or_login_fallback(...)`, which **overrides step 1**:
+
+```rust
+if auth_methods.is_empty() {
+    return (true, None, None, AuthStartMode::Pending, None);   // forced login
+}
+```
+
+3. `event_loop.rs:1368` — `needs_interactive_login = connection.needs_login || force_login`; when true it seeds `AuthState::Pending` and (for an empty list) sets the error copy to the shell's `PREFERRED_API_KEY_UNAVAILABLE` (`auth_method.rs:324`), which the welcome view renders as the "sign in" card.
+
+Consequences:
+
+- **No config switch can suppress it.** An empty method list is treated as a *failed* auth, not as "auth not applicable". The `[auth] preferred_method = "api_key"` pin is still worth keeping (it removes the interactive OAuth method and prevents any browser/device flow), but it is not sufficient.
+- **Therefore the backend owns auth.** A backend that advertises at least one **non-interactive** method and answers `authenticate` successfully leaves `needs_login = false`, so the pager never enters the login state at all. That is adapter policy — exactly the §3 P3 split — and needs no additional pager patch.
+- OMP's own ACP server has no x.ai credential concept; the adapter needs to confirm what it currently advertises and, if necessary, inject a non-interactive method whose `authenticate` is a no-op success.
+- This must be verified with a replay agent (§10.3a) before the first live run, because it is the difference between "boots to a usable prompt" and "boots to a sign-in card".
 
 ### 8.2 Category B — the only real hooks
 
