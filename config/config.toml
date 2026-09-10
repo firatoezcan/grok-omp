@@ -1,0 +1,29 @@
+# Zero-diff x.ai neutralization for the grok-omp fork (SPEC.md §8.1).
+# Seeded into $GROK_HOME/config.toml by scripts/run-omp-grok.sh.
+# Nothing in this file requires a source patch.
+
+[features]
+# Egress master gate. Kills the settings fetch, model-catalog fetch,
+# announcements, campaigns, and every entitlement/allow_access check that
+# hangs off RemoteSettings. User layer wins over managed layer.
+remote_fetch = false
+# Product telemetry + Mixpanel (TelemetryMode::Disabled is already the default;
+# this makes it explicit and survives a future default change).
+telemetry = false
+# Feedback uploads (/feedback and heuristic prompts).
+feedback = false
+
+[telemetry]
+trace_upload = false
+otel_enabled = false
+
+[cli]
+# Never phone home for a new version.
+auto_update = false
+# Never auto-spawn the leader process (a second process with its own auth,
+# settings fetch, telemetry identity and auto-updater).
+use_leader = false
+
+[diagnostics]
+# Local crash files only; independent of Sentry, which stays inert without a DSN.
+crash_handler = false
