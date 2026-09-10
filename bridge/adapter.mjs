@@ -66,7 +66,7 @@ function parseArgs(argv) {
 		hygiene: true,
 		shape: true,
 		mcp: true,
-		quiet: false,
+		allowStale: false,
 	};
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i];
@@ -93,6 +93,9 @@ function parseArgs(argv) {
 			case "--no-mcp":
 				opts.mcp = false;
 				break;
+			case "--allow-stale":
+				opts.allowStale = true;
+				break;
 			case "--quiet":
 				opts.quiet = true;
 				break;
@@ -118,6 +121,7 @@ function helpText() {
   --no-hygiene      do not rewrite client capabilities
   --no-shape        do not rewrite tool-call identity
   --no-mcp          strip mcpServers from session/new (hermetic test fixtures)
+  --allow-stale     replay a tape recorded against a different sourceRev
 `;
 }
 
@@ -425,6 +429,462 @@ const titleById = new Map();
  * Async-iterates the stream, which is the one shape that works for both
  * `Bun.stdin.stream()` and a `Bun.spawn` child's piped stdout.
  */
+
+// ---------------------------------------------------------------------------
+// ext surface: answer the pager's private `x.ai/*` rail from observed state
+// ---------------------------------------------------------------------------
+//
+// The pager drives its settings modal, model picker, tasks pane, and session
+// chrome over a private `x.ai/*` extension rail that OMP does not implement —
+// every such request forwarded to OMP comes back `-32603 Unknown ACP ext
+// method`. This layer answers the rail itself, from state the adapter already
+// observes in the standard ACP stream, so the pager's surfaces populate with
+// real data instead of hanging or erroring.
+//
+// Truthfulness rule (SPEC.md §7.4): answer only what the adapter can derive
+// from frames it actually saw. Where OMP genuinely has no data (billing,
+// subscription, auth, marketplace), return a JSON-RPC error rather than
+// fabricate an entitlement or an empty-but-plausible payload.
+
+/**
+ * Reasoning-effort options the pager's `/effort` picker offers, in the wire
+ * shape `reasoningEfforts` expects (ReasoningEffortOption). OMP's thinking
+ * levels map onto these; "auto" is OMP-specific and surfaced as a no-op effort.
+ */
+const EFFORT_OPTIONS = [
+	{ id: "none", value: "none", label: "None", description: "No extended reasoning" },
+	{ id: "minimal", value: "minimal", label: "Minimal" },
+	{ id: "low", value: "low", label: "Low" },
+	{ id: "medium", value: "medium", label: "Medium", default: true },
+	{ id: "high", value: "high", label: "High" },
+	{ id: "xhigh", value: "xhigh", label: "Xhigh" },
+	{ id: "max", value: "max", label: "Max" },
+];
+
+/** OMP thinking-level values the pager's ReasoningEffort maps onto. */
+const EFFORT_TO_THINKING = {
+	none: "off",
+	minimal: "minimal",
+	low: "low",
+	medium: "medium",
+	high: "high",
+	xhigh: "xhigh",
+	max: "max",
+};
+
+/**
+ * Tracks session/agent state from agent→client frames and answers the pager's
+ * `x.ai/*` extension requests. One instance per live run.
+ */
+class ExtSurface {
+	constructor() {
+		/** session/new result fields we answer from. */
+		this.session = null; // {sessionId, modes}
+		/** mcpServers array the pager sent in session/new params. */
+		this.mcpServers = [];
+		/** Last available_commands_update payload. */
+		this.commands = [];
+		/** Last usage_update payload ({size, used}). */
+		this.usage = null;
+		/** initialize result (agent name/version). */
+		this.agentInfo = null;
+		/** configOptions[id="model"] → SessionModelState source. */
+		this.modelConfig = null;
+		/** configOptions[id="mode"] → current mode. */
+		this.modeConfig = null;
+		/** id → translate(result) for requests forwarded to OMP. */
+		this.pendingTranslated = new Map();
+		/** toolCallId → subagent record for task-tool subagent synthesis. */
+		this.subagents = new Map();
+		this.subagentSeq = 0;
+		/** selector → OMP model metadata (from `omp models --json`). */
+		this.catalog = null;
+		/** Extra client→agent requests to send right after the current one. */
+		this.followUp = [];
+	}
+
+	// -- state capture ------------------------------------------------------
+
+	/**
+	 * Observe an agent→client frame; update tracked state.
+	 * @returns {object[]} extra frames to inject into the client stream after
+	 *   this one (synthesized notifications the pager needs but OMP never sends).
+	 */
+	observeToClient(frame) {
+		const extra = [];
+		if (!frame || typeof frame !== "object") return extra;
+
+		// initialize result → agent identity.
+		if (frame.result?.protocolVersion !== undefined && frame.result?.agentInfo) {
+			this.agentInfo = frame.result.agentInfo;
+		}
+
+		// session/new result → session identity + model catalog.
+		if (frame.result?.sessionId !== undefined && frame.id !== undefined) {
+			this.captureSessionNew(frame.result);
+			// The pager's model picker reads `resp.models` (SessionModelState)
+			// from session/new; OMP omits it. Inject the catalog synthesized from
+			// configOptions so the picker populates on connect, not just on the
+			// models/update notification below.
+			const models = this.modelState();
+			if (frame.result.models === undefined && models) {
+				frame.result.models = models;
+			}
+			// The pager seeds a "Starting session…" MCP row that only
+			// `x.ai/mcp_initialized` clears. OMP never sends it; synthesize it
+			// so the seed resolves instead of animating ~30s then freezing.
+			extra.push(this.notif("_x.ai/mcp_initialized", {
+				sessionId: frame.result.sessionId,
+				mcpToolCount: this.mcpServers.length,
+				elapsedMs: 0,
+			}));
+			// The pager's model picker refreshes on `x.ai/models/update`; OMP
+			// only emits configOptions. Synthesize the model-state notification
+			// so the picker populates without a manual refetch.
+			if (models) extra.push(this.notif("_x.ai/models/update", models));
+		}
+
+		// session/update notifications → commands, usage, config, subagents.
+		const update = frame.params?.update;
+		if (frame.method === "session/update" && update && typeof update === "object") {
+			switch (update.sessionUpdate) {
+				case "available_commands_update":
+					this.commands = update.availableCommands ?? [];
+					break;
+				case "usage_update":
+					this.usage = { size: update.size, used: update.used };
+					break;
+				case "config_option_update":
+					this.captureConfigOptions(update.configOptions);
+					break;
+				case "tool_call":
+					this.observeToolCallStart(update, extra);
+					break;
+				case "tool_call_update":
+					this.observeToolCallEnd(update, extra);
+					break;
+			}
+		}
+		return extra;
+	}
+
+	/** Record the session/new params the pager sent (mcpServers, cwd). */
+	observeToAgent(frame) {
+		if (frame?.method === "session/new" && frame.params) {
+			this.mcpServers = Array.isArray(frame.params.mcpServers) ? frame.params.mcpServers : [];
+			this.sessionCwd = frame.params.cwd ?? null;
+		}
+	}
+
+	captureSessionNew(result) {
+		this.session = {
+			sessionId: result.sessionId,
+			modes: result.modes ?? null,
+		};
+		this.captureConfigOptions(result.configOptions);
+	}
+
+	captureConfigOptions(configOptions) {
+		if (!Array.isArray(configOptions)) return;
+		for (const opt of configOptions) {
+			if (opt?.id === "model") this.modelConfig = opt;
+			if (opt?.id === "mode") this.modeConfig = opt;
+		}
+	}
+
+	/** Build an ACP SessionModelState from the model configOption, enriched. */
+	modelState() {
+		const cfg = this.modelConfig;
+		if (!cfg || !Array.isArray(cfg.options)) return null;
+		return {
+			currentModelId: cfg.currentValue,
+			availableModels: cfg.options.map((o) => this.enrichModel(o)),
+		};
+	}
+
+	/**
+	 * Map one configOptions entry to ACP ModelInfo, enriched with the metadata
+	 * the pager's model picker reads: vision (`acceptsImages`/`inputModalities`),
+	 * reasoning effort (`supportsReasoningEffort`/`reasoningEfforts`), and the
+	 * context window (`totalContextTokens`). Source: `omp models --json`.
+	 */
+	enrichModel(opt) {
+		const meta = this.catalog?.get(opt.value);
+		const info = {
+			modelId: opt.value,
+			name: opt.name ?? opt.value,
+			description: opt.description,
+		};
+		if (!meta) return info;
+		const m = {};
+		if (meta.contextWindow) m.totalContextTokens = meta.contextWindow;
+		if (meta.maxTokens) m.maxOutputTokens = meta.maxTokens;
+		// Vision: OMP reports input modalities; "image" present → acceptsImages.
+		const inputs = Array.isArray(meta.input) ? meta.input : [];
+		const acceptsImages = inputs.some((s) => String(s).toLowerCase() === "image");
+		m.acceptsImages = acceptsImages;
+		m.inputModalities = inputs.length ? inputs : ["text"];
+		// Reasoning effort: OMP's `reasoning` flag → the pager's effort surface.
+		if (meta.reasoning) {
+			m.supportsReasoningEffort = true;
+			m.reasoningEfforts = EFFORT_OPTIONS;
+		}
+		info._meta = m;
+		return info;
+	}
+
+	/**
+	 * Load `omp models --json` once into a selector→metadata map. Best-effort:
+	 * a failure leaves the catalog null and models render unenriched rather than
+	 * blocking startup.
+	 */
+	async loadCatalog(agentArgv) {
+		try {
+			const omp = agentArgv[0]; // the `omp` binary, not the `acp` subcommand
+			const proc = Bun.spawn([omp, "models", "--json"], { stdout: "pipe", stderr: "ignore" });
+			const text = await new Response(proc.stdout).text();
+			await proc.exited;
+			const parsed = JSON.parse(text);
+			const list = Array.isArray(parsed) ? parsed : (parsed.models ?? parsed.data ?? []);
+			this.catalog = new Map();
+			for (const m of list) {
+				const key = m.selector ?? `${m.provider}/${m.id}`;
+				if (key) this.catalog.set(key, m);
+			}
+			log(`model catalog: ${this.catalog.size} models enriched`);
+		} catch (e) {
+			log(`model catalog unavailable: ${e?.message ?? e}`);
+			this.catalog = null;
+		}
+	}
+
+	// -- subagent synthesis ---------------------------------------------------
+	//
+	// OMP runs subagents through its `task` tool as an ordinary tool_call. The
+	// pager's tasks pane and subagent tracker only light up on the private
+	// `subagent_spawned`/`subagent_finished` notifications. Synthesize them from
+	// the task tool_call lifecycle so the pane reflects real work. Without
+	// `subagent_spawned`, an intent-less `task` call renders as a bare "task"
+	// row and the tracker waits on a subagent that never reports.
+
+	observeToolCallStart(update, extra) {
+		const raw = update.rawInput ?? {};
+		// OMP's task tool isn't in TOOL_SHAPING, so no _meta stamp. Detect it by
+		// an explicit tool id, a bare "task" title, or the task-tool input shape
+		// (a prompt plus an agent/label selector).
+		const toolName = update._meta?.["x.ai/tool"] ?? raw.tool;
+		const isTask =
+			toolName === "task" ||
+			update.title === "task" ||
+			(typeof raw.prompt === "string" && (raw.agent !== undefined || raw.label !== undefined || raw.task !== undefined));
+		if (!isTask) return;
+		const toolCallId = update.toolCallId;
+		if (!toolCallId || this.subagents.has(toolCallId)) return;
+		const subagentId = `omp-task-${++this.subagentSeq}`;
+		const childSessionId = `${this.session?.sessionId ?? "session"}:sub:${this.subagentSeq}`;
+		const description = raw.prompt ?? raw.description ?? update.title ?? "subagent";
+		this.subagents.set(toolCallId, {
+			subagentId,
+			childSessionId,
+			startedAt: Date.now(),
+			toolCalls: 0,
+		});
+		extra.push(this.notif("_x.ai/session/update", {
+			sessionId: this.session?.sessionId,
+			update: {
+				sessionUpdate: "subagent_spawned",
+				subagent_id: subagentId,
+				parent_session_id: this.session?.sessionId,
+				child_session_id: childSessionId,
+				subagent_type: "general-purpose",
+				description,
+				context_normalized: false,
+			},
+		}));
+	}
+
+	observeToolCallEnd(update, extra) {
+		const toolCallId = update.toolCallId;
+		const rec = toolCallId && this.subagents.get(toolCallId);
+		if (!rec) return;
+		const status = update.status;
+		if (status !== "completed" && status !== "failed" && status !== "cancelled") return;
+		this.subagents.delete(toolCallId);
+		extra.push(this.notif("_x.ai/session/update", {
+			sessionId: this.session?.sessionId,
+			update: {
+				sessionUpdate: "subagent_finished",
+				subagent_id: rec.subagentId,
+				child_session_id: rec.childSessionId,
+				status,
+				error: status === "failed" ? (update.rawOutput?.error ?? "subagent failed") : undefined,
+				tool_calls: rec.toolCalls,
+				turns: 1,
+				duration_ms: Date.now() - rec.startedAt,
+				tokens_used: 0,
+				will_wake: false,
+			},
+		}));
+	}
+
+	// -- request answering ----------------------------------------------------
+
+	/**
+	 * Decide how to handle a client→agent request.
+	 * @returns {null|{action:string,result?:any,error?:any,as?:string,translate?:Function}}
+	 *   null → forward verbatim; 'answer' → respond locally; 'forward' → send to
+	 *   OMP under `as` and translate the response; 'error' → respond with error.
+	 */
+	answerRequest(frame) {
+		const method = frame.method;
+		if (typeof method !== "string") return null;
+
+		// `session/set_model` is standard ACP, not x.ai/* — but OMP doesn't
+		// implement it (only set_config_option). Translate it so the pager's
+		// `/model` picker works, and carry `_meta.reasoningEffort` into a
+		// follow-up `thinking` config set so `/effort` works too.
+		if (method === "session/set_model") {
+			const p = frame.params ?? {};
+			const effort = p._meta?.reasoningEffort ?? p.meta?.reasoningEffort;
+			const thinking = effort ? EFFORT_TO_THINKING[String(effort).toLowerCase()] : undefined;
+			if (thinking !== undefined) {
+				this.followUp.push({
+					jsonrpc: "2.0",
+					id: `effort-${frame.id}`,
+					method: "session/set_config_option",
+					params: { sessionId: p.sessionId, configId: "thinking", value: thinking },
+				});
+			}
+			return {
+				action: "forward",
+				as: "session/set_config_option",
+				rewriteParams: { sessionId: p.sessionId, configId: "model", value: p.modelId },
+				translate: () => ({}),
+			};
+		}
+
+		if (!method.startsWith("x.ai/") && !method.startsWith("_x.ai/")) {
+			return null;
+		}
+		const m = method.replace(/^_?x\.ai\//, "");
+
+		switch (m) {
+			// -- answered from observed state ----------------------------------
+			case "session/info":
+				// This call site reads `response.result` (double-wrapped), unlike
+				// the bare-payload sites — see acp_handler session_info fetch.
+				return this.answer({
+					result: {
+						sessionId: this.session?.sessionId,
+						cwd: this.sessionCwd,
+						agentName: this.agentInfo?.name ?? "oh-my-pi",
+						model: this.modelConfig?.currentValue,
+						turns: 0,
+						context: this.usage
+							? { size: this.usage.size, used: this.usage.used }
+							: { size: 0, used: 0 },
+					},
+				});
+			case "session/usage":
+				// OMP's usage_update reports context-window size/used, not token
+				// counts. Return an honest, explicitly-incomplete usage rather
+				// than fabricate token numbers.
+				return this.answer({
+					usage: {
+						numTurns: 0,
+						modelUsage: {},
+						usageIsIncomplete: true,
+					},
+				});
+			case "commands/list":
+				return this.answer({ commands: this.commands });
+			case "mcp/list":
+				return this.answer({
+					servers: this.mcpServers.map((s) => ({
+						name: s.name,
+						session: { enabled: true },
+					})),
+				});
+			case "prompt_history":
+				return this.answer({ prompts: [] });
+			case "bundle/status":
+				return this.answer({
+					hasCache: false,
+					personas: [],
+					roles: [],
+					agents: [],
+					skills: [],
+					personaDetails: [],
+					roleDetails: [],
+				});
+			case "suggest":
+			case "suggestPrompt":
+				return this.answer({ generation: 0, ghost: null, completions: [] });
+			case "session/search":
+				return this.answer({ results: [] });
+
+			// -- forwarded to OMP, response translated --------------------------
+			case "session/list":
+				return {
+					action: "forward",
+					as: "session/list",
+					translate: (r) => ({ sessions: r?.sessions ?? r ?? [] }),
+				};
+			case "session/fork":
+				return {
+					action: "forward",
+					as: "session/fork",
+					translate: (r) => r,
+				};
+
+			// -- truthful empty lists (OMP has the concept, no data source) -----
+			// Each endpoint decodes a distinct envelope; `{items:[]}` fits none.
+			case "hooks/list":
+				return this.answer({ hooks: [], project_trusted: true, load_errors: [] });
+			case "plugins/list":
+				return this.answer({ plugins: [] });
+			case "marketplace/list":
+				return this.answer({ sources: [] });
+			case "skills/list":
+				return this.answer({ skills: [] });
+			case "workflows/list":
+				return this.answer({ workflows: [] });
+
+			// -- no OMP data source: error, don't fabricate ---------------------
+			default:
+				return {
+					action: "error",
+					error: { code: -32601, message: `x.ai method not available via OMP: ${method}` },
+				};
+		}
+	}
+
+	answer(result) {
+		return { action: "answer", result };
+	}
+
+	notif(method, params) {
+		return { jsonrpc: "2.0", method, params };
+	}
+
+	/** Register a forwarded request whose response needs translation. */
+	trackForwarded(id, translate) {
+		if (translate) this.pendingTranslated.set(id, translate);
+	}
+
+	/** Apply a pending translation to an agent→client response, if registered. */
+	translateResponse(frame) {
+		if (frame?.id === undefined || !this.pendingTranslated.has(frame.id)) return frame;
+		const translate = this.pendingTranslated.get(frame.id);
+		this.pendingTranslated.delete(frame.id);
+		if (frame.error !== undefined) return frame;
+		try {
+			return { ...frame, result: translate(frame.result) };
+		} catch {
+			return frame;
+		}
+	}
+}
 async function lineReader(stream, onLine) {
 	const decoder = new TextDecoder();
 	let buffer = "";
@@ -476,6 +936,10 @@ async function runLive(opts) {
 	const writer = child.stdin;
 	const emit = (obj) => writer.write(`${JSON.stringify(obj)}\n`);
 	const forward = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
+	const ext = new ExtSurface();
+	// Enrich the model catalog before session/new so the picker gets vision,
+	// effort, and context-window metadata on first connect.
+	await ext.loadCatalog(argv);
 
 	// Both directions run concurrently; each pump owns one direction, so
 	// cross-direction interleaving is preserved without a lock.
@@ -502,10 +966,36 @@ async function runLive(opts) {
 			// crashes session/new; an empty array passes through with nothing to
 			// connect.
 			frame.params.mcpServers = [];
-			log("emptied mcpServers on session/new (--no-mcp)");
+		}
+		ext.observeToAgent(frame);
+		// The pager's private `x.ai/*` rail: answer locally where the adapter has
+		// the data, forward-and-translate where OMP owns it, error where neither
+		// does. Forwarding verbatim would surface OMP's -32603 to the user.
+		const decision = frame.id !== undefined ? ext.answerRequest(frame) : null;
+		if (decision?.action === "answer") {
+			tape?.record("to_agent", frame);
+			forward({ jsonrpc: "2.0", id: frame.id, result: decision.result });
+			return;
+		}
+		if (decision?.action === "error") {
+			tape?.record("to_agent", frame);
+			forward({ jsonrpc: "2.0", id: frame.id, error: decision.error });
+			return;
+		}
+		if (decision?.action === "forward") {
+			frame.method = decision.as;
+			if (decision.rewriteParams) frame.params = decision.rewriteParams;
+			ext.trackForwarded(frame.id, decision.translate);
 		}
 		tape?.record("to_agent", frame);
 		emit(frame);
+		// A translation may queue a follow-up request (e.g. set_model also sets
+		// the thinking effort). Drain it so OMP sees both.
+		while (ext.followUp.length) {
+			const f = ext.followUp.shift();
+			tape?.record("to_agent", f);
+			emit(f);
+		}
 	});
 
 	const toClient = lineReader(child.stdout, (line) => {
@@ -523,8 +1013,18 @@ async function runLive(opts) {
 			const change = shapeToClient(frame);
 			if (change) log(`shaped ${change}`);
 		}
-		tape?.record("to_client", frame);
-		forward(frame);
+		// Translate any forwarded x.ai/* response back to the pager's shape.
+		const shaped = ext.translateResponse(frame);
+		// Observe BEFORE forwarding: observeToClient may mutate the frame (it
+		// injects `result.models` into session/new), and JSON.stringify captures
+		// the object at forward time. Extras are emitted after the main frame.
+		const extras = ext.observeToClient(shaped);
+		tape?.record("to_client", shaped);
+		forward(shaped);
+		for (const extra of extras) {
+			tape?.record("to_client", extra);
+			forward(extra);
+		}
 	});
 
 	void toClient;
@@ -700,7 +1200,11 @@ async function runReplay(opts) {
 	if (opts.selfcheck) return selfcheck(opts, header, entries);
 
 	const stale = staleReason(header);
-	if (stale) log(`WARNING: ${stale}`);
+	if (stale && !opts.allowStale) {
+		// C5: a tape recorded against a different upstream base is rejected, not
+		// replayed — the recorded stream may not match this tree's behaviour.
+		fail(`stale tape: ${stale} (re-record, or --allow-stale to override)`);
+	}
 
 	const replay = createReplay(header, entries);
 	const emit = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);

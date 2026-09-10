@@ -3414,9 +3414,21 @@ impl AgentView {
                     }
                     hint
                 });
+                // Stable machine-readable turn-state token for ACP harnesses and
+                // terminal automation: a fixed `[agent:<state>]` marker in the
+                // right-aligned slot. Lets a driver grep for "idle" instead of
+                // guessing from spinners or timing out on a busy turn.
+                let state_token = match self.session.state {
+                    crate::app::agent::AgentState::Idle => "[agent:idle]",
+                    crate::app::agent::AgentState::TurnRunning => "[agent:running]",
+                    crate::app::agent::AgentState::TurnCancelling => "[agent:cancelling]",
+                    crate::app::agent::AgentState::CommandRunning { .. } => "[agent:command]",
+                    crate::app::agent::AgentState::CommandCancelling { .. } => "[agent:cancelling]",
+                };
                 ShortcutsBar::new(&hints)
                     .compact(5, help_hint)
                     .with_pending(pending_hint)
+                    .with_right_text(Some(state_token))
                     .render(layout.shortcuts, buf);
             }
         }
