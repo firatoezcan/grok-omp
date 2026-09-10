@@ -1,0 +1,23 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "grok-omp-bridge",
+      "devDependencies": {
+        "@kitlangton/terminal-control": "1.2.1",
+      },
+    },
+  },
+  "packages": {
+    "@kitlangton/terminal-control": ["@kitlangton/terminal-control@1.2.1", "", { "optionalDependencies": { "@kitlangton/terminal-control-darwin-arm64": "1.2.1", "@kitlangton/terminal-control-darwin-x64": "1.2.1", "@kitlangton/terminal-control-linux-arm64-gnu": "1.2.1", "@kitlangton/terminal-control-linux-x64-gnu": "1.2.1" }, "peerDependencies": { "vitest": ">=3.0.0" }, "optionalPeers": ["vitest"] }, "sha512-xLHRikahSWCRAGr6QHegmVrDGHOBFDzcn+Xm5d5KhbcZ0zaBfeVND7jDNAzSdqW/llHjVdvCDWsP6MgH5VNWTA=="],
+
+    "@kitlangton/terminal-control-darwin-arm64": ["@kitlangton/terminal-control-darwin-arm64@1.2.1", "", { "os": "darwin", "cpu": "arm64", "bin": { "termctrl": "bin/termctrl" } }, "sha512-iKsdk5FGSNbhYirbv1UH3lCQ0zxDCLymKFEQqifVGLj9rZQl+Qr32jzR5yLZVO7d10EzjiNUag1Rkn4hXC7JCg=="],
+
+    "@kitlangton/terminal-control-darwin-x64": ["@kitlangton/terminal-control-darwin-x64@1.2.1", "", { "os": "darwin", "cpu": "x64", "bin": { "termctrl": "bin/termctrl" } }, "sha512-cwU6UDWWF8x5SrE/+oqmUTAik8Gj8dj4jDftbzCaZkNTUKPkxbSyRyWUlOtCQEC0R5c3lD63riIqwXOLmxig3g=="],
+
+    "@kitlangton/terminal-control-linux-arm64-gnu": ["@kitlangton/terminal-control-linux-arm64-gnu@1.2.1", "", { "os": "linux", "cpu": "arm64", "bin": { "termctrl": "bin/termctrl" } }, "sha512-+HsI5ifWOHj463OfxDwjcJtfJmrXrHLcPoO+lgq+cgOfGkKvhad0oU9O2w71jZjIcpqL+Q20gtMzzPycm01Jgw=="],
+
+    "@kitlangton/terminal-control-linux-x64-gnu": ["@kitlangton/terminal-control-linux-x64-gnu@1.2.1", "", { "os": "linux", "cpu": "x64", "bin": { "termctrl": "bin/termctrl" } }, "sha512-2qKEK/CGaXx5P8XXCCXAPWmjucE+QRSJ3iM8Zguig0FVJtsYn2qvhNyGMqh9txB/kS8JJLmo/ATWmMN6z9xPLg=="],
+  }
+}

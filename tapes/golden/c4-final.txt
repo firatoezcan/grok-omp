@@ -1,0 +1,24 @@
+ main~/Projects/Freelancing/personal/grok-omp
+   run                                        <TIME>
+◈Read 1 file
+
+  ◆Creating Creating bridge-probe.txt
+
+ ◆Thought for <DUR>
+
+ done                                          <TIME>
+
+ Worked for <DUR>
+
+
+
+
+
+
+
+
+ <SPIN>Starting session… <SEED>
+╭────────────────────────────────────────────────────────────────────────────────────────────────╮
+│❯│
+╰─────────────────────────────────────────────────────────────────────unknown·always-approve─╯
+Shift+Tab:mode  │  Ctrl+.:shortcuts

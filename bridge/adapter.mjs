@@ -65,6 +65,7 @@ function parseArgs(argv) {
 		selfcheck: false,
 		hygiene: true,
 		shape: true,
+		mcp: true,
 		quiet: false,
 	};
 	for (let i = 0; i < argv.length; i++) {
@@ -88,6 +89,9 @@ function parseArgs(argv) {
 				break;
 			case "--no-shape":
 				opts.shape = false;
+				break;
+			case "--no-mcp":
+				opts.mcp = false;
 				break;
 			case "--quiet":
 				opts.quiet = true;
@@ -113,7 +117,7 @@ function helpText() {
   --selfcheck       with --replay: assert two replays are byte-identical
   --no-hygiene      do not rewrite client capabilities
   --no-shape        do not rewrite tool-call identity
-  --quiet           silence diagnostics on stderr
+  --no-mcp          strip mcpServers from session/new (hermetic test fixtures)
 `;
 }
 
@@ -133,10 +137,16 @@ const optsRef = { quiet: false };
 // tape
 // ---------------------------------------------------------------------------
 
-/** Source revision of the tree under test, so a stale tape is detectable. */
+/**
+ * Source revision of the tree under test, so a stale tape is detectable.
+ * Resolved from the bridge's own location, not the working directory: the pager
+ * spawns the child in whatever directory the session uses, which is usually not
+ * the repo.
+ */
 function sourceRev() {
-	for (const candidate of ["SOURCE_REV", ".source-rev"]) {
-		const path = resolve(process.cwd(), candidate);
+	const roots = [resolve(import.meta.dir, ".."), process.cwd()];
+	for (const root of roots) {
+		const path = resolve(root, "SOURCE_REV");
 		if (existsSync(path)) return readFileSync(path, "utf8").trim();
 	}
 	return null;
@@ -146,16 +156,36 @@ function sourceRev() {
  * Records every frame crossing the adapter in one file with a single
  * cross-direction `seq` counter — two counters would destroy the interleaving
  * that makes a TUI test deterministic.
+ *
+ * The header is written lazily, on the first frame, so it can name the client.
+ * That identity matters: ACP request ids are client-local, so a tape replays
+ * only for the client that recorded it, and a mismatch should be diagnosable
+ * from the file rather than from a failed replay.
  */
 class Tape {
 	constructor(path, header) {
 		this.path = path;
 		this.seq = 0;
+		this.header = { type: "header", format: TAPE_FORMAT, ...header };
+		this.headerWritten = false;
 		mkdirSync(dirname(resolve(path)), { recursive: true });
-		writeFileSync(path, `${JSON.stringify({ type: "header", format: TAPE_FORMAT, ...header })}\n`);
 	}
 
 	record(dir, frame, raw) {
+		if (!this.headerWritten) {
+			// The pager sends no `clientInfo`; it identifies itself under
+			// `params._meta.clientType`. Accept either so the header names the
+			// client that owns this tape's id space.
+			if (frame && typeof frame === "object") {
+				const info = frame.params?.clientInfo;
+				const clientType = frame.params?._meta?.clientType;
+				if (info?.name || clientType) {
+					this.header.client = { name: info?.name ?? clientType, version: info?.version ?? null };
+				}
+			}
+			writeFileSync(this.path, `${JSON.stringify(this.header)}\n`);
+			this.headerWritten = true;
+		}
 		const entry = {
 			dir,
 			t: Date.now() - this.startedAt(),
@@ -438,6 +468,7 @@ async function runLive(opts) {
 				agentCommand: opts.agent,
 				hygiene: opts.hygiene,
 				shape: opts.shape,
+				mcp: opts.mcp,
 				recordedAt: new Date().toISOString(),
 			})
 		: null;
@@ -465,6 +496,13 @@ async function runLive(opts) {
 		if (opts.hygiene && frame.method === "initialize") {
 			const removed = applyHygiene(frame);
 			if (removed.length) log(`capability hygiene: removed ${removed.join(", ")} from initialize`);
+		}
+		if (!opts.mcp && frame.method === "session/new" && frame.params?.mcpServers !== undefined) {
+			// OMP reads `params.mcpServers.length` unguarded — deleting the field
+			// crashes session/new; an empty array passes through with nothing to
+			// connect.
+			frame.params.mcpServers = [];
+			log("emptied mcpServers on session/new (--no-mcp)");
 		}
 		tape?.record("to_agent", frame);
 		emit(frame);
@@ -546,18 +584,44 @@ function splitCommand(command) {
  * `session/request_permission` — which a "drain everything on prompt" heuristic
  * would flatten.
  */
-function createReplay(entries) {
+/**
+ * Replay-only stubs for pager probes whose truthful answer is empty and whose
+ * error poisons a pending turn ("Turn failed", SPEC §7.4). Only history/info
+ * queries qualify: `x.ai/prompt_history` decodes `result.prompts`/`prompts` as
+ * Vec<String>, and OMP genuinely has no x.ai history, so `[]` is the truth.
+ * Subscription/billing are NOT here — the pager applies their result
+ * authoritatively, so they keep their recorded error.
+ */
+const PROBE_STUBS = {
+	"x.ai/prompt_history": { prompts: [] },
+};
+
+function createReplay(header, entries) {
 	const ordered = [...entries].sort((a, b) => a.seq - b.seq);
-	const responseSeqById = new Map();
+
+	// Recorded pairing is by request id. Live pairing cannot be: the pager's
+	// x.ai/* probes fire on timers, so the id space drifts run to run. Match a
+	// live request to its recorded counterpart by method + occurrence index —
+	const responseSeqByRecordedId = new Map();
+	const recordedIdsByMethod = new Map();
+	/** recorded request id -> stub result, for probes whose recorded reply was an error. */
+	const stubByRecordedId = new Map();
 	for (const entry of ordered) {
 		if (entry.dir === "to_client" && (entry.kind === "response" || entry.kind === "error")) {
-			responseSeqById.set(entry.id, entry.seq);
+			responseSeqByRecordedId.set(entry.id, entry.seq);
+		}
+		if (entry.dir === "to_agent" && entry.kind === "request") {
+			const ids = recordedIdsByMethod.get(entry.method) ?? [];
+			ids.push(entry.id);
+			recordedIdsByMethod.set(entry.method, ids);
+			if (PROBE_STUBS[entry.method] !== undefined) stubByRecordedId.set(entry.id, PROBE_STUBS[entry.method]);
 		}
 	}
 
 	let cursor = 0;
-	/** Requests this client actually sent; a stray response must not leak out. */
-	const seenRequestIds = new Set();
+	const liveCounts = new Map();
+	/** recorded request id -> live request id, so emitted replies echo the id the client actually used. */
+	const idAlias = new Map();
 
 	const drain = (limit) => {
 		const out = [];
@@ -566,11 +630,15 @@ function createReplay(entries) {
 			if (entry.seq > limit) break;
 			cursor++;
 			if (entry.dir !== "to_client") continue;
-			// Notifications and agent-initiated requests always belong to the
-			// stream; a response only belongs if its request was sent.
 			const isReply = entry.kind === "response" || entry.kind === "error";
-			if (isReply && !seenRequestIds.has(entry.id)) continue;
-			out.push(entry.frame);
+			if (isReply) {
+				const liveId = idAlias.get(entry.id);
+				if (liveId === undefined) continue; // reply to a request this client never sent
+				const stub = entry.kind === "error" ? stubByRecordedId.get(entry.id) : undefined;
+				out.push(stub !== undefined ? { jsonrpc: "2.0", id: liveId, result: stub } : { ...entry.frame, id: liveId });
+			} else {
+				out.push(entry.frame); // notifications and agent-initiated requests pass verbatim
+			}
 		}
 		return out;
 	};
@@ -580,11 +648,41 @@ function createReplay(entries) {
 		handle(frame) {
 			if (!frame || typeof frame.method !== "string") return []; // a client response/notification advances nothing
 			if (frame.id === undefined) return []; // client notification
-			seenRequestIds.add(frame.id);
-			const limit = responseSeqById.get(frame.id);
-			if (limit === undefined) {
-				return [{ jsonrpc: "2.0", id: frame.id, error: { code: -32601, message: `no recorded reply for ${frame.method}` } }];
+			const n = liveCounts.get(frame.method) ?? 0;
+			liveCounts.set(frame.method, n + 1);
+			const ids = recordedIdsByMethod.get(frame.method) ?? [];
+			// x.ai/* probes are idempotent status queries on timers; a live run may
+			// fire them more often than the tape recorded. Reuse the last recorded
+			// reply rather than failing a probe the pager only logs anyway. Core
+			// ACP methods stay strict — a mismatched prompt must error, not replay.
+			const isProbe = frame.method.startsWith("_x.ai/") || frame.method.startsWith("x.ai/");
+			// Replay-only stub: a probe the tape never recorded gets a benign
+			// success, not an error — an error during a pending turn surfaces as
+			// "Turn failed" in the pager (SPEC §7.4). Only history/info queries
+			// are stubbed; subscription/billing stay errors because the pager
+			// applies their result authoritatively.
+			const stub = PROBE_STUBS[frame.method];
+			if (isProbe && ids.length === 0 && stub !== undefined) {
+				return [{ jsonrpc: "2.0", id: frame.id, result: stub }];
 			}
+			const recordedId = isProbe ? ids[Math.min(n, ids.length - 1)] : ids[n];
+			if (recordedId === undefined) {
+				return [
+					{
+						jsonrpc: "2.0",
+						id: frame.id,
+						error: {
+							code: -32601,
+							message:
+								`no recorded reply for ${frame.method} (call #${n + 1}) — tape recorded by ` +
+								`${header?.client?.name ?? "another client"} has ${ids.length} call(s)`,
+						},
+					},
+				];
+			}
+			idAlias.set(recordedId, frame.id);
+			const limit = responseSeqByRecordedId.get(recordedId);
+			if (limit === undefined) return []; // recorded request had no reply
 			return drain(limit);
 		},
 		/** Any client-bound frames recorded after the last client request. */
@@ -604,7 +702,7 @@ async function runReplay(opts) {
 	const stale = staleReason(header);
 	if (stale) log(`WARNING: ${stale}`);
 
-	const replay = createReplay(entries);
+	const replay = createReplay(header, entries);
 	const emit = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
 
 	void lineReader(Bun.stdin.stream(), (line) => {
@@ -661,9 +759,15 @@ function validateTape(entries) {
  * with itself: it fails when a client request has no recorded reply, when an
  * `id` does not round-trip, or when emission reorders the recorded stream.
  */
+
+/** The method of the recorded request a response id belongs to. */
+function requestMethodById(ordered, id) {
+	return ordered.find((e) => e.dir === "to_agent" && e.id === id)?.method;
+}
+
 function selfcheck(opts, header, entries) {
 	const ordered = [...entries].sort((a, b) => a.seq - b.seq);
-	const replay = createReplay(entries);
+	const replay = createReplay(header, entries);
 
 	const actual = [];
 	for (const entry of ordered) {
@@ -671,8 +775,16 @@ function selfcheck(opts, header, entries) {
 		actual.push(...replay.handle(entry.frame));
 	}
 	actual.push(...replay.flush());
+	const expected = ordered
+		.filter((entry) => entry.dir === "to_client")
+		.map((entry) => {
+			// Replay substitutes stubs for recorded probe errors; expected must too.
+			if (entry.kind === "error" && PROBE_STUBS[requestMethodById(ordered, entry.id)] !== undefined) {
+				return { jsonrpc: "2.0", id: entry.id, result: PROBE_STUBS[requestMethodById(ordered, entry.id)] };
+			}
+			return entry.frame;
+		});
 
-	const expected = ordered.filter((entry) => entry.dir === "to_client").map((entry) => entry.frame);
 
 	let mismatchAt = -1;
 	for (let i = 0; i < Math.max(actual.length, expected.length); i++) {

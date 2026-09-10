@@ -1,0 +1,9 @@
+{
+  "name": "grok-omp-bridge",
+  "private": true,
+  "type": "module",
+  "description": "ACP adapter, probes and acceptance checks for the Grok TUI <-> OMP seam",
+  "devDependencies": {
+    "@kitlangton/terminal-control": "1.2.1"
+  }
+}

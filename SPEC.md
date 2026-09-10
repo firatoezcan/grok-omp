@@ -497,7 +497,11 @@ A **tee inside our own path** is primary (the adapter records what it forwards),
   - fidelity matrix §7.4 filled in from observation; the gaps that remain are recorded with the reason they are left alone, including two deliberate non-fixes (todo/task suppression, entitlement probes)
 - [x] **M3** C0 green: `bun bridge/adapter.mjs --replay tapes/live-tools.acptape --selfcheck` → 27 client-bound frames replayed byte-identically; proven to fail on a missing reply (id mismatch) and on duplicate/non-contiguous `seq`
 - [x] **M3** replay lane verified end to end: the pager booted against `--replay tapes/live-tools.acptape` in 94 ms with no model and rendered the recorded turn
-- [ ] **M3** C1/C2/C3 green under termctrl; C4 golden frame committed
+- [x] **M3** C1/C2/C3 green under termctrl; C4 golden frame committed
+  - `bridge/checks.mjs` drives the pager under `@kitlangton/terminal-control` against `--replay` tapes. C1 text+idle, C2 edit diff hunk, C3 resize 132x38 keeps the dock, C4 re-derives the recorded run twice (byte-identical) and compares normalized text to `tapes/golden/c4-final.txt`
+  - two replay bugs found and fixed while landing this: (a) request pairing is by method+occurrence, not id — the pager's `x.ai/*` probes fire on timers so the id space drifts run to run, and emitted replies now echo the live id; (b) `x.ai/prompt_history` gets a replay-only `{prompts: []}` stub because re-serving OMP's recorded `-32603` during a pending turn surfaces as "Turn failed" and re-seeds the MCP spinner
+  - the pager's `McpInitProgress{total:0}` seed row animates "Starting session…" for ~30s after each turn (SEED_EXPIRE, `agent_view/mod.rs:203`) because a replayed agent never reports server counts; checks wait for output quiescence, not the text disappearing — at expiry the row freezes mid-glyph
+  - `--no-mcp` added to the adapter: the pager forwards its configured `mcpServers` in `session/new`, and a 401 from one (temporal-docs) fails session create and blocks the prompt; fixtures record with `mcpServers: []` so replay needs no external auth
 - [ ] **M4** fidelity backlog worked in §7.4 order; one upstream sync performed and timed
 
 ---
