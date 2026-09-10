@@ -182,6 +182,7 @@ fn agent_name(agent: AgentKind) -> &'static str {
     match agent {
         AgentKind::Embedded => "local agent",
         AgentKind::Leader => "shared leader",
+        AgentKind::External => "external agent",
     }
 }
 /// Rounded: a truncated total can print smaller than the steps it sums.

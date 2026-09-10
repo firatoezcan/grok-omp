@@ -1,6 +1,7 @@
 //! ACP (Agent Communication Protocol) connection management.
 //!
 //! This module spawns the agent process, initializes the protocol, authenticates, and provides the channel for communication.
+pub mod external;
 pub mod leader_bridge;
 pub mod meta;
 pub mod model_state;

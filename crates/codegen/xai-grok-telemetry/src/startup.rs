@@ -155,6 +155,8 @@ pub enum Owner {
 pub enum AgentKind {
     Embedded,
     Leader,
+    /// ACP agent running as a child process over stdio (`--agent-command`).
+    External,
 }
 impl AgentKind {
     pub fn label(self) -> &'static str {

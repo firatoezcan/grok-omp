@@ -430,6 +430,11 @@ pub struct PagerArgs {
         value_hint = ValueHint::FilePath
     )]
     pub leader_socket: Option<PathBuf>,
+    /// Run an external ACP agent as a child process over stdio instead of the built-in agent.
+    /// The command is split like a shell word list; quoted arguments are supported.
+    /// Example: `--agent-command "omp acp"`.
+    #[arg(long = "agent-command", value_name = "COMMAND", global = true)]
+    pub agent_command: Option<String>,
     /// Enable debug logging.
     #[arg(long = "debug", global = true)]
     pub debug: bool,

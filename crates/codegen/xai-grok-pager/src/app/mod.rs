@@ -1011,7 +1011,11 @@ pub async fn run(
         );
     }
     let fallback_flags = use_leader.then(|| connect_flags.clone());
-    let primary_target = if use_leader {
+    // An external agent backend takes precedence over both built-in targets.
+    let external_command = crate::acp::external::resolve_command(args.agent_command.as_deref());
+    let primary_target = if external_command.is_some() {
+        crate::acp::AgentKind::External
+    } else if use_leader {
         crate::acp::AgentKind::Leader
     } else {
         crate::acp::AgentKind::Embedded
@@ -1043,6 +1047,10 @@ pub async fn run(
                 }
                 crate::acp::AgentKind::Embedded => {
                     crate::acp::connect(&cancel, connect_flags).await
+                }
+                crate::acp::AgentKind::External => {
+                    let command = external_command.unwrap_or_default();
+                    crate::acp::external::connect(&command, &cancel, connect_flags).await
                 }
             }
         },

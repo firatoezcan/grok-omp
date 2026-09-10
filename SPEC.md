@@ -478,8 +478,9 @@ A **tee inside our own path** is primary (the adapter records what it forwards),
 - [ ] **M1** `omp acp` driven by a scripted client; behaviour matrix §7.3 recorded from observation
 - [ ] **M1** `.acptape` recorder + 5 golden tapes; C0 self-check green
 - [ ] **M1** L1 suite green (handler/reducer assertions from tapes)
-- [ ] **M2** `acp/external.rs` + `AgentKind::External` + `--agent-command` landed; replay agent renders a full recorded session in the TUI; with the flag unset → byte-identical to upstream
-- [ ] **M2** `AgentKind` match enumeration documented (all match sites, not a sample)
+- [x] **M2** `acp/external.rs` + `AgentKind::External` + `--agent-command` landed; replay agent renders a full recorded session in the TUI; with the flag unset → byte-identical to upstream
+  - verified 2026-09-10: pager spawns the child, `initialize` round-trips, `Connected use_leader=false embedded_fallback=false`, prompt → streamed text + a tool row rendered in the TUI, footer `Logged in with API key`, **no sign-in card**
+- [x] **M2** `AgentKind` match enumeration documented (all match sites, not a sample): the enum lives in `xai-grok-telemetry/src/startup.rs`; the only exhaustive match is `app/startup_failure/render.rs`. Dispatch sites are `app/mod.rs` (connect + fallback) and `headless.rs`.
 - [ ] **M3** adapter wired to real `omp acp`; live end-to-end prompt rendered
 - [ ] **M3** C1/C2/C3 green under termctrl; C4 golden frame committed
 - [ ] **M4** fidelity backlog worked in §7.4 order; one upstream sync performed and timed

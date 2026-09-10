@@ -23,6 +23,13 @@ HOOK_FILES=(
   crates/codegen/xai-grok-pager/src/app/cli.rs
 )
 
+# Files we own outright even though they sit inside an upstream directory:
+# upstream will never create these paths, so they cannot conflict on a merge and
+# they do not count against the hook line budget.
+OWNED_FILES=(
+  crates/codegen/xai-grok-pager/src/acp/external.rs
+)
+
 # Paths that are ours outright. Upstream can never collide with them, so they
 # never conflict on a merge and never count against the line budget.
 OWNED_PREFIXES=(
@@ -52,6 +59,12 @@ is_hook() {
   return 1
 }
 
+is_owned_file() {
+  local p="$1" f
+  for f in "${OWNED_FILES[@]}"; do [[ "$p" == "$f" ]] && return 0; done
+  return 1
+}
+
 status=0
 
 # 1. Name allowlist. Three-dot diff = "what we changed since the merge base",
@@ -60,6 +73,7 @@ while IFS= read -r path; do
   [[ -z "$path" ]] && continue
   is_owned "$path" && continue
   is_hook "$path" && continue
+  is_owned_file "$path" && continue
   echo "DRIFT: '$path' differs from $UPSTREAM_REF and is not in the allowlist (SPEC.md §6)" >&2
   status=1
 done < <(git diff --name-only "$UPSTREAM_REF"...HEAD)
