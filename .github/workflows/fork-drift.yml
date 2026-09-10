@@ -1,0 +1,29 @@
+name: fork-drift
+
+# Enforces SPEC.md §6: our fork may differ from upstream only on the hook files
+# listed there, plus paths that are ours outright. Runs on every push, and
+# weekly so upstream movement is noticed even when we are not pushing.
+#
+# Needs no Rust toolchain — the gate is pure git.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the gate needs the merge base with upstream
+      - name: fetch upstream
+        run: |
+          git remote add upstream https://github.com/xai-org/grok-build
+          git fetch --no-tags upstream main
+      - name: check drift
+        run: bash scripts/check-drift.sh

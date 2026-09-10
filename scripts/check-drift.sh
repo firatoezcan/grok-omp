@@ -31,6 +31,7 @@ OWNED_PREFIXES=(
   config/
   bridge/
   tapes/
+  .github/
 )
 
 if ! git rev-parse --verify --quiet "$UPSTREAM_REF" >/dev/null; then
