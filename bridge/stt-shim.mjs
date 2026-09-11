@@ -361,6 +361,7 @@ const server = Bun.serve({
 				done: false,
 			};
 			ws.data.conn = conn;
+			log(`ws open ${new URL(ws.data.url).pathname}${new URL(ws.data.url).search} (stream ${conn.streamId})`);
 
 			const send = obj => {
 				try {
