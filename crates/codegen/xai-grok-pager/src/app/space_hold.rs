@@ -234,18 +234,18 @@ impl SpaceHold {
     }
 
     /// The gesture is a text-composition shortcut, so it needs the same gates
-    /// as the voice chord plus a prompt the spaces can actually land in. It
-    /// only arms under `voice_capture_mode = "hold"` — a user who chose
-    /// `toggle` must keep a space bar that only ever types spaces — and never
-    /// while a capture session is already live or queued (a hold must not
-    /// hijack a `/voice` or Ctrl+Space session).
+    /// as the voice chord plus a prompt the spaces can actually land in. It is
+    /// deliberately NOT gated on `voice_capture_mode`: that setting governs
+    /// only the Ctrl+Space/F8 chord (whose `hold` choice needs kitty release
+    /// events), while the space-hold works on every terminal via the
+    /// auto-repeat cadence — gating it would silently disable it exactly where
+    /// the chord can't hold. It never arms while a capture session is already
+    /// live or queued (a hold must not hijack a `/voice` or Ctrl+Space
+    /// session).
     fn gesture_enabled(&self, app: &AppView) -> bool {
         app.voice_mode_enabled
             && xai_grok_voice::AUDIO_SUPPORTED
             && app.current_ui.voice_keybind_enabled.unwrap_or(true)
-            && crate::settings::canonical_voice_capture_mode(
-                app.current_ui.voice_capture_mode.as_deref(),
-            ) == "hold"
             && !app.voice_listening()
             && !app.voice_state.pending_cold_start()
             && dispatch::space_hold_prompt_len(app).is_some()
@@ -468,8 +468,10 @@ mod tests {
     }
 
     #[test]
-    fn capture_mode_toggle_disarms_the_gesture() {
-        // A user who chose `toggle` keeps a space bar that only types spaces.
+    fn capture_mode_toggle_still_arms_the_gesture() {
+        // `voice_capture_mode` governs only the Ctrl+Space/F8 chord; the
+        // space-hold works on every terminal via auto-repeat cadence, so a
+        // `toggle` choice must not disarm it.
         let mut hold = SpaceHold::default();
         let mut app = app_with_voice_ready();
         app.current_ui.voice_capture_mode = Some("toggle".to_owned());
@@ -479,7 +481,7 @@ mod tests {
             Instant::now(),
             &app,
         );
-        assert!(matches!(pre, SpaceHoldPre::Ignore));
+        assert!(matches!(pre, SpaceHoldPre::Observe));
     }
 
     #[test]

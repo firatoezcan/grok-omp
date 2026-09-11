@@ -5403,10 +5403,11 @@ mod tests {
         assert_eq!(agent.prompt.text(), "hi x");
     }
 
-    /// `voice_capture_mode = "toggle"`: the space bar only ever types spaces —
-    /// a mechanical cadence must not arm the gesture.
+    /// `voice_capture_mode = "toggle"` governs only the Ctrl+Space/F8 chord —
+    /// the space-hold works on every terminal via auto-repeat cadence, so a
+    /// mechanical cadence still records under `toggle`.
     #[tokio::test]
-    async fn space_hold_toggle_mode_types_spaces() {
+    async fn space_hold_toggle_mode_still_records() {
         let mut app = crate::app::app_view::tests::test_app_with_agent();
         app.apply_auth_meta(&xai_grok_login::AuthMeta {
             auth_mode: Some("ApiKey".into()),
@@ -5464,14 +5465,20 @@ mod tests {
         .await;
 
         assert!(!result.should_quit);
-        assert!(!space_hold.active());
-        assert!(!app.voice_listening());
-        assert!(voice_rx.try_recv().is_err(), "no PttPress in toggle mode");
+        assert!(space_hold.active());
+        assert!(
+            app.voice_listening() && app.voice_hold_owned(),
+            "capture_mode=toggle must not disarm the space-hold gesture"
+        );
+        assert!(matches!(
+            voice_rx.try_recv(),
+            Ok(xai_grok_voice::VoiceCommand::PttPress)
+        ));
         let agent = app.agents.values().next().expect("agent");
         assert_eq!(
             agent.prompt.text(),
-            "    ",
-            "all four spaces land as text when the gesture is gated off"
+            "",
+            "the optimistically typed spaces are tracked back out on confirm"
         );
     }
 
