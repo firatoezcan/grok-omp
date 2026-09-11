@@ -56,6 +56,28 @@ On first launch the launcher seeds this profile from your real OMP install:
 
 To reset the profile, delete `~/.local/share/grok-pi` and relaunch.
 
+### Connecting providers & models
+
+There is no grok-pi-specific provider setting — the model list is whatever OMP
+resolves inside the isolated profile. Credentials live in the isolated
+`agent.db`; model roles and provider options live in the isolated `config.yml`.
+Both start as copies of your real `~/.omp/agent/` files and then diverge.
+
+To add a provider after first launch, run OMP's own auth against the isolated
+profile:
+
+```sh
+PI_CODING_AGENT_DIR=~/.local/share/grok-pi/omp/agent omp auth-broker login <provider>
+PI_CODING_AGENT_DIR=~/.local/share/grok-pi/omp/agent omp auth-broker import <file|dir>
+```
+
+(`omp auth-broker list` shows the provider ids.) Provider env keys
+(`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, …) exported before `grok-pi` also work —
+the launcher passes its environment through to the agent. To re-pull
+credentials from your real profile, delete `omp/agent/agent.db` under
+`$GROK_HOME` and relaunch — the launcher re-seeds only when the isolated DB
+has no credentials.
+
 ### Which OMP runs
 
 The adapter spawns OMP in ACP mode. Resolution order:
@@ -83,9 +105,10 @@ distinct blocks in the scrollback. Disable it with `GROK_PI_ADVISOR=0`.
 
 ## Models & effort
 
-`/model` (alias `/m`, or Ctrl+M outside the prompt) opens the model picker. It
-lists every model OMP advertises — 51 in a typical profile — each enriched by
-the adapter from `omp models --json` with:
+`/model` (alias `/m`, or Ctrl+M outside the prompt) opens the model picker. The
+list itself is OMP's `model` config option from `session/new` — every model
+the isolated profile advertises (51 in a typical profile) — and the adapter
+enriches each entry from `omp models --json` with:
 
 - provider/id selector and display name,
 - a vision flag (`acceptsImages` / input modalities),
@@ -93,9 +116,11 @@ the adapter from `omp models --json` with:
 - reasoning-effort support (`supportsReasoningEffort`).
 
 `/effort <level>` sets reasoning effort on the current model without re-picking
-it; `/model <name> <effort>` does both at once. Levels: `none`, `minimal`,
-`low`, `medium` (default), `high`, `xhigh`, `max`. Effort only applies to
-models OMP marks as reasoning-capable.
+it; `/model <name> <effort>` does both at once — `<name>` must be the exact
+display name or `provider/id` selector (fuzzy fragments report "Unknown
+model"; OMP's own `/switch` does fuzzy matching). Levels: `none`, `minimal`,
+`low`, `medium` (default), `high`, `xhigh`, `max`. The effort sub-picker only
+appears for models OMP marks as reasoning-capable.
 
 On the wire, the pager's `session/set_model` is translated by the adapter to
 OMP's `session/set_config_option` (`configId: "model"`), and an effort choice
