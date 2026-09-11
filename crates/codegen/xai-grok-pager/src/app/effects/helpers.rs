@@ -325,6 +325,11 @@ pub(crate) struct SessionFlags {
     /// Startup resume target deferred to the worktree handler after missing local id/title resolution.
     /// Worktree failure messages append the no-match hint only when the failing target equals this value.
     pub resume_local_miss: Option<String>,
+    /// Whether the connected agent is NOT grok-shell (`_meta.grokShell` absent on initialize).
+    /// `true` for foreign agents (e.g. Oh My Pi): the agent's own session list is then
+    /// authoritative and grok-local disk reconciliation must not filter it.
+    /// `false` under `Default` in tests preserves first-party behavior.
+    pub foreign_agent: bool,
 }
 impl SessionFlags {
     /// Resolve the agent profile name from the flags.

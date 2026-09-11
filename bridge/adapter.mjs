@@ -45,9 +45,11 @@
  * The pager reaches this through `--agent-command "bun bridge/adapter.mjs"`.
  */
 
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, cpSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
+import { execFile } from "node:child_process";
+import { Database } from "bun:sqlite";
 
 const BRIDGE_NAME = "grok-omp-bridge";
 const BRIDGE_VERSION = "0.1.0";
@@ -560,6 +562,241 @@ function enrichSessionList(result) {
 	return { sessions };
 }
 
+/** Flatten ACP prompt ContentBlocks to display text for the queue pane. */
+function promptBlocksText(prompt) {
+	if (!Array.isArray(prompt)) return "";
+	return prompt
+		.map((b) => (b?.type === "text" ? b.text : b?.type === "resource_link" ? (b.name ?? b.uri ?? "") : ""))
+		.filter(Boolean)
+		.join("\n");
+}
+
+/**
+ * Read OMP's prompt history db (<agentDir>/history.db or
+ * $XDG_DATA_HOME/omp/history.db; table history(prompt,created_at,cwd,
+ * session_id)). Newest first; filter_session_id narrows to that session,
+ * otherwise cwd narrows to the project. Missing db → [].
+ */
+function readOmpPromptHistory(params) {
+	const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".omp", "agent");
+	const candidates = [
+		join(agentDir, "history.db"),
+		join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "omp", "history.db"),
+	];
+	const dbPath = candidates.find((p) => existsSync(p));
+	if (!dbPath) return [];
+	let db;
+	try {
+		db = new Database(dbPath, { readonly: true });
+	} catch {
+		return [];
+	}
+	try {
+		const sid = params?.filter_session_id ?? params?.filterSessionId;
+		const cwd = params?.cwd;
+		let rows;
+		if (typeof sid === "string" && sid) {
+			rows = db
+				.query("SELECT prompt FROM history WHERE session_id = ? ORDER BY created_at DESC LIMIT 200")
+				.all(sid);
+		} else if (typeof cwd === "string" && cwd) {
+			rows = db
+				.query("SELECT prompt FROM history WHERE cwd = ? ORDER BY created_at DESC LIMIT 200")
+				.all(cwd);
+		} else {
+			rows = db.query("SELECT prompt FROM history ORDER BY created_at DESC LIMIT 200").all();
+		}
+		return rows.map((r) => r.prompt).filter((p) => typeof p === "string");
+	} catch {
+		return [];
+	} finally {
+		try {
+			db.close();
+		} catch {}
+	}
+}
+
+/** OMP extension source → pager SkillInfo scope. */
+function skillScope(source) {
+	if (source === "user") return "user";
+	if (source === "project") return "repo";
+	if (source === "plugin") return "plugin";
+	if (source === "bundled") return "bundled";
+	return "local";
+}
+
+/** _omp/extensions skill-kind entry → pager SkillInfo (camelCase). */
+function extensionToSkillInfo(e) {
+	const paths =
+		typeof e.trigger === "string" && e.trigger.trim()
+			? e.trigger.split(",").map((s) => s.trim()).filter(Boolean)
+			: undefined;
+	return {
+		name: e.name,
+		displayName: e.displayName !== e.name ? e.displayName : undefined,
+		description: e.description ?? "",
+		hasUserSpecifiedDescription: Boolean(e.description),
+		paths,
+		path: e.path ?? "",
+		scope: skillScope(e.source),
+		userInvocable: true,
+	};
+}
+
+/** OMP hook trigger name → pager HookEvent (snake_case). */
+const OMP_HOOK_EVENT = {
+	tool_call: "pre_tool_use",
+	tool_result: "post_tool_use",
+	session_start: "session_start",
+	session_end: "session_end",
+	user_prompt_submit: "user_prompt_submit",
+	notification: "notification",
+	stop: "stop",
+	subagent_stop: "subagent_stop",
+	pre_compact: "pre_compact",
+};
+
+/** _omp/extensions hook-kind entry → pager HookInfo (camelCase). */
+function extensionToHookInfo(e) {
+	const raw = e.raw && typeof e.raw === "object" ? e.raw : {};
+	return {
+		name: e.name,
+		event: OMP_HOOK_EVENT[e.trigger] ?? e.trigger ?? "unknown",
+		handlerType: "command",
+		matcher: raw.matcher ?? raw.when,
+		command: raw.command ?? raw.cmd,
+		url: raw.url,
+		timeoutMs: raw.timeoutMs ?? raw.timeout_ms,
+		sourceDir: e.path ? dirname(e.path) : "",
+		disabled: e.state === "disabled",
+		pinned: e.source === "bundled",
+		removable: e.source !== "bundled",
+	};
+}
+
+/** _omp/extensions plugin-kind entry → pager PluginInfo (camelCase). */
+function extensionToPluginInfo(e) {
+	const scope =
+		e.source === "project" ? "project" : e.source === "user" ? "user" : e.source === "cli" ? "cli" : "config";
+	return {
+		name: e.name,
+		id: e.id ?? e.name,
+		root: e.path ?? "",
+		scope,
+		trusted: true,
+		enabled: e.state !== "disabled",
+		version: e.raw?.version,
+		description: e.description,
+		skillCount: 0,
+		skillNames: [],
+		agentCount: 0,
+		agentNames: [],
+		hookStatus: "none",
+		hookCount: 0,
+		mcpServerCount: 0,
+		mcpStatus: "none",
+	};
+}
+
+/** Pager ActionOutcome for extension mutations. */
+function actionOutcome(status, message, requiresReload = false) {
+	return { status, message, requiresReload, requiresRestart: false };
+}
+
+/**
+ * One JSON-schema property → one pager Question. Returns null when the shape
+ * can't be represented (caller falls through to verbatim forwarding, which
+ * yields method_not_found → OMP auto-approve, same as no elicitation.form).
+ * Freeform props (string/number without enum) get options:[] — the pager's
+ * question view always appends a freeform "Other" row, and a freeform-only
+ * answer arrives as labels:["Other"] with the typed text in annotations notes.
+ */
+function schemaPropToQuestion(key, prop, message) {
+	if (!prop || typeof prop !== "object") return null;
+	const question =
+		(typeof prop.title === "string" && prop.title) ||
+		(typeof prop.description === "string" && prop.description) ||
+		(typeof message === "string" && message) ||
+		key;
+	if (Array.isArray(prop.enum) && prop.enum.length) {
+		return {
+			question,
+			options: prop.enum.map((v) => ({ label: String(v), description: "" })),
+			multiSelect: false,
+			id: key,
+		};
+	}
+	if (prop.type === "boolean") {
+		return {
+			question,
+			options: [
+				{ label: "Yes", description: "" },
+				{ label: "No", description: "" },
+			],
+			multiSelect: false,
+			id: key,
+		};
+	}
+	if (prop.type === "string" || prop.type === "number" || prop.type === "integer") {
+		return { question, options: [], multiSelect: false, id: key };
+	}
+	return null;
+}
+
+/** JSON-RPC error object thrown by async worktree handlers. */
+function rpcError(code, message) {
+	const e = new Error(message);
+	e.rpcCode = code;
+	return e;
+}
+
+/** Run git in `cwd`; resolve stdout, reject with stderr text. */
+function gitOut(cwd, args) {
+	return new Promise((res, rej) => {
+		execFile("git", args, { cwd, timeout: 30000 }, (err, stdout, stderr) => {
+			if (err) rej(rpcError(-32603, `git ${args[0]}: ${(stderr || err.message).trim()}`));
+			else res(stdout);
+		});
+	});
+}
+
+/** `git worktree add`; retry --detach when the ref is checked out elsewhere. */
+async function gitWorktreeAdd(root, dest, ref) {
+	try {
+		await gitOut(root, ["worktree", "add", dest, ref]);
+	} catch (e) {
+		if (/already checked out|is already used by worktree/i.test(e.message)) {
+			await gitOut(root, ["worktree", "add", "--detach", dest, ref]);
+		} else {
+			throw e;
+		}
+	}
+}
+
+/** Copy dirty (modified/untracked) files from src worktree into dest. */
+async function copyDirtyFiles(src, dest) {
+	const out = await gitOut(src, ["status", "--porcelain", "-z"]);
+	for (const rec of out.split("\0")) {
+		if (!rec || rec.length < 4) continue;
+		const path = rec.slice(3).split(" -> ").pop();
+		if (!path) continue;
+		const from = join(src, path);
+		const to = join(dest, path);
+		try {
+			if (!existsSync(from)) continue;
+			mkdirSync(dirname(to), { recursive: true });
+			cpSync(from, to, { recursive: true });
+		} catch {
+			// file vanished between status and copy — skip
+		}
+	}
+}
+
+/** Filesystem-safe worktree directory label. */
+function sanitizeLabel(s) {
+	return String(s).replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "worktree";
+}
+
 // ---------------------------------------------------------------------------
 // advisor session tailer: OMP 18.1.17 never puts advisor notes on the ACP
 // wire — mapAssistantMessageEnd drops non-assistant messages live, and
@@ -756,11 +993,55 @@ class ExtSurface {
 		this.pendingTranslated = new Map();
 		/** toolCallId → subagent record for task-tool subagent synthesis. */
 		this.subagents = new Map();
+		/** toolCallId → terminal status, for subagent/cancel already_finished. */
+		this.finishedSubagents = new Map();
 		this.subagentSeq = 0;
 		/** selector → OMP model metadata (from `omp models --json`). */
 		this.catalog = null;
 		/** Extra client→agent requests to send right after the current one. */
 		this.followUp = [];
+		// -- usage/cost tracking (usage-cost.md) ------------------------------
+		/** Completed session/prompt turns observed this session. */
+		this.turns = 0;
+		/** Cumulative session cost in USD from usage_update.cost.amount. */
+		this.lastCost = null;
+		/** Summed per-turn token usage from session/prompt responses. */
+		this.turnTokens = { input: 0, output: 0, total: 0, cacheRead: 0, cacheWrite: 0 };
+		/** True once any prompt response carried a usage object. */
+		this.sawTurnUsage = false;
+		/** True when the session was loaded/resumed/forked (pre-bridge history). */
+		this.sessionResumed = false;
+		/** Last session_info_update title. */
+		this.sessionTitle = null;
+		// -- virtual prompt queue (interaction.md) ----------------------------
+		// OMP cancels a running turn when a second session/prompt arrives, so
+		// the adapter holds extra prompts client-side and drains FIFO on turn
+		// end. `held` entries: {queueId, kind, text, version, frame|params,
+		// clientId, agentId, answerResult}.
+		this.held = [];
+		/** The prompt OMP is currently answering: {agentId, queueId, kind, text}. */
+		this.running = null;
+		/** agentId → true for every session/prompt in flight (running or
+		 *  implicitly-cancelled-but-unsettled). */
+		this.inFlightPrompts = new Set();
+		/** agentId → {kind, clientId, answerResult} for adapter-internal
+		 *  requests whose responses must not reach the pager. */
+		this.internalIds = new Map();
+		/** pager request id → {ompId, kind, prop} for bridged elicitations. */
+		this.bridgedElicits = new Map();
+		this.internalSeq = 0;
+		/** Client-bound frames to emit after the current one. */
+		this.outToClient = [];
+		/** Agent-bound frames to emit after the current one. */
+		this.outToAgent = [];
+		/** Last enriched session/list rows (roster + search source). */
+		this.lastSessionRows = [];
+		/** Last _omp/extensions response (toggle id resolution). */
+		this.extCache = null;
+		/** cwd → worktree label for rows created via git/worktree/*. */
+		this.knownWorktrees = new Map();
+		/** request id → sessionId for session/load|resume|fork in flight. */
+		this.pendingSessionSwitch = new Map();
 	}
 
 	// -- state capture ------------------------------------------------------
@@ -782,6 +1063,9 @@ class ExtSurface {
 		// session/new result → session identity + model catalog.
 		if (frame.result?.sessionId !== undefined && frame.id !== undefined) {
 			this.captureSessionNew(frame.result);
+			// A new session replaces the queue scope: held prompts belonged to
+			// the previous session and must not drain into this one.
+			this.resetQueue();
 			// The pager's model picker reads `resp.models` (SessionModelState)
 			// from session/new; OMP omits it. Inject the catalog synthesized from
 			// configOptions so the picker populates on connect, not just on the
@@ -802,6 +1086,39 @@ class ExtSurface {
 			// only emits configOptions. Synthesize the model-state notification
 			// so the picker populates without a manual refetch.
 			if (models) extra.push(this.notif("_x.ai/models/update", models));
+			// FleetView roster: announce the live session.
+			extra.push(this.notif("_x.ai/sessions/changed", {
+				upserted: [this.rosterEntryFor(this.session?.sessionId, true)],
+				removed: [],
+			}));
+		}
+
+		// session/load|resume|fork responses switch the active session: reset
+		// queue + usage scope, and adopt the sessionId (fork results carry it;
+		// load/resume results don't, so fall back to the request's param).
+		if (
+			frame.id !== undefined &&
+			frame.result !== undefined &&
+			this.pendingSessionSwitch?.has(frame.id)
+		) {
+			const sid = frame.result.sessionId ?? this.pendingSessionSwitch.get(frame.id);
+			this.pendingSessionSwitch.delete(frame.id);
+			this.resetQueue();
+			this.sessionResumed = true;
+			if (sid) {
+				this.session = { sessionId: sid, modes: frame.result.modes ?? this.session?.modes ?? null };
+			}
+			this.captureConfigOptions(frame.result.configOptions);
+		}
+
+		// session/close response → roster removal broadcast.
+		if (frame.id !== undefined && this.pendingClose?.has(frame.id)) {
+			const closedId = this.pendingClose.get(frame.id);
+			this.pendingClose.delete(frame.id);
+			if (closedId) {
+				this.lastSessionRows = this.lastSessionRows.filter((r) => r.sessionId !== closedId);
+				extra.push(this.notif("_x.ai/sessions/changed", { upserted: [], removed: [closedId] }));
+			}
 		}
 
 		// session/update notifications → commands, usage, config, subagents.
@@ -813,9 +1130,13 @@ class ExtSurface {
 					break;
 				case "usage_update":
 					this.usage = { size: update.size, used: update.used };
+					if (typeof update.cost?.amount === "number") this.lastCost = update.cost.amount;
 					break;
 				case "config_option_update":
 					this.captureConfigOptions(update.configOptions);
+					break;
+				case "session_info_update":
+					if (typeof update.title === "string") this.sessionTitle = update.title;
 					break;
 				case "tool_call":
 					this.observeToolCallStart(update, extra);
@@ -836,6 +1157,20 @@ class ExtSurface {
 		if (frame?.method === "session/new" && frame.params) {
 			this.mcpServers = Array.isArray(frame.params.mcpServers) ? frame.params.mcpServers : [];
 			this.sessionCwd = frame.params.cwd ?? null;
+		}
+		if (
+			frame?.id !== undefined &&
+			(frame.method === "session/load" || frame.method === "session/resume" || frame.method === "session/fork")
+		) {
+			(this.pendingSessionSwitch ??= new Map()).set(
+				frame.id,
+				frame.method === "session/fork" ? undefined : frame.params?.sessionId,
+			);
+		}
+		// session/close: remember the id so the response can broadcast the
+		// roster removal (sessions.md: synthesize sessions/changed on close).
+		if (frame?.id !== undefined && frame.method === "session/close") {
+			(this.pendingClose ??= new Map()).set(frame.id, frame.params?.sessionId);
 		}
 	}
 
@@ -933,13 +1268,15 @@ class ExtSurface {
 	observeToolCallStart(update, extra) {
 		const raw = update.rawInput ?? {};
 		// OMP's task tool isn't in TOOL_SHAPING, so no _meta stamp. Detect it by
-		// an explicit tool id, a bare "task" title, or the task-tool input shape
-		// (a prompt plus an agent/label selector).
+		// an explicit tool id, a bare "task" title, the task_* toolCallId prefix
+		// OMP assigns, or the task-tool input shape (prompt + description).
 		const toolName = update._meta?.["x.ai/tool"] ?? raw.tool;
 		const isTask =
 			toolName === "task" ||
 			update.title === "task" ||
-			(typeof raw.prompt === "string" && (raw.agent !== undefined || raw.label !== undefined || raw.task !== undefined));
+			(typeof update.toolCallId === "string" && update.toolCallId.startsWith("task_")) ||
+			(typeof raw.prompt === "string" &&
+				(raw.agent !== undefined || raw.label !== undefined || raw.task !== undefined || raw.description !== undefined));
 		if (!isTask) return;
 		const toolCallId = update.toolCallId;
 		if (!toolCallId || this.subagents.has(toolCallId)) return;
@@ -949,8 +1286,15 @@ class ExtSurface {
 		this.subagents.set(toolCallId, {
 			subagentId,
 			childSessionId,
+			toolCallId,
+			subagentType: typeof raw.agent === "string" && raw.agent ? raw.agent : "general-purpose",
+			description,
 			startedAt: Date.now(),
 			toolCalls: 0,
+			tokensUsed: 0,
+			// undefined until a tool_call_update reveals OMP's async dispatch
+			// shape (details.async); then mirrors the aggregate job state.
+			asyncState: undefined,
 		});
 		extra.push(this.notif("_x.ai/session/update", {
 			sessionId: this.session?.sessionId,
@@ -959,7 +1303,7 @@ class ExtSurface {
 				subagent_id: subagentId,
 				parent_session_id: this.session?.sessionId,
 				child_session_id: childSessionId,
-				subagent_type: "general-purpose",
+				subagent_type: this.subagents.get(toolCallId).subagentType,
 				description,
 				context_normalized: false,
 			},
@@ -970,24 +1314,95 @@ class ExtSurface {
 		const toolCallId = update.toolCallId;
 		const rec = toolCallId && this.subagents.get(toolCallId);
 		if (!rec) return;
+		const out = update.rawOutput && typeof update.rawOutput === "object" ? update.rawOutput : {};
+		const details = out.details && typeof out.details === "object" ? out.details : {};
+		// OMP's task tool returns as soon as the subagent jobs are *dispatched*;
+		// details.async.state is the aggregate over those jobs ("running" until
+		// every spawn settles — task/index.ts buildAsyncDetails). The tool_call's
+		// own terminal status only means the dispatch finished, so a "running"
+		// async state must NOT emit subagent_finished: the subagent is genuinely
+		// still running. Its real finish reaches the wire as a later
+		// tool_call_update (status "in_progress") whose details.async.state has
+		// settled — the job's onProgress keeps calling the tool's onUpdate while
+		// the parent turn's event stream is still open.
+		const asyncState = typeof details.async?.state === "string" ? details.async.state : undefined;
+		if (asyncState !== undefined) {
+			rec.asyncState = asyncState;
+		}
+		// Lift live counters from the per-spawn progress snapshots when present.
+		if (Array.isArray(details.progress)) {
+			let tools = 0;
+			let tokens = 0;
+			for (const p of details.progress) {
+				if (typeof p?.toolCount === "number") tools += p.toolCount;
+				if (typeof p?.tokens === "number") tokens += p.tokens;
+			}
+			rec.toolCalls = tools;
+			rec.tokensUsed = tokens;
+		}
+		const ASYNC_TERMINAL = new Set(["completed", "failed", "cancelled", "aborted"]);
+		if (rec.asyncState !== undefined && !ASYNC_TERMINAL.has(rec.asyncState)) {
+			// Dispatched but still running — hold the finish.
+			return;
+		}
 		const status = update.status;
-		if (status !== "completed" && status !== "failed" && status !== "cancelled") return;
-		this.subagents.delete(toolCallId);
-		extra.push(this.notif("_x.ai/session/update", {
+		if (status !== "completed" && status !== "failed" && status !== "cancelled") {
+			// Non-terminal tool_call_update: only interesting when it carries the
+			// subagent's terminal async state (the real finish signal).
+			if (rec.asyncState === undefined || !ASYNC_TERMINAL.has(rec.asyncState)) return;
+			this.finishSubagent(rec, rec.asyncState === "aborted" ? "cancelled" : rec.asyncState, out);
+			return;
+		}
+		// Terminal tool_call_update: emit when the call was synchronous (no
+		// details.async — the tool result IS the subagent's result) or when the
+		// async aggregate already settled before the call returned.
+		const finalStatus =
+			rec.asyncState !== undefined && ASYNC_TERMINAL.has(rec.asyncState)
+				? rec.asyncState === "aborted"
+					? "cancelled"
+					: rec.asyncState
+				: status;
+		this.finishSubagent(rec, finalStatus, out);
+	}
+
+	/**
+	 * Emit `subagent_finished` for a tracked task-tool subagent and record the
+	 * terminal status so `x.ai/subagent/cancel` answers already_finished.
+	 */
+	finishSubagent(rec, status, out) {
+		this.finishedSubagents.set(rec.subagentId, status);
+		this.subagents.delete(rec.toolCallId);
+		const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+		this.outToClient.push(this.notif("_x.ai/session/update", {
 			sessionId: this.session?.sessionId,
 			update: {
 				sessionUpdate: "subagent_finished",
 				subagent_id: rec.subagentId,
 				child_session_id: rec.childSessionId,
 				status,
-				error: status === "failed" ? (update.rawOutput?.error ?? "subagent failed") : undefined,
-				tool_calls: rec.toolCalls,
-				turns: 1,
+				error: status === "failed" ? (out.error ?? "subagent failed") : undefined,
+				tool_calls: num(out.toolCalls ?? out.tool_calls) ?? rec.toolCalls,
+				turns: num(out.turns) ?? 1,
 				duration_ms: Date.now() - rec.startedAt,
-				tokens_used: 0,
+				tokens_used: num(out.tokensUsed ?? out.tokens_used) ?? rec.tokensUsed,
 				will_wake: false,
+				output: typeof out.summary === "string" ? out.summary : undefined,
 			},
 		}));
+	}
+
+	/**
+	 * Turn settle fallback: a tracked subagent whose tool_call never produced a
+	 * terminal update (dropped frame, aborted batch) is finished with the turn.
+	 * Records last seen with async state "running" are skipped — the subagent
+	 * genuinely outlives the turn and stays live in the pager's tasks pane.
+	 */
+	finishSubagentsAtTurnEnd(stopReason) {
+		const fallback = stopReason === "cancelled" ? "cancelled" : stopReason === "error" ? "failed" : "completed";
+		for (const rec of [...this.subagents.values()]) {
+			if (rec.asyncState !== undefined) continue;
+			this.finishSubagent(rec, fallback, {});
+		}
 	}
 
 	/**
@@ -1068,50 +1483,88 @@ class ExtSurface {
 			};
 		}
 
+		// Virtual prompt queue (interaction.md): OMP has no server-side queue —
+		// a second session/prompt mid-turn cancels the running turn. Hold extra
+		// prompts client-side and drain FIFO when the turn settles. `_meta.
+		// sendNow` is the pager's send-now flag: dispatch immediately and let
+		// OMP's implicit cancel do exactly what send-now means.
+		if (method === "session/prompt") {
+			const p = frame.params ?? {};
+			const entry = {
+				queueId: p._meta?.promptId ?? `prompt-${frame.id}`,
+				kind: "prompt",
+				text: promptBlocksText(p.prompt),
+				version: 0,
+				frame,
+				clientId: frame.id,
+				agentId: frame.id,
+			};
+			if (this.running && !p._meta?.sendNow) this.held.push(entry);
+			else this.dispatchEntry(entry);
+			this.broadcastQueue();
+			return { action: "hold" };
+		}
+
 		if (!method.startsWith("x.ai/") && !method.startsWith("_x.ai/")) {
 			return null;
 		}
 		const m = method.replace(/^_?x\.ai\//, "");
+		const p = frame.params ?? {};
 
 		switch (m) {
 			// -- answered from observed state ----------------------------------
-			case "session/info":
+			case "session/info": {
 				// This call site reads `response.result` (double-wrapped), unlike
 				// the bare-payload sites — see acp_handler session_info fetch.
+				const used = this.usage?.used ?? 0;
+				const total = this.usage?.size ?? 0;
+				const usagePct = total > 0 ? Math.min(100, Math.round((used / total) * 100)) : 0;
 				return this.answer({
 					result: {
-						sessionId: this.session?.sessionId,
-						cwd: this.sessionCwd,
+						sessionId: this.session?.sessionId ?? "",
+						cwd: this.sessionCwd ?? "",
 						agentName: this.agentInfo?.name ?? "oh-my-pi",
-						model: this.modelConfig?.currentValue,
-						turns: 0,
-						context: this.usage
-							? { size: this.usage.size, used: this.usage.used }
-							: { size: 0, used: 0 },
+						model: this.modelConfig?.currentValue ?? null,
+						resolvedModelId: null,
+						modelFingerprint: null,
+						turns: this.turns,
+						turnIndex: this.turns > 0 ? this.turns - 1 : 0,
+						context: {
+							used,
+							total,
+							usagePct,
+							freeTokens: Math.max(0, total - used),
+							turnCount: this.turns,
+							compactionCount: 0,
+							usageCategories: this.usageCategories(),
+						},
 					},
 				});
-			case "session/usage":
-				// OMP's usage_update reports context-window size/used, not token
-				// counts. Return an honest, explicitly-incomplete usage rather
-				// than fabricate token numbers.
-				return this.answer({
-					usage: {
-						numTurns: 0,
-						modelUsage: {},
-						usageIsIncomplete: true,
-					},
-				});
+			}
+			case "session/usage": {
+				// Bare {usage: PromptUsage}. Token counters are the sums of the
+				// per-turn `usage` objects on prompt responses; cost is OMP's
+				// cumulative session cost in 1e10 ticks/USD. usageIsIncomplete
+				// stays honest: true for resumed sessions (pre-bridge turns we
+				// never saw) and before the first usage-bearing response.
+				const usage = {
+					inputTokens: this.turnTokens.input,
+					outputTokens: this.turnTokens.output,
+					totalTokens: this.turnTokens.total,
+					cachedReadTokens: this.turnTokens.cacheRead,
+					cacheCreationTokens: this.turnTokens.cacheWrite,
+					modelCalls: this.turns,
+					modelUsage: {},
+					numTurns: this.turns,
+					usageIsIncomplete: this.sessionResumed || !this.sawTurnUsage,
+				};
+				if (this.lastCost != null) usage.costUsdTicks = Math.round(this.lastCost * 1e10);
+				return this.answer({ usage });
+			}
 			case "commands/list":
 				return this.answer({ commands: this.commands });
-			case "mcp/list":
-				return this.answer({
-					servers: this.mcpServers.map((s) => ({
-						name: s.name,
-						session: { enabled: true },
-					})),
-				});
 			case "prompt_history":
-				return this.answer({ prompts: [] });
+				return this.answer({ prompts: readOmpPromptHistory(p) });
 			case "bundle/status":
 				return this.answer({
 					hasCache: false,
@@ -1125,35 +1578,306 @@ class ExtSurface {
 			case "suggest":
 			case "suggestPrompt":
 				return this.answer({ generation: 0, ghost: null, completions: [] });
-			case "session/search":
-				return this.answer({ results: [] });
 
-			// -- forwarded to OMP, response translated --------------------------
+			// -- sessions (sessions.md) -----------------------------------------
 			case "session/list":
 				return {
 					action: "forward",
 					as: "session/list",
-					translate: enrichSessionList,
+					rewriteParams: { cwd: p.cwd, cursor: p.cursor },
+					translate: (r) => this.translateSessionList(r, p),
+				};
+			case "session/search":
+				// OMP has no query param; search the full listing adapter-side.
+				return {
+					action: "forward",
+					as: "_omp/sessions/listAll",
+					rewriteParams: { limit: 1000 },
+					translate: (r) => this.translateSessionSearch(r, p),
 				};
 			case "session/fork":
+				// Pager sends sourceSessionId/newCwd; OMP wants sessionId/cwd and
+				// answers {sessionId} which the pager reads back as newSessionId.
 				return {
 					action: "forward",
 					as: "session/fork",
-					translate: (r) => r,
+					rewriteParams: {
+						sessionId: p.sourceSessionId ?? p.sessionId,
+						cwd: p.newCwd ?? p.sourceCwd ?? p.cwd,
+					},
+					translate: (r) => ({ ...r, newSessionId: r?.sessionId ?? r?.newSessionId }),
 				};
+			case "sessions/list": {
+				// FleetView roster: live session + dormant rows from the last
+				// session/list. Kick a refresh so the next fetch is populated.
+				if (!this.lastSessionRows.length) this.requestSessionList();
+				const rows = this.lastSessionRows.map((r) => this.rosterEntryFor(r.sessionId, false));
+				const liveId = this.session?.sessionId;
+				if (liveId && !rows.some((r) => r.sessionId === liveId)) {
+					rows.unshift(this.rosterEntryFor(liveId, true));
+				} else if (liveId) {
+					const i = rows.findIndex((r) => r.sessionId === liveId);
+					if (i >= 0) rows[i] = this.rosterEntryFor(liveId, true);
+				}
+				return this.answer({ sessions: rows });
+			}
+			case "session/delete":
+				return this.err(`session/delete: OMP exposes no ACP or CLI delete verb (SessionManager.deleteSessionWithArtifacts is internal)`);
+			case "session/rename":
+				return this.err(`session/rename: OMP exposes no ACP or CLI rename verb (SessionManager.setSessionName is internal)`);
 
-			// -- truthful empty lists (OMP has the concept, no data source) -----
-			// Each endpoint decodes a distinct envelope; `{items:[]}` fits none.
-			case "hooks/list":
-				return this.answer({ hooks: [], project_trusted: true, load_errors: [] });
-			case "plugins/list":
-				return this.answer({ plugins: [] });
-			case "marketplace/list":
-				return this.answer({ sources: [] });
+			// -- interaction (interaction.md) ------------------------------------
+			case "interject": {
+				// True mid-turn steer is impossible over ACP: the interjection
+				// lands as the next queued prompt. Echo it back so every pane
+				// paints the row (the pager dedups self-originated echoes via
+				// interjectionId).
+				const text = typeof p.text === "string" ? p.text : "";
+				const content = Array.isArray(p.content) && p.content.length ? p.content : [{ type: "text", text }];
+				const entry = {
+					queueId: p.interjectionId ?? `interject-${++this.internalSeq}`,
+					kind: "interjection",
+					text,
+					version: 0,
+					params: { sessionId: p.sessionId ?? this.session?.sessionId, prompt: content },
+					clientId: undefined,
+					agentId: `xai-int-${++this.internalSeq}`,
+				};
+				if (this.running) this.held.push(entry);
+				else this.dispatchEntry(entry);
+				this.broadcastQueue();
+				this.outToClient.push(this.notif("_x.ai/session/interjection", {
+					sessionId: p.sessionId ?? this.session?.sessionId,
+					text,
+					interjectionId: p.interjectionId,
+				}));
+				return this.answer({ status: "queued" });
+			}
+			case "btw":
+				return this.err("x.ai/btw: OMP has no side-question channel over ACP");
+
+			// -- session control (session-control.md) ----------------------------
+			case "compact_conversation": {
+				// OMP's /compact is a builtin slash command — a real prompt turn.
+				// Queue it like any other prompt; answer {} when it settles.
+				const text = `/compact${typeof p.userContext === "string" && p.userContext ? ` ${p.userContext}` : ""}`;
+				const entry = {
+					queueId: `compact-${++this.internalSeq}`,
+					kind: "compact",
+					text,
+					version: 0,
+					params: { sessionId: p.sessionId ?? this.session?.sessionId, prompt: [{ type: "text", text }] },
+					clientId: frame.id,
+					agentId: `xai-int-${++this.internalSeq}`,
+					answerResult: {},
+				};
+				if (this.running) this.held.push(entry);
+				else this.dispatchEntry(entry);
+				this.broadcastQueue();
+				return { action: "defer" };
+			}
+			case "rewind/points":
+				return this.err("x.ai/rewind/points: OMP rewind is tool-driven (checkpoint tool); no per-prompt-index ACP surface");
+			case "rewind/execute":
+				return this.err("x.ai/rewind/execute: OMP rewind is tool-driven; no client-initiated rewind over ACP");
+			case "recap":
+				return this.err("x.ai/recap: OMP has no recap generator over ACP");
+
+			// -- extensions (extensions.md) --------------------------------------
 			case "skills/list":
-				return this.answer({ skills: [] });
+				return {
+					action: "forward",
+					as: "_omp/extensions",
+					rewriteParams: { cwd: p.cwd ?? this.sessionCwd },
+					translate: (r) => ({ skills: this.extensionsOfKind(r, "skill").map(extensionToSkillInfo) }),
+				};
+			case "skills/toggle": {
+				const name = p.name ?? p.skillName ?? p.skill;
+				if (typeof name !== "string" || !name) return this.err("skills/toggle: missing skill name");
+				const enabled = p.enabled ?? (p.disabled === true ? false : undefined);
+				return {
+					action: "forward",
+					as: "_omp/extensions/toggle",
+					rewriteParams: { providerId: `skill:${name}`, enabled: enabled !== false },
+					translate: (r) => ({ result: { ok: true, enabled: r?.enabled !== false } }),
+				};
+			}
+			case "skills/add":
+			case "skills/remove":
+			case "skills/reset":
+			case "skills/config":
+				return this.err(`x.ai/${m}: OMP has no skill ${m.split("/")[1]} over ACP`);
 			case "workflows/list":
 				return this.answer({ workflows: [] });
+			case "hooks/list":
+				return {
+					action: "forward",
+					as: "_omp/extensions",
+					rewriteParams: { cwd: p.cwd ?? this.sessionCwd },
+					translate: (r) => ({
+						hooks: this.extensionsOfKind(r, "hook").map(extensionToHookInfo),
+						projectTrusted: true,
+						loadErrors: [],
+					}),
+				};
+			case "hooks/action": {
+				const a = p.action ?? {};
+				if ((a.type === "enable" || a.type === "disable") && typeof a.hookName === "string") {
+					return {
+						action: "forward",
+						as: "_omp/extensions/toggle",
+						rewriteParams: { providerId: `hook:${a.hookName}`, enabled: a.type === "enable" },
+						translate: () => {
+							this.setExtState(`hook:${a.hookName}`, a.type === "enable");
+							this.pushHooksChanged();
+							return { result: actionOutcome("success", `hook ${a.hookName} ${a.type}d`, true) };
+						},
+					};
+				}
+				return this.answer({ result: actionOutcome("unsupported", `hooks action '${a.type ?? "?"}' has no OMP ACP path`) });
+			}
+			case "plugins/list":
+				return {
+					action: "forward",
+					as: "_omp/extensions",
+					rewriteParams: { cwd: p.cwd ?? this.sessionCwd },
+					translate: (r) => ({ plugins: this.extensionsOfKind(r, "plugin").map(extensionToPluginInfo) }),
+				};
+			case "plugins/action": {
+				const a = p.action ?? {};
+				if ((a.type === "enable" || a.type === "disable") && typeof a.pluginId === "string") {
+					return {
+						action: "forward",
+						rewriteParams: { providerId: `plugin:${a.pluginId}`, enabled: a.type === "enable" },
+						translate: () => {
+							this.setExtState(`plugin:${a.pluginId}`, a.type === "enable");
+							this.pushPluginsChanged();
+							return { result: actionOutcome("success", `plugin ${a.pluginId} ${a.type}d`, true) };
+						},
+					};
+				}
+				return this.answer({ result: actionOutcome("unsupported", `plugins action '${a.type ?? "?"}' has no OMP ACP path`) });
+			}
+			case "plugins/reload":
+				return this.answer({ result: actionOutcome("unsupported", "OMP reloads plugins internally; no ACP reload") });
+			case "marketplace/list":
+				return this.answer({ sources: [] });
+			case "marketplace/action":
+				return this.err("x.ai/marketplace/action: OMP marketplace has no ACP surface");
+			case "mcp/list":
+				return {
+					action: "forward",
+					as: "_omp/extensions",
+					rewriteParams: { cwd: this.sessionCwd },
+					translate: (r) => ({ servers: this.mcpServerEntries(r) }),
+				};
+			case "mcp/toggle": {
+				const serverName = p.serverName ?? p.server_name;
+				if (typeof serverName !== "string" || !serverName) return this.err("mcp/toggle: missing serverName");
+				return {
+					action: "forward",
+					as: "_omp/extensions/toggle",
+					rewriteParams: { providerId: `mcp:${serverName}`, enabled: p.enabled !== false },
+					translate: () => {
+						this.setExtState(`mcp:${serverName}`, p.enabled !== false);
+						// Real wire shape: {mcpServers:[...]} with NO sessionId — the
+						// pager broadcasts to every agent with an open modal.
+						this.outToClient.push(this.notif("_x.ai/mcp/servers_updated", { mcpServers: [] }));
+						return { result: { ok: true } };
+					},
+				};
+			}
+			case "mcp/toggle_tool":
+			case "mcp/upsert":
+			case "mcp/delete":
+			case "mcp/setup":
+			case "mcp/auth_status":
+			case "mcp/auth_trigger":
+			case "mcp/read_resource":
+			case "mcp/call":
+				return this.err(`x.ai/${m}: OMP MCP ${m.split("/")[1]} has no ACP surface`);
+
+			// -- subagents & tasks (subagents.md) --------------------------------
+			case "subagent/cancel": {
+				// No per-subagent cancel crosses ACP — session/cancel would kill
+				// the whole turn. Answer truthfully: not_found for unknown ids,
+				// already_finished for completed ones, and (per the pager-side
+				// contract) not_found for live omp-task rows so the pager keeps
+				// the row live with a note instead of stamping it cancelled.
+				const id = p.subagentId ?? p.subagent_id;
+				const finished = this.finishedSubagents?.get(id);
+				const outcome = finished
+					? { kind: "already_finished", status: finished }
+					: { kind: "not_found" };
+				return this.answer({ result: { subagentId: id, cancelled: false, outcome } });
+			}
+			case "subagent/list_running":
+				return this.answer({
+					result: {
+						subagents: [...this.subagents.values()].map((r) => ({
+							subagentId: r.subagentId,
+							parentSessionId: this.session?.sessionId ?? "",
+							childSessionId: r.childSessionId,
+							subagentType: r.subagentType,
+							description: r.description,
+							startedAtEpochMs: r.startedAt,
+							durationMs: Date.now() - r.startedAt,
+							turnCount: 0,
+							toolCallCount: r.toolCalls,
+							tokensUsed: 0,
+							contextWindowTokens: this.usage?.size ?? 0,
+							contextUsagePct: this.usage?.size ? Math.min(100, Math.round(((this.usage?.used ?? 0) / this.usage.size) * 100)) : 0,
+							toolsUsed: [],
+							errorCount: 0,
+						})),
+					},
+				});
+			case "subagent/message":
+				return this.err("x.ai/subagent/message: OMP subagent steering does not cross ACP");
+			case "task/kill":
+				return this.err("x.ai/task/kill: OMP exposes no background-task registry over ACP; bash{async} completions arrive as ordinary tool_call results");
+			case "task/list":
+				return this.answer({ result: { tasks: [] } });
+
+			// -- auth & billing (auth-accounts.md, usage-cost.md) ----------------
+			case "auth/info":
+				// Minimal honest account row: OMP auth is ambient local
+				// credentials; retention opt-out fails closed like the shell's
+				// no-credential default.
+				return this.answer({ result: { methodId: "agent", codingDataRetentionOptOut: true } });
+			case "auth/get_url":
+			case "auth/submit_code":
+			case "auth/cancel":
+			case "auth/logout":
+			case "auth/check_subscription":
+			case "auth/getBearerToken":
+			case "getApiKey":
+			case "setApiKey":
+				return this.err(`x.ai/${m}: no xAI auth flow exists behind OMP; credentials live in OMP's own store`);
+			case "consent/record":
+				return this.err("x.ai/consent/record: consent notices are xAI-server-targeted; none apply to OMP");
+			case "billing":
+			case "auto-topup-rule":
+				return this.err(`x.ai/${m}: OMP has no xAI billing concept`);
+
+			// -- data surfaces (data-surfaces.md) --------------------------------
+			case "share_session":
+				return this.err("x.ai/share_session: OMP has no remote share service");
+			case "memory/flush":
+			case "memory/rewrite":
+				return this.err(`x.ai/${m}: OMP session memory is internal; no ACP flush/rewrite`);
+			case "scheduler/delete":
+				return this.err("x.ai/scheduler/delete: OMP has no scheduler");
+
+			// -- worktrees (worktrees.md) — real local git work ------------------
+			case "git/worktree/create_from_worktree_sync":
+				return { action: "answerAsync", promise: this.worktreeCreate(p) };
+			case "git/worktree/resume_session":
+				return { action: "answerAsync", promise: this.worktreeResume(p) };
+			case "git/worktree/list":
+				return { action: "answerAsync", promise: this.worktreeList(p) };
+			case "git/worktree/remove":
+				return { action: "answerAsync", promise: this.worktreeRemove(p) };
 
 			// -- no OMP data source: error, don't fabricate ---------------------
 			default:
@@ -1162,6 +1886,622 @@ class ExtSurface {
 					error: { code: -32601, message: `x.ai method not available via OMP: ${method}` },
 				};
 		}
+	}
+
+	err(message) {
+		return { action: "error", error: { code: -32601, message } };
+	}
+
+	// -- virtual prompt queue ---------------------------------------------------
+
+	/** Send a held/new prompt to OMP and mark it running. */
+	dispatchEntry(entry) {
+		const agentId = entry.agentId ?? `xai-int-${++this.internalSeq}`;
+		entry.agentId = agentId;
+		const req = entry.frame ?? {
+			jsonrpc: "2.0",
+			id: agentId,
+			method: "session/prompt",
+			params: entry.params,
+		};
+		if (entry.clientId !== agentId) this.internalIds.set(agentId, entry);
+		this.inFlightPrompts.add(agentId);
+		this.running = { agentId, queueId: entry.queueId, kind: entry.kind, text: entry.text };
+		this.outToAgent.push(req);
+	}
+
+	/** A prompt response arrived: settle the turn and release the next held. */
+	settleTurn(agentId, stopReason) {
+		this.inFlightPrompts.delete(agentId);
+		if (this.running?.agentId !== agentId) return; // implicitly-cancelled prompt settling late
+		this.running = null;
+		this.finishSubagentsAtTurnEnd(stopReason);
+		this.broadcastQueue();
+	}
+
+	/** Accumulate per-turn usage from a session/prompt response. */
+	noteTurnSettled(frame) {
+		this.turns++;
+		const u = frame?.result?.usage;
+		if (u && typeof u === "object") {
+			this.sawTurnUsage = true;
+			this.turnTokens.input += u.inputTokens ?? 0;
+			this.turnTokens.output += u.outputTokens ?? 0;
+			this.turnTokens.total += u.totalTokens ?? 0;
+			this.turnTokens.cacheRead += u.cachedReadTokens ?? 0;
+			this.turnTokens.cacheWrite += u.cachedWriteTokens ?? 0;
+		}
+	}
+
+	/**
+	 * Agent→client response handling for adapter-internal requests and turn
+	 * bookkeeping. Returns true when the frame was consumed (must not reach the
+	 * pager), false/null to pass through.
+	 */
+	handleAgentResponse(frame) {
+		if (!frame || typeof frame !== "object" || frame.id === undefined || frame.method !== undefined) return null;
+		const rec = this.internalIds.get(frame.id);
+		if (rec) {
+			this.internalIds.delete(frame.id);
+			if (rec.kind === "prompt" || rec.params) {
+				this.noteTurnSettled(frame);
+				this.settleTurn(frame.id, frame.result?.stopReason);
+			}
+			if (rec.kind === "sessionList" && frame.result !== undefined) {
+				this.lastSessionRows = this.translateSessionList(frame.result, {}).sessions;
+				this.outToClient.push(this.notif("_x.ai/sessions/changed", {
+					upserted: this.lastSessionRows.map((r) => this.rosterEntryFor(r.sessionId, false)),
+					removed: [],
+				}));
+			}
+			if (rec.clientId !== undefined) {
+				this.outToClient.push(
+					frame.error !== undefined
+						? { jsonrpc: "2.0", id: rec.clientId, error: frame.error }
+						: { jsonrpc: "2.0", id: rec.clientId, result: rec.answerResult ?? {} },
+				);
+			}
+			return true;
+		}
+		if (this.inFlightPrompts.has(frame.id)) {
+			this.noteTurnSettled(frame);
+			this.settleTurn(frame.id, frame.result?.stopReason);
+			return null; // pager-originated prompt: response passes through
+		}
+		return null;
+	}
+
+	/**
+	 * Client→agent response handling: answers to adapter-bridged elicitation
+	 * requests are translated back to OMP's `elicitation/create` shape and
+	 * re-emitted under OMP's original request id. Returns the frame to send to
+	 * OMP, or null when the frame isn't a bridged response.
+	 */
+	handleClientResponse(frame) {
+		if (!frame || typeof frame !== "object" || frame.id === undefined || frame.method !== undefined) return null;
+		const rec = this.bridgedElicits.get(frame.id);
+		if (!rec) return null;
+		this.bridgedElicits.delete(frame.id);
+		const result = frame.error !== undefined ? { action: "cancel" } : this.elicitResultToOmp(rec, frame.result);
+		return { jsonrpc: "2.0", id: rec.ompId, result };
+	}
+
+	/**
+	 * Client→agent notifications on the x.ai rail (no id): queue mutations and
+	 * plan-mode toggle. Returns true when consumed; false → forward verbatim.
+	 */
+	handleNotification(frame) {
+		const method = frame?.method;
+		if (typeof method !== "string" || frame.id !== undefined) return false;
+		if (!method.startsWith("x.ai/") && !method.startsWith("_x.ai/")) return false;
+		const m = method.replace(/^_?x\.ai\//, "");
+		const p = frame.params ?? {};
+		switch (m) {
+			case "toggle_plan_mode": {
+				const current = this.modeConfig?.currentValue;
+				const target = current === "plan" ? this.defaultModeId() : "plan";
+				this.emitAgentRequest("session/set_mode", {
+					sessionId: p.sessionId ?? this.session?.sessionId,
+					modeId: target,
+				});
+				return true;
+			}
+			case "queue/remove": {
+				const i = this.held.findIndex((e) => e.queueId === p.id);
+				if (i >= 0) this.cancelHeld(this.held.splice(i, 1)[0]);
+				this.broadcastQueue();
+				return true;
+			}
+			case "queue/reorder": {
+				if (Array.isArray(p.orderedIds)) {
+					const rank = new Map(p.orderedIds.map((id, i) => [id, i]));
+					this.held.sort((a, b) => (rank.get(a.queueId) ?? 1e9) - (rank.get(b.queueId) ?? 1e9));
+				}
+				this.broadcastQueue();
+				return true;
+			}
+			case "queue/clear": {
+				for (const e of this.held.splice(0)) this.cancelHeld(e);
+				this.broadcastQueue();
+				return true;
+			}
+			case "queue/edit": {
+				const e = this.held.find((x) => x.queueId === p.id);
+				if (e && typeof p.newText === "string") {
+					e.text = p.newText;
+					e.version++;
+					const blocks = [{ type: "text", text: p.newText }];
+					if (e.frame?.params?.prompt) e.frame.params.prompt = blocks;
+					if (e.params?.prompt) e.params.prompt = blocks;
+				}
+				this.broadcastQueue();
+				return true;
+			}
+			case "queue/interject": {
+				// Send-now: promote the held entry immediately. OMP cancels the
+				// running turn on the new prompt — exactly send-now semantics.
+				const i = this.held.findIndex((e) => e.queueId === p.id);
+				const e = i >= 0 ? this.held.splice(i, 1)[0] : null;
+				if (e) {
+					if (typeof p.newText === "string") {
+						e.text = p.newText;
+						const blocks = [{ type: "text", text: p.newText }];
+						if (e.frame?.params?.prompt) e.frame.params.prompt = blocks;
+						if (e.params?.prompt) e.params.prompt = blocks;
+					}
+					this.dispatchEntry(e);
+				}
+				this.broadcastQueue();
+				return true;
+			}
+			case "queue/hold_edit":
+			case "queue/release_edit":
+				// Advisory edit locks; the virtual queue has no in-place editor.
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	/** Answer a removed/cleared held prompt so no pager request hangs. */
+	cancelHeld(entry) {
+		if (entry.clientId === undefined) return;
+		const result = entry.clientId === entry.agentId ? { stopReason: "cancelled" } : (entry.answerResult ?? {});
+		this.outToClient.push({ jsonrpc: "2.0", id: entry.clientId, result });
+	}
+
+	/** Broadcast the virtual queue snapshot the pager's queue pane repaints on. */
+	broadcastQueue() {
+		const sessionId = this.session?.sessionId;
+		if (!sessionId) return;
+		const params = {
+			sessionId,
+			entries: this.held.map((e, i) => ({
+				id: e.queueId,
+				version: e.version,
+				kind: e.kind,
+				text: e.text,
+				position: i,
+			})),
+		};
+		if (this.running) {
+			params.runningPromptId = this.running.queueId;
+			params.runningText = this.running.text;
+			params.runningKind = this.running.kind;
+		}
+		this.outToClient.push(this.notif("_x.ai/queue/changed", params));
+	}
+
+	/** Drop all queue state on a session switch; held prompts get cancelled answers. */
+	resetQueue() {
+		for (const e of this.held.splice(0)) this.cancelHeld(e);
+		this.running = null;
+		this.inFlightPrompts.clear();
+		// A session switch orphans every tracked subagent: the new session can't
+		// report their finish, so record them cancelled for cancel-answer
+		// accuracy and stop listing them as running.
+		for (const rec of this.subagents.values()) {
+			this.finishedSubagents.set(rec.subagentId, "cancelled");
+		}
+		this.subagents.clear();
+		this.turns = 0;
+		this.lastCost = null;
+		this.turnTokens = { input: 0, output: 0, total: 0, cacheRead: 0, cacheWrite: 0 };
+		this.sawTurnUsage = false;
+		this.sessionTitle = null;
+		this.broadcastQueue();
+	}
+
+	/** Emit an adapter-internal request to OMP; its response never reaches the pager. */
+	emitAgentRequest(method, params) {
+		const id = `xai-int-${++this.internalSeq}`;
+		this.internalIds.set(id, { kind: "internal" });
+		this.outToAgent.push({ jsonrpc: "2.0", id, method, params });
+		return id;
+	}
+
+	/** Refresh the session-list cache via an internal session/list request. */
+	requestSessionList() {
+		const id = `xai-int-${++this.internalSeq}`;
+		this.internalIds.set(id, { kind: "sessionList" });
+		this.outToAgent.push({
+			jsonrpc: "2.0",
+			id,
+			method: "session/list",
+			params: this.sessionCwd ? { cwd: this.sessionCwd } : {},
+		});
+	}
+
+	/** The non-plan mode to toggle back to. */
+	defaultModeId() {
+		const opts = this.modeConfig?.options ?? this.session?.modes?.availableModes ?? [];
+		for (const o of opts) {
+			const id = o?.value ?? o?.id ?? o;
+			if (id && id !== "plan") return id;
+		}
+		return "default";
+	}
+
+	// -- session list/search/roster translation ---------------------------------
+
+	/** Enrich OMP session/list rows into the pager's picker shape, then filter. */
+	translateSessionList(result, params) {
+		const enriched = enrichSessionList(result);
+		for (const s of enriched.sessions) {
+			s.numMessages ??= s._meta?.messageCount;
+			s.createdAt ??= s.updatedAt;
+			const label = s.cwd && this.knownWorktrees.get(s.cwd);
+			if (label) {
+				s.worktreeLabel = label;
+				s.sessionKind = "worktree";
+			}
+		}
+		this.lastSessionRows = enriched.sessions;
+		let rows = enriched.sessions;
+		const q = typeof params?.query === "string" ? params.query.trim().toLowerCase() : "";
+		if (q) {
+			rows = rows.filter(
+				(s) =>
+					(s.summary ?? "").toLowerCase().includes(q) ||
+					(s.firstPrompt ?? "").toLowerCase().includes(q),
+			);
+		}
+		if (typeof params?.limit === "number" && params.limit > 0) rows = rows.slice(0, params.limit);
+		return { sessions: rows };
+	}
+
+	/** Substring-filter the full session listing into SearchSessionHit rows. */
+	translateSessionSearch(result, params) {
+		const { sessions } = this.translateSessionList(result, {});
+		const q = (params?.query ?? "").toLowerCase();
+		const limit = typeof params?.limit === "number" && params.limit > 0 ? params.limit : 20;
+		const hits = [];
+		for (const s of sessions) {
+			const hay = `${s.summary ?? ""}\n${s.firstPrompt ?? ""}`.toLowerCase();
+			if (q && !hay.includes(q)) continue;
+			hits.push({
+				sessionId: s.sessionId,
+				cwd: s.cwd ?? "",
+				summary: s.summary ?? s.firstPrompt ?? "",
+				updatedAt: s.updatedAt ?? "",
+				score: 1,
+				matchedFields: ["title"],
+			});
+			if (hits.length >= limit) break;
+		}
+		return { results: hits, bootstrapping: false };
+	}
+
+	/** One FleetView roster row from a cached session-list row or live state. */
+	rosterEntryFor(sessionId, live) {
+		const row = this.lastSessionRows.find((r) => r.sessionId === sessionId);
+		const isLive = live && sessionId === this.session?.sessionId;
+		const cwd = row?.cwd ?? (isLive ? this.sessionCwd : "") ?? "";
+		return {
+			sessionId,
+			title: row?.summary ?? (isLive ? this.sessionTitle : undefined) ?? undefined,
+			cwd,
+			isWorktree: row?.worktreeLabel !== undefined || this.knownWorktrees.has(cwd),
+			modelId: isLive ? (this.modelConfig?.currentValue ?? undefined) : row?.modelId,
+			yolo: false,
+			activity: isLive ? (this.running ? "working" : "idle") : "dormant",
+			lastTurnSummary: row?.lastTurnSummary,
+			resident: isLive === true,
+			lastChangeUnixMs: Date.parse(row?.updatedAt ?? "") || Date.now(),
+			origin: { kind: "local" },
+		};
+	}
+
+	// -- extensions translation ---------------------------------------------------
+
+	extensionsOfKind(result, kind) {
+		const exts = Array.isArray(result?.extensions) ? result.extensions : [];
+		this.extCache = result;
+		return exts.filter((e) => e?.kind === kind);
+	}
+
+	/** Update a cached extension's state after a successful toggle. */
+	setExtState(providerId, enabled) {
+		const e = this.extCache?.extensions?.find((x) => x?.id === providerId || x?.name === providerId.split(":")[1]);
+		if (e) e.state = enabled ? "active" : "disabled";
+	}
+
+	/** Push hooks_changed with the post-toggle list (pager applies the payload). */
+	pushHooksChanged() {
+		const sessionId = this.session?.sessionId;
+		if (!sessionId || !this.extCache) return;
+		this.outToClient.push(this.notif("_x.ai/session/update", {
+			sessionId,
+			update: {
+				sessionUpdate: "hooks_changed",
+				hooks: this.extensionsOfKind(this.extCache, "hook").map(extensionToHookInfo),
+				project_trusted: true,
+				load_errors: [],
+			},
+		}));
+	}
+
+	/** Push plugins_changed with the post-toggle list (pager applies the payload). */
+	pushPluginsChanged() {
+		const sessionId = this.session?.sessionId;
+		if (!sessionId || !this.extCache) return;
+		this.outToClient.push(this.notif("_x.ai/session/update", {
+			sessionId,
+			update: {
+				sessionUpdate: "plugins_changed",
+				plugins: this.extensionsOfKind(this.extCache, "plugin").map(extensionToPluginInfo),
+			},
+		}));
+	}
+
+	/** Merge session/new mcpServers with _omp/extensions mcp-kind entries. */
+	mcpServerEntries(result) {
+		const byName = new Map();
+		for (const s of this.mcpServers) {
+			if (!s?.name) continue;
+			byName.set(s.name, {
+				name: s.name,
+				source: "local",
+				...(s.url
+					? { type: "http", url: s.url }
+					: { type: "stdio", command: s.command ?? "", args: s.args ?? [], env: s.env ?? [] }),
+				session: { enabled: true },
+			});
+		}
+		for (const e of this.extensionsOfKind(result, "mcp")) {
+			const enabled = e.state !== "disabled";
+			const existing = byName.get(e.name);
+			if (existing) {
+				existing.session.enabled = enabled;
+			} else {
+				byName.set(e.name, {
+					name: e.name,
+					displayName: e.displayName !== e.name ? e.displayName : undefined,
+					source: "local",
+					type: "stdio",
+					command: "",
+					session: { enabled },
+				});
+			}
+		}
+		return [...byName.values()];
+	}
+
+	/** usageCategories for ContextInfo: real counts, unknown token costs stay 0. */
+	usageCategories() {
+		const cats = [];
+		const exts = this.extCache?.extensions;
+		const active = (k) => (Array.isArray(exts) ? exts.filter((e) => e.kind === k && e.state === "active").length : 0);
+		const skills = active("skill");
+		if (skills) cats.push({ label: "Skills", tokens: 0, detail: `${skills} skill${skills === 1 ? "" : "s"}` });
+		const mcps = active("mcp") || this.mcpServers.length;
+		if (mcps) cats.push({ label: "MCP servers", tokens: 0, detail: `${mcps} server${mcps === 1 ? "" : "s"}` });
+		return cats;
+	}
+
+	// -- elicitation bridge (interaction.md, session-control.md) ------------------
+	//
+	// OMP's ask tool and plan approval use standard ACP `elicitation/create`,
+	// which the pager cannot decode (no ElicitationRequest variant). Translate
+	// to the pager's private question/elicit/plan-approval requests and map the
+	// outcome back to {action, content}. Unrepresentable schemas fall through
+	// verbatim — the pager's method_not_found makes OMP auto-approve, same as
+	// a client without elicitation.form.
+
+	bridgeElicitation(frame) {
+		const p = frame.params ?? {};
+		const pagerId = `xai-elicit-${++this.internalSeq}`;
+		const sessionId = p.sessionId ?? this.session?.sessionId;
+		const valueProp = p.requestedSchema?.properties?.value;
+		const enumVals = Array.isArray(valueProp?.enum) ? valueProp.enum : null;
+
+		// OMP's plan approval: a select over ["Approve and execute","Refine plan"]
+		// on an "Approve plan …" message → the pager's plan-approval view.
+		if (enumVals?.includes("Approve and execute") && typeof p.message === "string" && p.message.startsWith("Approve plan")) {
+			this.bridgedElicits.set(pagerId, { ompId: frame.id, kind: "plan" });
+			return {
+				jsonrpc: "2.0",
+				id: pagerId,
+				method: "_x.ai/exit_plan_mode",
+				params: { sessionId, toolCallId: pagerId, planContent: p.message },
+			};
+		}
+
+		if (p.mode === "url" && typeof p.url === "string") {
+			this.bridgedElicits.set(pagerId, { ompId: frame.id, kind: "mcp" });
+			return {
+				jsonrpc: "2.0",
+				id: pagerId,
+				method: "_x.ai/mcp/elicit",
+				params: {
+					sessionId,
+					toolCallId: pagerId,
+					serverName: "omp",
+					message: p.message ?? "",
+					mode: "url",
+					url: p.url,
+					elicitationId: p.elicitationId ?? pagerId,
+				},
+			};
+		}
+
+		const props = p.requestedSchema?.properties;
+		if (props && typeof props === "object") {
+			const questions = [];
+			const keyByQuestion = new Map();
+			for (const [key, prop] of Object.entries(props)) {
+				const q = schemaPropToQuestion(key, prop, p.message);
+				if (!q) return null;
+				questions.push(q);
+				// The pager keys answers/annotations by question text, not id.
+				keyByQuestion.set(q.question, key);
+			}
+			if (!questions.length) return null;
+			this.bridgedElicits.set(pagerId, { ompId: frame.id, kind: "ask", props, keyByQuestion });
+			return {
+				jsonrpc: "2.0",
+				id: pagerId,
+				method: "_x.ai/ask_user_question",
+				params: {
+					sessionId,
+					toolCallId: pagerId,
+					questions,
+					mode: this.modeConfig?.currentValue === "plan" ? "plan" : "default",
+				},
+			};
+		}
+		return null;
+	}
+
+	/** Map a pager question/elicit/plan outcome back to elicitation/create's shape. */
+	elicitResultToOmp(rec, result) {
+		const outcome = result?.outcome;
+		if (rec.kind === "plan") {
+			return outcome === "approved"
+				? { action: "accept", content: { value: "Approve and execute" } }
+				: { action: "cancel" };
+		}
+		if (rec.kind === "mcp") {
+			if (outcome === "accept") return { action: "accept", content: result.content ?? {} };
+			return { action: outcome === "decline" ? "decline" : "cancel" };
+		}
+		// ask_user_question → form content keyed by property name. The pager
+		// keys answers/annotations by question TEXT; keyByQuestion maps back.
+		if (outcome === "accepted") {
+			const content = {};
+			const answers = result.answers ?? {};
+			const annotations = result.annotations ?? {};
+			for (const [key, prop] of Object.entries(rec.props ?? {})) {
+				const qText = [...(rec.keyByQuestion?.entries() ?? [])].find(([, k]) => k === key)?.[0] ?? key;
+				const labels = answers[qText];
+				const first = Array.isArray(labels) ? labels[0] : labels;
+				const notes = annotations[qText]?.notes;
+				if (prop?.type === "boolean") {
+					const v = first ?? notes;
+					if (v !== undefined) content[key] = v === "Yes" || v === "true" || v === true;
+				} else if (prop?.type === "number" || prop?.type === "integer") {
+					const raw = first === "Other" ? notes : (first ?? notes);
+					const n = Number(raw);
+					if (raw !== undefined && Number.isFinite(n)) content[key] = n;
+				} else {
+					// Freeform answers arrive as labels:["Other"] + notes holding
+					// the typed text — prefer notes in that case.
+					const v = first === "Other" && notes !== undefined
+						? notes
+						: (Array.isArray(labels) && labels.length > 1 ? labels : first) ?? notes;
+					if (v !== undefined) content[key] = v;
+				}
+			}
+			return { action: "accept", content };
+		}
+		// chat_about_this / skip_interview carry partial answers but no commit —
+		// decline so OMP treats it as a non-answer, never an approval.
+		if (outcome === "chat_about_this" || outcome === "skip_interview") return { action: "decline" };
+		return { action: "cancel" };
+	}
+
+	// -- worktrees (worktrees.md): real local git work, nothing from OMP ---------
+
+	async worktreeCreate(p) {
+		const src = p.sourceWorktreePath ?? p.sourceCwd;
+		if (typeof src !== "string" || !src) throw rpcError(-32602, "sourceWorktreePath required");
+		const root = (await gitOut(src, ["rev-parse", "--show-toplevel"])).trim();
+		const label = sanitizeLabel(p.label ?? p.newSessionId ?? "worktree");
+		const dest = join(dirname(root), `${root.split("/").pop()}.worktrees`, label);
+		await gitWorktreeAdd(root, dest, p.gitRef ?? "HEAD");
+		if (p.copyMode === "dirty") await copyDirtyFiles(src, dest);
+		this.knownWorktrees.set(dest, label);
+		return { worktreePath: dest, sourceGitRoot: root };
+	}
+
+	async worktreeResume(p) {
+		const src = p.sourceCwd;
+		if (typeof src !== "string" || !src) throw rpcError(-32602, "sourceCwd required");
+		const root = (await gitOut(src, ["rev-parse", "--show-toplevel"])).trim();
+		const label = sanitizeLabel(p.label ?? `resume-${p.sessionId ?? "session"}`);
+		const dest = join(dirname(root), `${root.split("/").pop()}.worktrees`, label);
+		await gitWorktreeAdd(root, dest, p.gitRef ?? "HEAD");
+		if (p.copyMode === "dirty") await copyDirtyFiles(src, dest);
+		this.knownWorktrees.set(dest, label);
+		const rel = relative(root, src);
+		return {
+			worktreePath: dest,
+			effectiveCwd: rel && rel !== "." ? join(dest, rel) : dest,
+			sessionId: p.sessionId,
+			codeRestored: false, // OMP checkpoint/rewind is tool-driven; nothing to restore client-side
+		};
+	}
+
+	async worktreeList(p) {
+		const cwd = p.cwd ?? p.sourceCwd ?? this.sessionCwd;
+		if (typeof cwd !== "string" || !cwd) return { result: [] };
+		const root = (await gitOut(cwd, ["rev-parse", "--show-toplevel"])).trim();
+		const out = await gitOut(root, ["worktree", "list", "--porcelain"]);
+		const records = [];
+		let cur = null;
+		for (const line of out.split("\n")) {
+			if (line.startsWith("worktree ")) {
+				if (cur) records.push(cur);
+				cur = { path: line.slice(9), head: null, branch: null };
+			} else if (cur && line.startsWith("HEAD ")) {
+				cur.head = line.slice(5);
+			} else if (cur && line.startsWith("branch ")) {
+				cur.branch = line.slice(7).replace(/^refs\/heads\//, "");
+			}
+		}
+		if (cur) records.push(cur);
+		return {
+			result: records.map((r) => ({
+				id: r.path,
+				path: r.path,
+				source_repo: root,
+				repo_name: root.split("/").pop(),
+				kind: "session",
+				creation_mode: "unknown",
+				git_ref: r.branch,
+				head_commit: r.head,
+				session_id: null,
+				creator_pid: null,
+				created_at: 0,
+				last_accessed_at: null,
+				status: "alive",
+				metadata: this.knownWorktrees.has(r.path) ? { label: this.knownWorktrees.get(r.path) } : null,
+			})),
+		};
+	}
+
+	async worktreeRemove(p) {
+		const target = p.path ?? p.worktreePath ?? p.id;
+		if (typeof target !== "string" || !target) throw rpcError(-32602, "worktree path required");
+		let base = dirname(target);
+		try {
+			base = (await gitOut(target, ["rev-parse", "--show-toplevel"])).trim();
+		} catch {
+			// target may not be a repo root itself; remove relative to its parent
+		}
+		await gitOut(base, ["worktree", "remove", "--force", target]);
+		this.knownWorktrees.delete(target);
+		return { result: { removed: true, resolvedPath: target } };
 	}
 
 	answer(result) {
@@ -1246,6 +2586,29 @@ async function runLive(opts) {
 	// effort, and context-window metadata on first connect.
 	await ext.loadCatalog(argv);
 
+	// Drain adapter-synthesized frames in both directions. Adapter-internal
+	// requests (virtual-queue dispatches, _omp/* probes, set_mode toggles) are
+	// NOT taped: replay matches client requests to recorded agent requests by
+	// method+occurrence, and taping synthesized traffic would shift every
+	// later occurrence index.
+	const drainExt = () => {
+		while (ext.outToClient.length) {
+			const f = ext.outToClient.shift();
+			tape?.record("to_client", f);
+			forward(f);
+		}
+		while (ext.outToAgent.length) {
+			const f = ext.outToAgent.shift();
+			if (!ext.internalIds.has(f.id)) tape?.record("to_agent", f);
+			emit(f);
+		}
+		while (ext.followUp.length) {
+			const f = ext.followUp.shift();
+			tape?.record("to_agent", f);
+			emit(f);
+		}
+	};
+
 	// Advisor notes never reach the wire (see AdvisorTailer); tail the OMP
 	// session file and synthesize the user_message_chunk frames instead.
 	// Emitted frames run through the same observe/forward pipeline as real
@@ -1279,6 +2642,24 @@ async function runLive(opts) {
 			writer.write(`${line}\n`);
 			return;
 		}
+
+		// Response to an adapter-bridged elicitation: translate back to
+		// elicitation/create's shape and re-emit under OMP's original id.
+		const bridged = ext.handleClientResponse(frame);
+		if (bridged) {
+			emit(bridged);
+			drainExt();
+			return;
+		}
+
+		// x.ai/* notifications (queue mutations, plan-mode toggle) are consumed
+		// adapter-side; everything else falls through to verbatim forwarding.
+		if (ext.handleNotification(frame)) {
+			tape?.record("to_agent", frame);
+			drainExt();
+			return;
+		}
+
 		if (opts.hygiene && frame.method === "initialize") {
 			const removed = applyHygiene(frame);
 			if (removed.length) log(`capability hygiene: removed ${removed.join(", ")} from initialize`);
@@ -1304,11 +2685,37 @@ async function runLive(opts) {
 		if (decision?.action === "answer") {
 			tape?.record("to_agent", frame);
 			forward({ jsonrpc: "2.0", id: frame.id, result: decision.result });
+			drainExt();
 			return;
 		}
 		if (decision?.action === "error") {
 			tape?.record("to_agent", frame);
 			forward({ jsonrpc: "2.0", id: frame.id, error: decision.error });
+			drainExt();
+			return;
+		}
+		if (decision?.action === "hold" || decision?.action === "defer") {
+			// Held prompt / deferred internal prompt: the dispatch (now or on
+			// turn settle) emits via outToAgent; the client answer comes later.
+			drainExt();
+			return;
+		}
+		if (decision?.action === "answerAsync") {
+			tape?.record("to_agent", frame);
+			decision.promise.then(
+				(result) => {
+					forward({ jsonrpc: "2.0", id: frame.id, result });
+					drainExt();
+				},
+				(error) => {
+					forward({
+						jsonrpc: "2.0",
+						id: frame.id,
+						error: { code: error?.rpcCode ?? -32603, message: error?.message ?? String(error) },
+					});
+					drainExt();
+				},
+			);
 			return;
 		}
 		if (decision?.action === "forward") {
@@ -1318,13 +2725,7 @@ async function runLive(opts) {
 		}
 		tape?.record("to_agent", frame);
 		emit(frame);
-		// A translation may queue a follow-up request (e.g. set_model also sets
-		// the thinking effort). Drain it so OMP sees both.
-		while (ext.followUp.length) {
-			const f = ext.followUp.shift();
-			tape?.record("to_agent", f);
-			emit(f);
-		}
+		drainExt();
 	});
 
 	const toClient = lineReader(child.stdout, (line) => {
@@ -1338,6 +2739,27 @@ async function runLive(opts) {
 			process.stdout.write(`${line}\n`);
 			return;
 		}
+		// Adapter-internal request responses (virtual-queue dispatches, _omp/*
+		// probes) are consumed here — they must never reach the pager.
+		if (ext.handleAgentResponse(frame)) {
+			drainExt();
+			return;
+		}
+
+		// OMP's elicitation/create (ask tool, plan approval) is standard ACP the
+		// pager can't decode; bridge it to the pager's private question views.
+		if (frame.method === "elicitation/create" && frame.id !== undefined) {
+			const bridged = ext.bridgeElicitation(frame);
+			if (bridged) {
+				tape?.record("to_client", bridged);
+				forward(bridged);
+				drainExt();
+				return;
+			}
+			// Unrepresentable schema: forward verbatim → method_not_found → OMP
+			// auto-approves, same as a client without elicitation.form.
+		}
+
 		// Attach the advisor tailer once a session is known: session/new and
 		// session/fork carry result.sessionId; load/resume resolve via the
 		// request id recorded above.
@@ -1362,6 +2784,7 @@ async function runLive(opts) {
 			tape?.record("to_client", extra);
 			forward(extra);
 		}
+		drainExt();
 	});
 
 	void toClient;
@@ -1512,7 +2935,7 @@ function createReplay(header, entries) {
 							code: -32601,
 							message:
 								`no recorded reply for ${frame.method} (call #${n + 1}) — tape recorded by ` +
-								`${header?.client?.name ?? "another client"} has ${ids.length} call(s)`,
+							`${header?.client?.name ?? "another client"} has ${ids.length} call(s)`,
 						},
 					},
 				];
@@ -1589,21 +3012,30 @@ function staleReason(header) {
 function validateTape(entries) {
 	const problems = [];
 	const seen = new Set();
+	let allInteger = true;
 	for (const [index, entry] of entries.entries()) {
 		if (entry.dir !== "to_agent" && entry.dir !== "to_client") {
 			problems.push(`line ${index + 2}: dir must be to_agent|to_client, got ${JSON.stringify(entry.dir)}`);
 			continue;
 		}
-		if (!Number.isInteger(entry.seq)) {
-			problems.push(`line ${index + 2}: seq must be an integer, got ${JSON.stringify(entry.seq)}`);
+		// seq is the replay ordering key: it must be a finite, unique number.
+		// Fractional seqs are legal — older recorders interleaved tailer-
+		// synthesized frames between integer seqs (e.g. 36.5 between 36 and 37).
+		if (typeof entry.seq !== "number" || !Number.isFinite(entry.seq)) {
+			problems.push(`line ${index + 2}: seq must be a number, got ${JSON.stringify(entry.seq)}`);
 			continue;
 		}
+		if (!Number.isInteger(entry.seq)) allInteger = false;
 		if (seen.has(entry.seq)) problems.push(`line ${index + 2}: duplicate seq ${entry.seq}`);
 		seen.add(entry.seq);
 		if (entry.frame === undefined) problems.push(`line ${index + 2}: frame missing`);
 	}
-	for (let seq = 0; seq < entries.length; seq++) {
-		if (!seen.has(seq)) problems.push(`seq ${seq} missing (stream must be contiguous from 0)`);
+	// Contiguity (a dropped frame leaves a gap) is only checkable when every
+	// seq is an integer; fractional-seq tapes can't be gap-checked this way.
+	if (allInteger) {
+		for (let seq = 0; seq < entries.length; seq++) {
+			if (!seen.has(seq)) problems.push(`seq ${seq} missing (stream must be contiguous from 0)`);
+		}
 	}
 	return problems;
 }

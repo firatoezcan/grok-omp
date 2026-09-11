@@ -24,11 +24,19 @@ pub(super) enum LocalPresence {
     Relabel,
     /// Only rows found on disk survive, labelled `local`. Conversation and foreign rows never qualify.
     Require,
+    /// Foreign agent (non-grok-shell): the agent's own session store is authoritative and
+    /// unrelated to `~/.grok/sessions`, so no disk reconciliation runs — every row the agent
+    /// lists is kept with its own `source` label.
+    Agent,
 }
-
 impl LocalPresence {
     /// The dashboard picker only shows sessions on this machine; the other pickers keep remote rows.
-    pub(super) fn for_host(host: SessionPickerHost) -> Self {
+    /// A foreign agent's list is authoritative for every host — its sessions never live in the
+    /// grok store, so a disk check would drop all of them.
+    pub(super) fn for_host(host: SessionPickerHost, foreign_agent: bool) -> Self {
+        if foreign_agent {
+            return Self::Agent;
+        }
         match host {
             SessionPickerHost::Dashboard => Self::Require,
             SessionPickerHost::Welcome | SessionPickerHost::AgentModal => Self::Relabel,
@@ -283,6 +291,7 @@ fn parse_session_picker_entries_with(
         })
         .collect();
 
+
     let resolve_local = |ids: &[&str]| {
         resolve_local(ids).map_err(|error| {
             tracing::warn!(%error, ?presence, "session list local-session resolution failed");
@@ -327,6 +336,8 @@ fn parse_session_picker_entries_with(
             }
             Ok(parsed)
         }
+        // A foreign agent's store is not the grok store: its rows are authoritative as listed.
+        LocalPresence::Agent => Ok(parsed),
     }
 }
 

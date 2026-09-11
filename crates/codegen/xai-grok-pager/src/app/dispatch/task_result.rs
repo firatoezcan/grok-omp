@@ -13,7 +13,7 @@ use super::cta::{
     handle_plugin_cta_catalog_loaded, handle_plugin_cta_debounce_expired,
     handle_plugin_cta_mcps_loaded,
 };
-use super::ctx::{find_agent_by_session_id, get_active_agent_mut};
+use super::ctx::{find_agent_by_session_id, find_agent_id_by_session_id, get_active_agent_mut};
 use super::notes::{handle_btw_response, handle_memory_note_saved};
 use super::prompt::{
     defer_to_open_reload_window, handle_compact_complete, handle_prompt_response,
@@ -926,15 +926,38 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             attempt_id,
             outcome,
         } => {
+            // A foreign agent (e.g. OMP) has no per-subagent cancel: `not_found` on a still-live
+            // row means "can't cancel", not "already gone". Keep the row live — the real
+            // `subagent_finished` still lands — and say so instead of stamping "cancelled".
+            // grok-shell's `not_found` is authoritative (orphaned/evicted), so it finalizes.
             if let SubagentKillOutcome::NothingLive { status } = outcome {
-                let status = status.as_deref().unwrap_or("cancelled");
-                crate::app::acp_handler::finalize_killed_subagent(
-                    app,
-                    &session_id,
-                    &subagent_id,
-                    attempt_id.as_deref(),
-                    status,
-                );
+                let live_foreign = !app.is_grok_shell
+                    && status.is_none()
+                    && subagent_row_is_live(
+                        app,
+                        &session_id,
+                        &subagent_id,
+                        attempt_id.as_deref(),
+                    );
+                if live_foreign {
+                    if let Some(agent) =
+                        find_agent_by_session_id(&mut app.agents, session_id.0.as_ref())
+                    {
+                        agent.scrollback.push_block(RenderBlock::system(
+                            "This agent can't cancel a running subagent; it may still be running."
+                                .to_owned(),
+                        ));
+                    }
+                } else {
+                    let status = status.as_deref().unwrap_or("cancelled");
+                    crate::app::acp_handler::finalize_killed_subagent(
+                        app,
+                        &session_id,
+                        &subagent_id,
+                        attempt_id.as_deref(),
+                        status,
+                    );
+                }
             }
             vec![]
         }
@@ -2172,4 +2195,30 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             vec![]
         }
     }
+}
+
+/// Whether the named subagent's tracked row is still live on the session's root agent.
+/// Mirrors the lookup in `finalize_killed_subagent` (same attempt-id guard) but read-only:
+/// a `not_found` cancel answer against a live row means the agent couldn't cancel it.
+fn subagent_row_is_live(
+    app: &AppView,
+    session_id: &acp::SessionId,
+    subagent_id: &str,
+    attempt_id: Option<&str>,
+) -> bool {
+    let Some(agent_id) =
+        find_agent_id_by_session_id(&app.agents, session_id.0.as_ref())
+    else {
+        return false;
+    };
+    let Some(agent) = app.agents.get(&agent_id) else {
+        return false;
+    };
+    agent
+        .subagent_sessions
+        .values()
+        .find(|info| info.subagent_id.as_ref() == subagent_id)
+        .is_some_and(|info| {
+            info.attempt.lifecycle.current_attempt_id() == attempt_id && !info.is_finished()
+        })
 }

@@ -178,7 +178,9 @@ pub(crate) fn session_usage_block_text(
     usage: &xai_grok_shell::extensions::notification::PromptUsage,
 ) -> String {
     let t = &usage.totals;
-    if t.model_calls == 0 && usage.model_usage.is_empty() {
+    // A foreign agent (e.g. OMP) may report a real cumulative cost without per-call token
+    // counters; the cost row must still render instead of the "no model calls" early return.
+    if t.model_calls == 0 && usage.model_usage.is_empty() && t.cost_usd_ticks.is_none() {
         return if usage.usage_is_incomplete {
             "Session usage: none recorded, but tracking is incomplete and may under-count."
                 .to_string()

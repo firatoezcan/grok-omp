@@ -666,6 +666,7 @@ pub(crate) fn execute(
             headless_policy,
         } => {
             let tx = acp_tx.clone();
+            let foreign_agent = session_flags.foreign_agent;
             let cwd = cwd_override.unwrap_or_else(|| cwd.to_path_buf());
             tasks
                 .spawn(async move {
@@ -728,7 +729,7 @@ pub(crate) fn execute(
                             let scope = parse_session_list_scope(&payload);
                             let sessions = match parse_session_picker_entries_blocking(
                                     payload,
-                                    LocalPresence::for_host(host),
+                                    LocalPresence::for_host(host, foreign_agent),
                                 )
                                 .await
                             {
@@ -819,6 +820,7 @@ pub(crate) fn execute(
         }
         Effect::FetchDashboardSessions => {
             let tx = acp_tx.clone();
+            let foreign_agent = session_flags.foreign_agent;
             let cwd = cwd.to_path_buf();
             tasks
                 .spawn(async move {
@@ -844,7 +846,11 @@ pub(crate) fn execute(
                             };
                             let sessions = match parse_session_picker_entries_blocking(
                                     payload,
-                                    LocalPresence::Relabel,
+                                    if foreign_agent {
+                                        LocalPresence::Agent
+                                    } else {
+                                        LocalPresence::Relabel
+                                    },
                                 )
                                 .await
                             {

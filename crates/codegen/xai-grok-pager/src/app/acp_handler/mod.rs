@@ -325,6 +325,12 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
 
                         let had_activity_before = agent.session.tracker.activity().is_some();
                         let update = notif.request.update;
+                        // Standard ACP `usage_update` (OMP emits it end-of-turn): feed the
+                        // context bar directly. `size` is the real window, so it beats the
+                        // model-catalog guess `refresh_context_used` falls back to.
+                        if let acp::SessionUpdate::UsageUpdate(usage) = &update {
+                            agent.apply_context_used(usage.used, usage.size);
+                        }
                         let (is_visible_kind, is_bash) = if meta.is_replay {
                             (
                                 crate::acp::tracker::is_agent_output_update(&update),

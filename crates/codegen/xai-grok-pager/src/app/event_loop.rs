@@ -1178,6 +1178,7 @@ pub(crate) async fn run(
     // The dashboard itself is NOT gated on this flag (it renders local sessions regardless)
     // `leader_mode` only controls whether we additionally poll the leader roster (see the roster-poll arm below)
     app.leader_mode = connection.leader_status_rx.is_some();
+    app.is_grok_shell = connection.is_grok_shell;
     app.screen_mode = term_state.screen_mode;
     // `AppView::new` precedes the terminal's resolved screen mode
     // Rebuild the registry at this I/O boundary; the later config-aware rebuild preserves this mode while adding the optional mouse-reporting action
@@ -4486,6 +4487,7 @@ pub(crate) fn session_flags_for_effects(
         screen_mode_label: Some(app.screen_mode.meta_label()),
         is_api_key_auth: app.is_api_key_auth,
         resume_local_miss: app.resume_local_miss.clone(),
+        foreign_agent: !app.is_grok_shell,
     }
 }
 

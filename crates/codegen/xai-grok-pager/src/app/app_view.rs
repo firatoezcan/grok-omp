@@ -651,6 +651,12 @@ pub struct AppView {
     /// The Agent Dashboard entry points (`/dashboard`, `Ctrl+\`, `grok dashboard`, the startup hook) are gated on this flag.
     /// They are only meaningful when a leader is coordinating a fleet of sessions.
     pub leader_mode: bool,
+    /// Whether the connected agent is a grok-shell instance (`_meta.grokShell` on initialize).
+    /// `false` for foreign ACP agents (e.g. Oh My Pi via the bridge adapter): grok-local disk
+    /// reconciliation (session-store presence checks) and shell-specific cancel semantics are
+    /// gated on this so a foreign agent's answers are trusted as authoritative.
+    /// Defaults `true` so tests and in-process spawns keep first-party behavior.
+    pub is_grok_shell: bool,
     /// App-level credit balance used to show the usage warning on the welcome screen before any agent session exists.
     pub credit_balance: Option<crate::views::credit_bar::CreditBalance>,
     /// App-level auto top-up rule paired with `credit_balance` for the warning.
@@ -1650,6 +1656,7 @@ impl AppView {
             has_external_auth_provider: false,
             tier_restricted_commands: Vec::new(),
             leader_mode: false,
+            is_grok_shell: true,
             credit_balance: None,
             auto_topup: None,
             billing_poll_wanted: false,
