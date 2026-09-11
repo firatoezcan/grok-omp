@@ -80,6 +80,29 @@ if (existsSync(DEFAULT_CONFIG) && !existsSync(ISOLATED_CONFIG)) {
 	}
 }
 
+// --- OMP command -----------------------------------------------------------
+// Which `omp` the adapter spawns. Precedence:
+//   1. OMP_ACP_CMD      — the adapter's own contract; a full ACP command line
+//      used verbatim (e.g. "/path/to/omp acp --advisor").
+//   2. GROK_PI_OMP_CMD  — the omp binary (or a full "... acp" command line);
+//      "acp" is appended when absent and --advisor is added per GROK_PI_ADVISOR.
+//   3. A patched OMP build at a known location — the oh-my-pi source clone's
+//      compiled binary (vibe-mode DRIVING patch, bridge/specs/vibe-mode.md) or
+//      a copy dropped into $GROK_HOME/omp-build/omp.
+//   4. Stock `omp` on PATH — vibe mode stays observe-only.
+const PATCHED_OMP_CANDIDATES = [
+	join(homedir(), "Projects", "Freelancing", "personal", "oh-my-pi", "packages", "coding-agent", "dist", "omp"),
+	join(GROK_HOME, "omp-build", "omp"),
+];
+const OMP_ACP_CMD_USER_SET = process.env.OMP_ACP_CMD !== undefined;
+const OMP_CMD =
+	process.env.OMP_ACP_CMD ??
+	(() => {
+		const base = process.env.GROK_PI_OMP_CMD ?? PATCHED_OMP_CANDIDATES.find(p => existsSync(p)) ?? "omp";
+		return /\bacp\b/.test(base) ? base : `${base} acp`;
+	})();
+process.env.OMP_ACP_CMD = OMP_CMD;
+
 // --- Advisor ---------------------------------------------------------------
 // OMP's advisor (a second model reviewing each turn) is on by default;
 // GROK_PI_ADVISOR=0 disables it. Rather than patch the seeded config.yml, ship
@@ -105,8 +128,10 @@ if (ADVISOR_ON) {
 	} catch (e) {
 		process.stderr.write(`grok-pi: could not write advisor overlay (${e?.message ?? e})\n`);
 	}
-	if (!process.env.OMP_ACP_CMD) {
-		process.env.OMP_ACP_CMD = "omp acp --advisor";
+	// --advisor is appended only to a command grok-pi resolved itself — a
+	// verbatim user-supplied OMP_ACP_CMD keeps full control of its flags.
+	if (ADVISOR_ON && !OMP_ACP_CMD_USER_SET && !process.env.OMP_ACP_CMD.includes("--advisor")) {
+		process.env.OMP_ACP_CMD = `${process.env.OMP_ACP_CMD} --advisor`;
 	}
 }
 
