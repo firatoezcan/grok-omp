@@ -92,6 +92,10 @@ The user guide ships with the pager crate:
 — getting started, keyboard shortcuts, slash commands, configuration, theming,
 MCP servers, skills, plugins, hooks, headless mode, sandboxing, and more.
 
+For running this TUI against Oh My Pi (OMP) as the agent — the `grok-pi`
+launcher, isolated profile, voice dictation, vibe mode, and which surfaces are
+real vs. unsupported — see [`docs/GROK-PI.md`](docs/GROK-PI.md).
+
 ## Repository layout
 
 | Path | Contents |
