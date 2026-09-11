@@ -1,20 +1,55 @@
 <div align="center">
 
-<h1>
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://media.x.ai/v1/website/spacexai-symbol-white-transparent-0c31957f.png">
-    <source media="(prefers-color-scheme: light)" srcset="https://media.x.ai/v1/website/spacexai-symbol-black-transparent-6435cf42.png">
-    <img alt="SpaceXAI logo" src="https://media.x.ai/v1/website/spacexai-symbol-black-transparent-6435cf42.png" width="96">
-  </picture>
-  <br>
-  Grok Build (<code>grok</code>)
-</h1>
+<h1>grok-pi</h1>
 
-**Grok Build** is SpaceXAI's terminal-based AI coding agent. It runs as a
-full-screen TUI that understands your codebase, edits files, executes shell
-commands, searches the web, and manages long-running tasks — interactively,
-headlessly for scripting/CI, or embedded in editors via the Agent Client
-Protocol (ACP).
+**The Grok Build TUI, driven by [Oh My Pi](https://github.com/can1357/oh-my-pi) — your models, your providers, not xAI.**
+
+</div>
+
+`grok-pi` is a fork of [`xai-org/grok-build`](https://github.com/xai-org/grok-build)
+that keeps the full-screen Rust TUI — scrollback, modals, panes, voice,
+subagent views — and swaps the agent: every prompt, tool call, and permission
+is handled by OMP over ACP through a local bridge. Nothing talks to x.ai —
+login, telemetry, billing, and the auto-updater are disabled or unanswered,
+and xAI-only surfaces (credits, marketplace, rewind) error honestly instead
+of pretending.
+
+- **Bring your own model** — `/model` lists every model OMP resolves (51 in a
+  typical profile) from any connected provider; `/effort` sets reasoning effort.
+- **Hold the space bar to talk** — local push-to-talk dictation (Parakeet or
+  Whisper); audio never leaves your machine.
+- **`/vibe` director mode** — the main agent spawns and supervises persistent
+  worker agents with live progress in the tasks pane (needs the patched OMP
+  build, auto-detected).
+- **Real sessions** — `/resume`, `/fork`, `/new`, prompt `/history`, and git
+  worktrees, all on OMP's session store.
+- **Usage & cost** — `/usage` reports turns, tokens, and cumulative USD cost;
+  the context bar fills live.
+- **Per-command toggles** — Settings › OMP lists every advertised slash
+  command with an enable/disable switch.
+- **Isolated profile** — everything lives under `~/.local/share/grok-pi`;
+  your real `~/.grok` and `~/.omp` are never touched.
+- **Advisor on by default** — a second model reviews each turn
+  (`GROK_PI_ADVISOR=0` to disable).
+
+## Quickstart
+
+```sh
+scripts/build-dist.sh   # build + install the dist bundle (~/.local/bin/grok-pi)
+grok-pi                 # run from any project directory
+```
+
+Then: **hold the space bar** to dictate, **`/vibe`** to spin up worker agents,
+**`/model`** to pick any provider's model.
+
+**Full guide:** [`docs/GROK-PI.md`](docs/GROK-PI.md) — providers & auth, voice
+setup, vibe mode, every slash command, and the honest limitations list.
+
+---
+
+*The rest of this file is the upstream `grok-build` build & development doc,
+kept verbatim for working on the fork. `SOURCE_REV` records the upstream sync
+point.*
 
 [Installing the released binary](#installing-the-released-binary) ·
 [Building from source](#building-from-source) ·
@@ -23,18 +58,6 @@ Protocol (ACP).
 [Development](#development) ·
 [Contributing](#contributing) ·
 [License](#license)
-
-![Grok Build TUI](https://media.x.ai/v1/website/universe-tui-screenshot-6f7a0837.png)
-
-**Learn more about Grok Build at [x.ai/cli](https://x.ai/cli)**
-
-This repository contains the Rust source for the `grok` CLI/TUI and its agent
-runtime. It is synced periodically from the SpaceXAI monorepo.
-
-A small `SOURCE_REV` file at the root records the full monorepo commit SHA
-for the version of the code present in this tree.
-
-</div>
 
 ---
 
