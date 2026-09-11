@@ -64,6 +64,10 @@ pub mod user_prompt_meta {
     /// `[[start, end], …]` byte ranges of recognized slash tokens into the block's `text`.
     /// Only meaningful when that text is displayed verbatim (never stamped alongside `displayText`).
     pub const SKILL_TOKEN_RANGES: &str = "skillTokenRanges";
+    /// Advisor note attribution (`{advisor, severity}`), stamped by the bridge
+    /// when it splits an OMP `<advisory>` element out of a `user_message_chunk`.
+    /// Presence marks the chunk as an advisor note, not a user prompt.
+    pub const ADVISOR: &str = "x.ai/advisor";
     /// See [`xai_prompt_queue::COMBINED_DISPLAY_TEXTS_META`].
     pub const COMBINED_DISPLAY_TEXTS: &str = xai_prompt_queue::COMBINED_DISPLAY_TEXTS_META;
 }

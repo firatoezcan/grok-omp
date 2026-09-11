@@ -45,8 +45,9 @@
  * The pager reaches this through `--agent-command "bun bridge/adapter.mjs"`.
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 
 const BRIDGE_NAME = "grok-omp-bridge";
 const BRIDGE_VERSION = "0.1.0";
@@ -417,6 +418,265 @@ function shapeToClient(frame) {
 	return `${toolName} -> ${meta.kind}`;
 }
 
+// ---------------------------------------------------------------------------
+// advisor notes: OMP serializes advisor notes into a user_message_chunk whose
+// text is `<advisory advisor="NAME" severity="SEV" guidance="…">NOTE</advisory>`
+// (one element per note, joined by "\n"; customType/severity/attribution are
+// dropped on the wire). Split each element into its own chunk carrying
+// `content._meta["x.ai/advisor"]` so the pager renders a distinct advisor block
+// instead of a user echo full of raw XML.
+// ---------------------------------------------------------------------------
+
+/** One `<advisory …>…</advisory>` element; body is `escapeXmlText`-encoded. */
+const ADVISORY_RE = /<advisory\b([^>]*)>([\s\S]*?)<\/advisory>/g;
+const ADVISORY_ATTR_RE = /(\w+)="([^"]*)"/g;
+
+/** Reverse OMP's escapeXmlText/escapeXmlAttribute (`&` decoded last). */
+function unescapeXml(s) {
+	return s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&amp;/g, "&");
+}
+
+/**
+ * Split chunk text into ordered segments: `{kind:"text"}` runs pass through
+ * verbatim, `{kind:"advisory", advisor, severity, text}` carry the parsed
+ * attributes and the unescaped note body. Returns null when no advisory
+ * element is present.
+ */
+function splitAdvisoryText(text) {
+	ADVISORY_RE.lastIndex = 0;
+	const segments = [];
+	let last = 0;
+	let match;
+	while ((match = ADVISORY_RE.exec(text)) !== null) {
+		if (match.index > last) segments.push({ kind: "text", text: text.slice(last, match.index) });
+		const attrs = {};
+		for (const [, name, value] of match[1].matchAll(ADVISORY_ATTR_RE)) attrs[name] = unescapeXml(value);
+		segments.push({
+			kind: "advisory",
+			advisor: attrs.advisor,
+			severity: attrs.severity,
+			text: unescapeXml(match[2].replace(/^\n/, "").replace(/\n$/, "")),
+		});
+		last = match.index + match[0].length;
+	}
+	if (segments.length === 0) return null;
+	if (last < text.length) segments.push({ kind: "text", text: text.slice(last) });
+	return segments;
+}
+
+// ---------------------------------------------------------------------------
+// session/list enrichment: OMP's ACP `session/list` returns only
+// {sessionId, cwd, title, updatedAt, _meta}. The pager's resume picker drops
+// any entry without `summary`/`firstPrompt` (its last fallback reads the Grok
+// session store, which knows nothing about OMP files). We recover the first
+// user prompt from the OMP session JSONL so OMP sessions are resumable — the
+// only path that replays advisor notes to the pager.
+// ---------------------------------------------------------------------------
+
+/** OMP sessions root: $PI_CODING_AGENT_DIR/sessions (default ~/.omp/agent). */
+function ompSessionsRoot() {
+	const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".omp", "agent");
+	return join(agentDir, "sessions");
+}
+
+/** Locate `<root>/<cwd-dir>/*_<sessionId>.jsonl`; returns null when absent. */
+function findOmpSessionFile(sessionId) {
+	const root = ompSessionsRoot();
+	let dirs;
+	try {
+		dirs = readdirSync(root, { withFileTypes: true });
+	} catch {
+		return null;
+	}
+	const suffix = `_${sessionId}.jsonl`;
+	for (const d of dirs) {
+		if (!d.isDirectory()) continue;
+		let files;
+		try {
+			files = readdirSync(join(root, d.name));
+		} catch {
+			continue;
+		}
+		for (const f of files) {
+			if (f.endsWith(suffix)) return join(root, d.name, f);
+		}
+	}
+	return null;
+}
+
+/**
+ * Read the first user-message text from an OMP session JSONL. Returns null
+ * when the file is unreadable or has no user text.
+ */
+function firstUserPrompt(sessionFile) {
+	let raw;
+	try {
+		raw = readFileSync(sessionFile, "utf8");
+	} catch {
+		return null;
+	}
+	for (const line of raw.split("\n")) {
+		if (!line.includes('"role":"user"')) continue;
+		try {
+			const entry = JSON.parse(line);
+			if (entry.type !== "message" || entry.message?.role !== "user") continue;
+			const content = entry.message.content;
+			const text = Array.isArray(content)
+				? content.find((c) => c?.type === "text")?.text
+				: typeof content === "string" ? content : undefined;
+			if (typeof text === "string" && text.trim()) return text;
+		} catch {
+			continue;
+		}
+	}
+	return null;
+}
+
+/**
+ * Add `summary`/`firstPrompt` to each OMP session/list entry so the pager's
+ * resume picker keeps it. `title` maps to `summary`; the first user prompt
+ * comes from the session file when the wire omits it.
+ */
+function enrichSessionList(result) {
+	const sessions = result?.sessions ?? result;
+	if (!Array.isArray(sessions)) return { sessions: [] };
+	for (const s of sessions) {
+		if (!s || typeof s !== "object") continue;
+		// The agent owns the session store; "agent" routes the pick straight to
+		// ACP session/load instead of the pager's local/remote lookups.
+		s.source = "agent";
+		if (typeof s.title === "string" && s.title.trim() && !s.summary) {
+			s.summary = s.title;
+		}
+		if (s.firstPrompt === undefined && typeof s.sessionId === "string") {
+			const file = findOmpSessionFile(s.sessionId);
+			const prompt = file && firstUserPrompt(file);
+			if (prompt) {
+				s.firstPrompt = prompt;
+				if (!s.summary) s.summary = prompt.split("\n", 1)[0].slice(0, 120);
+			}
+		}
+	}
+	return { sessions };
+}
+
+// ---------------------------------------------------------------------------
+// advisor session tailer: OMP 18.1.17 never puts advisor notes on the ACP
+// wire — mapAssistantMessageEnd drops non-assistant messages live, and
+// #extractReplayContent only handles array content while advisor entries
+// persist a string, so session/load replay emits nothing either. The notes do
+// land in the session JSONL as custom_message/customType:"advisor", so we
+// tail that file and synthesize the same user_message_chunk frames OMP's
+// replay would have sent. observeAdvisoryChunk then splits/meta-stamps them
+// exactly like a wire frame.
+// ---------------------------------------------------------------------------
+
+class AdvisorTailer {
+	/**
+	 * @param {(frame: object) => void} emit synthesized to_client frame sender
+	 *   (must run the frame through ExtSurface.observeToClient + forward).
+	 */
+	constructor(emit) {
+		this.emit = emit;
+		this.sessionId = null;
+		this.file = null;
+		this.offset = 0;
+		this.pending = "";
+		this.seen = new Set();
+		this.timer = null;
+	}
+
+	/** Point the tailer at a session; no-op when already attached. */
+	attach(sessionId) {
+		if (!sessionId || this.sessionId === sessionId) return;
+		log(`advisor tailer: attach ${sessionId}`);
+		this.sessionId = sessionId;
+		this.file = null;
+		this.offset = 0;
+		this.pending = "";
+		this.seen.clear();
+		if (!this.timer) {
+			this.timer = setInterval(() => this.poll(), 400);
+			this.timer.unref?.();
+		}
+	}
+
+	stop() {
+		clearInterval(this.timer);
+		this.timer = null;
+	}
+
+	poll() {
+		if (!this.sessionId) return;
+		if (!this.file) {
+			this.file = findOmpSessionFile(this.sessionId);
+			if (this.file) log(`advisor tailer: file ${this.file}`);
+		}
+		if (!this.file) return;
+		let size;
+		try {
+			size = statSync(this.file).size;
+		} catch {
+			this.file = null;
+			return;
+		}
+		if (size < this.offset) {
+			// Full rewrite (load-migration/sanitize): rescan; `seen` dedupes.
+			this.offset = 0;
+			this.pending = "";
+		}
+		if (size === this.offset) return;
+		let text;
+		try {
+			const fd = openSync(this.file, "r");
+			try {
+				const len = size - this.offset;
+				const buf = Buffer.alloc(len);
+				const got = readSync(fd, buf, 0, len, this.offset);
+				this.offset += got;
+				text = buf.subarray(0, got).toString("utf8");
+			} finally {
+				closeSync(fd);
+			}
+		} catch {
+			return;
+		}
+		const chunk = this.pending + text;
+		const nl = chunk.lastIndexOf("\n");
+		if (nl < 0) {
+			this.pending = chunk;
+			return;
+		}
+		this.pending = chunk.slice(nl + 1);
+		for (const line of chunk.slice(0, nl).split("\n")) {
+			if (!line.includes('"advisor"')) continue;
+			let entry;
+			try {
+				entry = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			if (entry.type !== "custom_message" || entry.customType !== "advisor") continue;
+			if (typeof entry.content !== "string" || !entry.content.includes("<advisory")) continue;
+			const key = entry.id ?? entry.content;
+			if (this.seen.has(key)) continue;
+			this.seen.add(key);
+			this.emit({
+				jsonrpc: "2.0",
+				method: "session/update",
+				params: {
+					sessionId: this.sessionId,
+					update: {
+						sessionUpdate: "user_message_chunk",
+						content: { type: "text", text: entry.content },
+						messageId: crypto.randomUUID(),
+					},
+				},
+			});
+		}
+	}
+}
+
 /** toolCallId -> OMP tool name, so later updates inherit the classification. */
 const titleById = new Map();
 
@@ -562,6 +822,9 @@ class ExtSurface {
 					break;
 				case "tool_call_update":
 					this.observeToolCallEnd(update, extra);
+					break;
+				case "user_message_chunk":
+					this.observeAdvisoryChunk(frame, update, extra);
 					break;
 			}
 		}
@@ -727,6 +990,48 @@ class ExtSurface {
 		}));
 	}
 
+	/**
+	 * Split a `user_message_chunk` carrying `<advisory>` elements into one chunk
+	 * per segment. The first segment rewrites `update.content` in place (the
+	 * caller forwards `frame` after this returns); the rest go out as extras so
+	 * ordering is preserved. Advisory segments get
+	 * `content._meta["x.ai/advisor"] = {advisor, severity}`; plain text passes
+	 * through unchanged. Whitespace-only separators between elements are dropped.
+	 */
+	observeAdvisoryChunk(frame, update, extra) {
+		const content = update.content;
+		if (!content || content.type !== "text" || typeof content.text !== "string") return;
+		if (!content.text.includes("<advisory")) return;
+		const segments = splitAdvisoryText(content.text);
+		if (!segments) return;
+
+		const toContent = (seg) => {
+			if (seg.kind === "text") return { ...content, text: seg.text };
+			const meta = {};
+			if (seg.advisor !== undefined) meta.advisor = seg.advisor;
+			if (seg.severity !== undefined) meta.severity = seg.severity;
+			return {
+				...content,
+				text: seg.text,
+				_meta: {
+					...(content._meta && typeof content._meta === "object" ? content._meta : {}),
+					"x.ai/advisor": meta,
+				},
+			};
+		};
+		const toFrame = (seg) => ({
+			...frame,
+			params: { ...frame.params, update: { ...update, content: toContent(seg) } },
+		});
+
+		const kept = segments.filter((seg) => seg.kind === "advisory" || seg.text.trim().length > 0);
+		if (kept.length === 0) return;
+		update.content = toContent(kept[0]);
+		for (const seg of kept.slice(1)) extra.push(toFrame(seg));
+		const count = kept.filter((seg) => seg.kind === "advisory").length;
+		log(`advisor: split chunk into ${kept.length} segment(s), ${count} advisor note(s)`);
+	}
+
 	// -- request answering ----------------------------------------------------
 
 	/**
@@ -828,7 +1133,7 @@ class ExtSurface {
 				return {
 					action: "forward",
 					as: "session/list",
-					translate: (r) => ({ sessions: r?.sessions ?? r ?? [] }),
+					translate: enrichSessionList,
 				};
 			case "session/fork":
 				return {
@@ -941,6 +1246,23 @@ async function runLive(opts) {
 	// effort, and context-window metadata on first connect.
 	await ext.loadCatalog(argv);
 
+	// Advisor notes never reach the wire (see AdvisorTailer); tail the OMP
+	// session file and synthesize the user_message_chunk frames instead.
+	// Emitted frames run through the same observe/forward pipeline as real
+	// agent frames so advisory splitting and meta-stamping apply identically.
+	const tailer = new AdvisorTailer((frame) => {
+		const extras = ext.observeToClient(frame);
+		tape?.record("to_client", frame);
+		forward(frame);
+		for (const extra of extras) {
+			tape?.record("to_client", extra);
+			forward(extra);
+		}
+	});
+	// session/load and session/resume responses carry no sessionId; remember
+	// the id from the forwarded request so the response can attach the tailer.
+	const pendingLoadSession = new Map();
+
 	// Both directions run concurrently; each pump owns one direction, so
 	// cross-direction interleaving is preserved without a lock.
 	const toAgent = lineReader(Bun.stdin.stream(), (line) => {
@@ -968,6 +1290,13 @@ async function runLive(opts) {
 			frame.params.mcpServers = [];
 		}
 		ext.observeToAgent(frame);
+		if (
+			frame.id !== undefined &&
+			(frame.method === "session/load" || frame.method === "session/resume") &&
+			typeof frame.params?.sessionId === "string"
+		) {
+			pendingLoadSession.set(frame.id, frame.params.sessionId);
+		}
 		// The pager's private `x.ai/*` rail: answer locally where the adapter has
 		// the data, forward-and-translate where OMP owns it, error where neither
 		// does. Forwarding verbatim would surface OMP's -32603 to the user.
@@ -1009,6 +1338,14 @@ async function runLive(opts) {
 			process.stdout.write(`${line}\n`);
 			return;
 		}
+		// Attach the advisor tailer once a session is known: session/new and
+		// session/fork carry result.sessionId; load/resume resolve via the
+		// request id recorded above.
+		if (frame.id !== undefined && frame.result !== undefined) {
+			const sid = frame.result.sessionId ?? pendingLoadSession.get(frame.id);
+			if (typeof sid === "string") tailer.attach(sid);
+		}
+		if (frame.id !== undefined) pendingLoadSession.delete(frame.id);
 		if (opts.shape) {
 			const change = shapeToClient(frame);
 			if (change) log(`shaped ${change}`);
@@ -1207,7 +1544,21 @@ async function runReplay(opts) {
 	}
 
 	const replay = createReplay(header, entries);
-	const emit = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
+	const ext = new ExtSurface();
+	const emit = (obj) => {
+		// Replay emits recorded frames verbatim, but the advisory split still
+		// applies: a taped `<advisory>` chunk must reach the pager in the same
+		// shape a live run produces, or replay can't reproduce advisor rendering.
+		const update = obj?.params?.update;
+		if (obj?.method === "session/update" && update?.sessionUpdate === "user_message_chunk") {
+			const extra = [];
+			ext.observeAdvisoryChunk(obj, update, extra);
+			process.stdout.write(`${JSON.stringify(obj)}\n`);
+			for (const e of extra) process.stdout.write(`${JSON.stringify(e)}\n`);
+			return;
+		}
+		process.stdout.write(`${JSON.stringify(obj)}\n`);
+	};
 
 	void lineReader(Bun.stdin.stream(), (line) => {
 		if (line === null) {

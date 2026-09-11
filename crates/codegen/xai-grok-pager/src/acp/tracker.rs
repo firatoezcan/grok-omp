@@ -1432,6 +1432,43 @@ impl AcpUpdateTracker {
         scrollback: &mut ScrollbackState,
     ) -> bool {
         let text = extract_text_from_content(&chunk.content);
+        // Advisor notes arrive as `user_message_chunk` frames whose Text meta
+        // carries `x.ai/advisor` (stamped by the bridge when it splits OMP's
+        // `<advisory>` XML). They are agent-attributed, not user echoes: check
+        // before the skill-body/echo skips so a note is never eaten by them.
+        let advisor_meta = match &chunk.content {
+            acp::ContentBlock::Text(t) => t
+                .meta
+                .as_ref()
+                .and_then(|m| m.get(user_prompt_meta::ADVISOR)),
+            _ => None,
+        };
+        if let Some(advisor_meta) = advisor_meta {
+            if text.is_empty() {
+                return false;
+            }
+            self.finish_thinking(scrollback);
+            if let Some(agent_id) = self.current_agent_msg.take() {
+                scrollback.finish_running(agent_id);
+            }
+            for (_, pending) in self.pending_tools.drain() {
+                if let Some(entry_id) = pending.entry_id {
+                    scrollback.finish_running(entry_id);
+                }
+            }
+            let advisor = advisor_meta
+                .get("advisor")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let severity = advisor_meta
+                .get("severity")
+                .and_then(|v| v.as_str())
+                .and_then(crate::scrollback::blocks::AdvisorSeverity::parse);
+            scrollback.push_block(RenderBlock::Advisor(
+                crate::scrollback::blocks::AdvisorBlock::new(advisor, severity, text),
+            ));
+            return true;
+        }
         if self.skip_next_skill_body {
             self.skip_next_skill_body = false;
             return false;

@@ -10,7 +10,7 @@ use xai_grok_pager_diff::DiffHunk;
 
 use super::blocks::mermaid_content::DiagramAffordance;
 use super::blocks::{
-    AgentMessageBlock, BgTaskBlock, BtwBlock, ContextInfoBlock, EditToolCallBlock,
+    AdvisorBlock, AgentMessageBlock, BgTaskBlock, BtwBlock, ContextInfoBlock, EditToolCallBlock,
     ExecuteToolCallBlock, LineRange, ListDirToolCallBlock, OtherToolCallBlock, ReadToolCallBlock,
     SearchFileMatch, SearchToolCallBlock, SessionEvent, SessionEventBlock, SubagentBlock,
     SubagentBlockKind, SystemMessageBlock, ThinkingBlock, ToolCallBlock, UserPromptBlock,
@@ -319,6 +319,8 @@ pub enum RenderBlock {
     Btw(BtwBlock),
     /// `/context` snapshot with categorical bar and breakdown.
     ContextInfo(ContextInfoBlock),
+    /// Advisor note (OMP advisor review injected mid-turn; severity-tinted).
+    Advisor(AdvisorBlock),
 }
 
 /// Delegate a method call to the inner block variant.
@@ -337,6 +339,7 @@ macro_rules! delegate_block {
             RenderBlock::Workflow(b) => b.$method($($arg),*),
             RenderBlock::Btw(b) => b.$method($($arg),*),
             RenderBlock::ContextInfo(b) => b.$method($($arg),*),
+            RenderBlock::Advisor(b) => b.$method($($arg),*),
         }
     };
 }
@@ -883,6 +886,7 @@ impl RenderBlock {
                 None
             }
             RenderBlock::Btw(_) => Some(theme.accent_plan),
+            RenderBlock::Advisor(b) => Some(b.severity.color(theme)),
             RenderBlock::Stub(block) => Some(block.accent_color),
         }
     }
@@ -1009,6 +1013,7 @@ impl RenderBlock {
                 Some(b.question.clone()),
                 Some(b.content().rendered_plain_text()),
             ]),
+            RenderBlock::Advisor(b) => join_searchable([Some(b.text.clone())]),
             RenderBlock::ContextInfo(b) => join_searchable([Some(b.model.clone())]),
             RenderBlock::ToolCall(tc) => tc.searchable_text(),
         }

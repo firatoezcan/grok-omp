@@ -14,9 +14,9 @@
  * Extra args pass through to the pager.
  */
 import { existsSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, delimiter } from "node:path";
 import { homedir } from "node:os";
-import { mkdirSync, copyFileSync, chmodSync } from "node:fs";
+import { mkdirSync, copyFileSync, chmodSync, readFileSync, writeFileSync } from "node:fs";
 
 // When compiled, process.execPath is the binary; when run under bun, argv[1].
 const selfDir = dirname(process.execPath.endsWith("bun") ? resolve(process.argv[1]) : process.execPath);
@@ -77,6 +77,36 @@ if (existsSync(DEFAULT_CONFIG) && !existsSync(ISOLATED_CONFIG)) {
 		copyFileSync(DEFAULT_CONFIG, ISOLATED_CONFIG);
 	} catch (e) {
 		process.stderr.write(`grok-pi: could not seed OMP config (${e?.message ?? e})\n`);
+	}
+}
+
+// --- Advisor ---------------------------------------------------------------
+// OMP's advisor (a second model reviewing each turn) is on by default;
+// GROK_PI_ADVISOR=0 disables it. Rather than patch the seeded config.yml, ship
+// a PI_CONFIG_FILES overlay (merges over global+project settings) that forces
+// `advisor.enabled` and pins `modelRoles.advisor` to the real profile's
+// advisor model when one is configured — else OMP's 'slow' priority chain
+// resolves the role. `--advisor` on the agent command is the ephemeral
+// override that survives any config drift.
+const ADVISOR_ON = process.env.GROK_PI_ADVISOR !== "0";
+if (ADVISOR_ON) {
+	try {
+		const realCfg = existsSync(DEFAULT_CONFIG) ? readFileSync(DEFAULT_CONFIG, "utf8") : "";
+		const advisorModel = realCfg.match(/^ {2}advisor:\s*(\S+)\s*$/m)?.[1];
+		const overlayPath = join(OMP_HOME, "grok-pi-advisor.yml");
+		writeFileSync(
+			overlayPath,
+			"advisor:\n  enabled: true\n" +
+				(advisorModel ? `modelRoles:\n  advisor: ${advisorModel}\n` : ""),
+			{ mode: 0o600 },
+		);
+		const existing = process.env.PI_CONFIG_FILES;
+		process.env.PI_CONFIG_FILES = existing ? `${existing}${delimiter}${overlayPath}` : overlayPath;
+	} catch (e) {
+		process.stderr.write(`grok-pi: could not write advisor overlay (${e?.message ?? e})\n`);
+	}
+	if (!process.env.OMP_ACP_CMD) {
+		process.env.OMP_ACP_CMD = "omp acp --advisor";
 	}
 }
 

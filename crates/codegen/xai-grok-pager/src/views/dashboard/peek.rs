@@ -810,7 +810,10 @@ pub fn extract_last_response_type(agent: &AgentView) -> String {
             // The user's latest input marks the turn boundary; there's no agent response after it yet
             RenderBlock::UserPrompt(_) => break,
             // Structural blocks carry no response type; keep scanning
-            RenderBlock::System(_) | RenderBlock::SessionEvent(_) | RenderBlock::Stub(_) => {}
+            RenderBlock::System(_)
+            | RenderBlock::SessionEvent(_)
+            | RenderBlock::Stub(_)
+            | RenderBlock::Advisor(_) => {}
         }
     }
     if running {
@@ -899,6 +902,7 @@ fn block_short_text(block: &crate::scrollback::block::RenderBlock) -> Option<Str
         RenderBlock::Workflow(_) => Some("(workflow)".to_string()),
         RenderBlock::Btw(_) => Some("(btw)".to_string()),
         RenderBlock::ContextInfo(_) => Some("(context info)".to_string()),
+        RenderBlock::Advisor(_) => Some("(advisor note)".to_string()),
         RenderBlock::Stub(_) => None,
     }
 }

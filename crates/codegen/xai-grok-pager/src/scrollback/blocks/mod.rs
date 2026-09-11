@@ -1,3 +1,4 @@
+mod advisor;
 mod agent;
 mod bg_task;
 mod btw;
@@ -13,6 +14,7 @@ pub mod tool;
 mod user;
 mod workflow;
 
+pub use advisor::{AdvisorBlock, AdvisorSeverity};
 pub use agent::AgentMessageBlock;
 pub use bg_task::{BgTaskBlock, BgTaskKind};
 pub use btw::BtwBlock;

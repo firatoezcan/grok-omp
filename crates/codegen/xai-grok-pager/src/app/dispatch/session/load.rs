@@ -382,6 +382,13 @@ pub(in crate::app::dispatch) fn dispatch_pick_session(
         effects.extend(dispatch(Action::SendPrompt(prompt), app));
         return effects;
     }
+    // Agent-owned sessions (e.g. OMP behind the ACP bridge): the agent's own
+    // store holds the content, so load straight through `session/load` — no
+    // local disk lookup, no remote restore.
+    if source == "agent" {
+        let session_cwd = (!cwd.is_empty()).then(|| std::path::PathBuf::from(&cwd));
+        return dispatch_load_session(app, session_id, session_cwd, false);
+    }
     let chat_kind = source == "conversation";
     #[cfg(feature = "local-workspace")]
     if app.chat_mode && matches!(app.active_view, ActiveView::Welcome) {
