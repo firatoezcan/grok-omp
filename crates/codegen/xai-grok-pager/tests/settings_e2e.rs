@@ -76,6 +76,15 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "contextual_hints.word_select",
     "contextual_hints.export_copy",
     "contextual_hints.ssh_wrap",
+    // OMP section (visible only when the connected agent is Oh My Pi; `make_state` sets `omp_agent`)
+    "omp_disabled_commands",
+    "omp_providers",
+    "omp_advisor_enabled",
+    "omp_voice_enabled",
+    "omp_stt_model",
+    "omp_agent_version",
+    "omp_agent_command",
+    "omp_vibe_capable",
 ];
 
 #[test]
@@ -119,8 +128,21 @@ fn make_state() -> SettingsModalState {
         UiConfig::default(),
         // auto_mode_gate on so the permission_mode picker shows the full catalog (including Auto)
         // The gate-off filtering is covered by a dedicated test
+        // omp_agent on so the OMP section (which now hosts the voice_* rows) renders;
+        // two advertised commands so the Slash commands sub-sheet has rows to toggle.
         PagerLocalSnapshot {
             auto_mode_gate: true,
+            omp_agent: true,
+            omp_commands: vec![
+                agent_client_protocol::AvailableCommand::new(
+                    "review".to_string(),
+                    "Review the diff".to_string(),
+                ),
+                agent_client_protocol::AvailableCommand::new(
+                    "commit".to_string(),
+                    "Commit the work".to_string(),
+                ),
+            ],
             ..PagerLocalSnapshot::default()
         },
     )
@@ -297,6 +319,12 @@ fn assert_set_bool_action(outcome: SettingsKeyOutcome, key: &str, expected: bool
                 b, expected,
                 "SetDisplayRefreshAutoCadence value differs from expected"
             )
+        }
+        ("omp_advisor_enabled", Action::SetOmpAdvisorEnabled(b)) => {
+            assert_eq!(b, expected, "SetOmpAdvisorEnabled value differs from expected")
+        }
+        ("omp_voice_enabled", Action::SetOmpVoiceEnabled(b)) => {
+            assert_eq!(b, expected, "SetOmpVoiceEnabled value differs from expected")
         }
         (key, action) => panic!(
             "expected typed setter for `{key}={expected}`, got wrong Action variant: {action:?}"
@@ -1833,6 +1861,9 @@ fn registry_kind_membership_through_pr_14() {
 
             SettingKind::DynamicEnum { .. } => "DynamicEnum",
             SettingKind::Group { .. } => "Group",
+            SettingKind::OmpCommands => "OmpCommands",
+            SettingKind::OmpProviders => "OmpProviders",
+            SettingKind::Info => "Info",
             other => panic!(
                 "registry_kind_membership: setting `{}` has unknown kind {:?} — \
                  add an arm here AND a kind-membership assertion below",
@@ -1870,6 +1901,8 @@ fn registry_kind_membership_through_pr_14() {
             "auto_update",
             "show_tips",
             "voice_keybind_enabled",
+            "omp_advisor_enabled",
+            "omp_voice_enabled",
             // Per-tip contextual-hint children (hidden from the top-level list, toggled inside the group sub-sheet) are still Bool settings
             "contextual_hints.undo",
             "contextual_hints.plan_mode",
@@ -1898,6 +1931,7 @@ fn registry_kind_membership_through_pr_14() {
             "follow_up_behavior",
             "hunk_tracker_mode",
             "keep_text_selection",
+            "omp_stt_model",
             "permission_mode",
             "plan_mode",
             "render_mermaid",
@@ -1940,6 +1974,27 @@ fn registry_kind_membership_through_pr_14() {
         "Group kind membership drift",
     );
 
+    let omp_commands_keys = by_kind.remove("OmpCommands").unwrap_or_default();
+    assert_eq!(
+        omp_commands_keys,
+        vec!["omp_disabled_commands"],
+        "OmpCommands kind membership drift",
+    );
+
+    let omp_providers_keys = by_kind.remove("OmpProviders").unwrap_or_default();
+    assert_eq!(
+        omp_providers_keys,
+        vec!["omp_providers"],
+        "OmpProviders kind membership drift",
+    );
+
+    let info_keys = by_kind.remove("Info").unwrap_or_default();
+    assert_eq!(
+        info_keys,
+        vec!["omp_agent_command", "omp_agent_version", "omp_vibe_capable"],
+        "Info kind membership drift",
+    );
+
     // No unexpected kinds.
     assert!(
         by_kind.is_empty(),
@@ -1968,6 +2023,7 @@ fn enum_settings_membership_through_pr_14() {
             "follow_up_behavior",
             "hunk_tracker_mode",
             "keep_text_selection",
+            "omp_stt_model",
             "permission_mode",
             "plan_mode",
             "render_mermaid",
@@ -2061,6 +2117,16 @@ fn defaults_round_trip_through_registry() {
             "contextual_hints.word_select" => SettingValue::Bool(true),
             "contextual_hints.export_copy" => SettingValue::Bool(true),
             "contextual_hints.ssh_wrap" => SettingValue::Bool(true),
+            // OMP section: `omp_disabled_commands` persists the disabled list (empty = all enabled);
+            // `omp_providers` and the Info rows carry no persisted value (empty string).
+            "omp_disabled_commands" => SettingValue::StringList(Vec::new()),
+            "omp_providers" => SettingValue::String(String::new()),
+            "omp_advisor_enabled" => SettingValue::Bool(true),
+            "omp_voice_enabled" => SettingValue::Bool(true),
+            "omp_stt_model" => SettingValue::Enum("parakeet"),
+            "omp_agent_version" => SettingValue::String(String::new()),
+            "omp_agent_command" => SettingValue::String(String::new()),
+            "omp_vibe_capable" => SettingValue::String(String::new()),
             other => panic!("test must list expected default for `{other}`"),
         }
     };
@@ -2134,6 +2200,8 @@ fn settings_value_payload_matches_kind() {
             | SettingsKeyOutcome::Action(Action::SetCollapsedEditBlocks(_))
             | SettingsKeyOutcome::Action(Action::SetInvertScroll(_))
             | SettingsKeyOutcome::Action(Action::SetDisplayRefreshAutoCadence(_))
+            | SettingsKeyOutcome::Action(Action::SetOmpAdvisorEnabled(_))
+            | SettingsKeyOutcome::Action(Action::SetOmpVoiceEnabled(_))
             | SettingsKeyOutcome::Action(Action::SetVoiceKeybindEnabled(_)) => {}
             other => panic!(
                 "expected a typed bool setter for `{}`, got {:?}",
@@ -2252,8 +2320,13 @@ fn d_key_emits_open_reset_confirm_for_every_setting() {
     let reg = SettingsRegistry::defaults();
     for meta in reg.all() {
         // Group rows have no scalar value to reset (consistent with the registry reset-arm coverage test)
-        // Their children are hidden from the top-level list; neither is `d`-resettable directly
-        if matches!(meta.kind, SettingKind::Group { .. }) || is_group_child(&reg, meta.key) {
+        // Their children are hidden from the top-level list; neither is `d`-resettable directly.
+        // Info rows are read-only and OmpProviders rows carry no persisted value — `d` is a no-op on both.
+        if matches!(
+            meta.kind,
+            SettingKind::Group { .. } | SettingKind::Info | SettingKind::OmpProviders
+        ) || is_group_child(&reg, meta.key)
+        {
             continue;
         }
         let mut s = make_state();
@@ -3736,18 +3809,35 @@ fn reset_overlay_dims_all_rows_except_target() {
         "reset/cancel action footer must be visible — found neither row",
     );
     for action_y in action_rows {
-        let mut action_dim_count = 0usize;
-        for dx in 0..area.width {
-            if has_dim(area.x + dx, action_y) {
-                action_dim_count += 1;
-            }
+        // The overlay's dim sweep must not reach the footer. Shortcut labels legitimately
+        // render muted (`theme.muted()` carries DIM under the terminal theme) — that's the
+        // standard shortcut style, not the overlay. The contract is that the shortcut KEY
+        // cells (the BOLD action tokens: y, n, Esc, F2) stay at full intensity.
+        // Walk cells (not bytes): the box-drawing border is multi-byte, so a byte offset
+        // into the row text does not map 1:1 to a column.
+        let cells: Vec<&str> = (area.x..area.x + area.width)
+            .map(|x| buf.cell((x, action_y)).map(|c| c.symbol()).unwrap_or(""))
+            .collect();
+        for key_token in ["y", "n", "Esc", "F2"] {
+            // Find the column where the token's chars start (each token char is one cell).
+            let token_len = key_token.len();
+            let start = (0..=cells.len().saturating_sub(token_len)).find(|&i| {
+                (0..token_len).all(|k| cells[i + k] == &key_token[k..k + 1])
+            });
+            let Some(i) = start else {
+                continue;
+            };
+            let x = area.x + i as u16;
+            let cell = buf.cell((x, action_y)).expect("key cell must exist");
+            assert!(
+                cell.modifier.contains(Modifier::BOLD)
+                    && !cell.modifier.contains(Modifier::DIM),
+                "shortcut key `{key_token}` on the action footer row (y={action_y}) must be \
+                 BOLD and free of Modifier::DIM — the overlay's dim sweep must not reach it \
+                 (got modifier {:?})",
+                cell.modifier,
+            );
         }
-        assert_eq!(
-            action_dim_count, 0,
-            "no cell on the action footer row (y={action_y}) may carry \
-             Modifier::DIM — y/n shortcuts are action elements and must \
-             stay at full intensity",
-        );
     }
 }
 
@@ -6136,6 +6226,284 @@ fn mouse_click_on_voice_stt_language_indicator_opens_picker_in_one_click() {
     match &s.mode() {
         SettingsModalMode::PickingEnum { key, .. } => assert_eq!(*key, "voice_stt_language"),
         _ => panic!("value click on voice_stt_language must enter PickingEnum"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OMP section: advisor, voice dictation/model, slash commands, providers, info rows
+// ---------------------------------------------------------------------------
+
+/// Space-toggle on `omp_advisor_enabled` dispatches the typed setter (default ON → off).
+#[test]
+fn space_on_omp_advisor_enabled_dispatches_typed_setter() {
+    let mut s = make_state();
+    navigate_to(&mut s, "omp_advisor_enabled");
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
+    assert_set_bool_action(outcome, "omp_advisor_enabled", false);
+}
+
+/// Value-column click toggles `omp_advisor_enabled` in one click.
+#[test]
+fn mouse_click_on_omp_advisor_enabled_indicator_toggles_in_one_click() {
+    let mut s = make_state();
+    synth_rects(&mut s);
+    let row_y = row_idx_for(&s, "omp_advisor_enabled") as u16;
+    let outcome = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        72,
+        row_y,
+    );
+    assert_set_bool_action(outcome, "omp_advisor_enabled", false);
+}
+
+/// Space-toggle on `omp_voice_enabled` dispatches the typed setter (default ON → off).
+#[test]
+fn space_on_omp_voice_enabled_dispatches_typed_setter() {
+    let mut s = make_state();
+    navigate_to(&mut s, "omp_voice_enabled");
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
+    assert_set_bool_action(outcome, "omp_voice_enabled", false);
+}
+
+/// Value-column click toggles `omp_voice_enabled` in one click.
+#[test]
+fn mouse_click_on_omp_voice_enabled_indicator_toggles_in_one_click() {
+    let mut s = make_state();
+    synth_rects(&mut s);
+    let row_y = row_idx_for(&s, "omp_voice_enabled") as u16;
+    let outcome = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        72,
+        row_y,
+    );
+    assert_set_bool_action(outcome, "omp_voice_enabled", false);
+}
+
+/// Enter on `omp_stt_model` opens the enum picker seeded with the default `parakeet`.
+#[test]
+fn enter_on_omp_stt_model_row_enters_picking_enum() {
+    let mut s = make_state();
+    navigate_to(&mut s, "omp_stt_model");
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Enter));
+    assert!(
+        matches!(outcome, SettingsKeyOutcome::Changed),
+        "Enter on omp_stt_model row must transition to PickingEnum, got {outcome:?}"
+    );
+    match &s.mode() {
+        SettingsModalMode::PickingEnum {
+            key,
+            original_value,
+            ..
+        } => {
+            assert_eq!(*key, "omp_stt_model");
+            assert_eq!(
+                original_value,
+                &SettingValue::Enum("parakeet"),
+                "default UiConfig omp_stt_model → original 'parakeet'"
+            );
+        }
+        other => panic!("expected PickingEnum mode, got {other:?}"),
+    }
+}
+
+/// Enter on a picker choice commits via `Action::SetOmpSttModel` carrying the canonical name.
+/// Seed is `parakeet` (index 0); one Down moves to `fast`.
+#[test]
+fn omp_stt_model_picker_enter_dispatches_set_commit() {
+    let mut s = make_state();
+    navigate_to(&mut s, "omp_stt_model");
+    let _ = handle_settings_key(&mut s, &press(KeyCode::Enter));
+    let _ = handle_settings_key(&mut s, &press(KeyCode::Down));
+    let outcome = handle_settings_key(&mut s, &press(KeyCode::Enter));
+    match outcome {
+        SettingsKeyOutcome::Action(Action::SetOmpSttModel(model)) => {
+            assert_eq!(model, "fast", "second choice is `fast`");
+        }
+        other => panic!("expected Action::SetOmpSttModel commit, got {other:?}"),
+    }
+    assert!(
+        matches!(s.mode(), SettingsModalMode::Browse),
+        "Enter commit must return to Browse"
+    );
+}
+
+/// Value-column click on the `omp_stt_model` row opens the picker in ONE click.
+#[test]
+fn mouse_click_on_omp_stt_model_indicator_opens_picker_in_one_click() {
+    let mut s = make_state();
+    synth_rects(&mut s);
+    let row_y = row_idx_for(&s, "omp_stt_model") as u16;
+    let outcome = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        72,
+        row_y,
+    );
+    assert!(
+        matches!(outcome, SettingsKeyOutcome::Changed),
+        "value click must open picker in one click, got: {outcome:?}",
+    );
+    match &s.mode() {
+        SettingsModalMode::PickingEnum { key, .. } => assert_eq!(*key, "omp_stt_model"),
+        _ => panic!("value click on omp_stt_model must enter PickingEnum"),
+    }
+}
+
+/// Enter on `omp_disabled_commands` opens the slash-commands sub-sheet; Space toggles the
+/// focused command off via `Action::SetOmpCommandEnabled`; Esc returns to Browse.
+#[test]
+fn enter_on_omp_disabled_commands_opens_sheet_and_toggles_command() {
+    let mut s = make_state();
+    navigate_to(&mut s, "omp_disabled_commands");
+
+    let out = handle_settings_key(&mut s, &press(KeyCode::Enter));
+    assert!(matches!(out, SettingsKeyOutcome::Changed));
+    assert!(matches!(
+        s.mode(),
+        SettingsModalMode::OmpCommands { cmd_idx: 0, .. }
+    ));
+
+    // Space on the first command ("review") disables it.
+    let out = handle_settings_key(&mut s, &press(KeyCode::Char(' ')));
+    match out {
+        SettingsKeyOutcome::Action(Action::SetOmpCommandEnabled { name, enabled }) => {
+            assert_eq!(name, "review");
+            assert!(!enabled, "first toggle must disable the command");
+        }
+        other => panic!("expected Action::SetOmpCommandEnabled, got {other:?}"),
+    }
+
+    // Esc returns to Browse.
+    let out = handle_settings_key(&mut s, &press(KeyCode::Esc));
+    assert!(matches!(out, SettingsKeyOutcome::Changed));
+    assert!(matches!(s.mode(), SettingsModalMode::Browse));
+}
+
+/// Clicking the `omp_disabled_commands` value column opens the sheet; clicking a command row
+/// toggles it in one click.
+#[test]
+fn mouse_click_on_omp_disabled_commands_opens_sheet_and_toggles_command() {
+    let mut s = make_state();
+    synth_rects(&mut s);
+    let row_y = row_idx_for(&s, "omp_disabled_commands") as u16;
+
+    let out = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        72,
+        row_y,
+    );
+    assert!(matches!(out, SettingsKeyOutcome::Changed));
+    assert!(
+        matches!(s.mode(), SettingsModalMode::OmpCommands { .. }),
+        "click on the commands value column must open the sub-sheet, got {:?}",
+        s.mode(),
+    );
+
+    // Synthesize command hit-rects (the renderer doesn't run in tests) and click the second
+    // command, which toggles "commit" off in one click.
+    s.picker_choice_rects = (0..2)
+        .map(|i| Rect {
+            x: 0,
+            y: i as u16,
+            width: 80,
+            height: 1,
+        })
+        .collect();
+    let out = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        1,
+        1,
+    );
+    match out {
+        SettingsKeyOutcome::Action(Action::SetOmpCommandEnabled { name, enabled }) => {
+            assert_eq!(name, "commit");
+            assert!(!enabled, "click on the second command must disable it");
+        }
+        other => panic!("expected Action::SetOmpCommandEnabled, got {other:?}"),
+    }
+}
+
+/// Enter on `omp_providers` opens the providers sheet and kicks off the async fetch.
+#[test]
+fn enter_on_omp_providers_opens_sheet_and_fetches() {
+    let mut s = make_state();
+    navigate_to(&mut s, "omp_providers");
+    let out = handle_settings_key(&mut s, &press(KeyCode::Enter));
+    assert!(
+        matches!(out, SettingsKeyOutcome::Action(Action::OmpFetchProviders)),
+        "Enter on omp_providers must emit OmpFetchProviders, got {out:?}"
+    );
+    assert!(matches!(
+        s.mode(),
+        SettingsModalMode::OmpProviders { provider_idx: 0, .. }
+    ));
+}
+
+/// Clicking the `omp_providers` value column opens the sheet and fetches in one click.
+#[test]
+fn mouse_click_on_omp_providers_opens_sheet_and_fetches() {
+    let mut s = make_state();
+    synth_rects(&mut s);
+    let row_y = row_idx_for(&s, "omp_providers") as u16;
+    let out = handle_settings_mouse(
+        &mut s,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        72,
+        row_y,
+    );
+    assert!(
+        matches!(out, SettingsKeyOutcome::Action(Action::OmpFetchProviders)),
+        "value click on omp_providers must emit OmpFetchProviders, got {out:?}"
+    );
+    assert!(matches!(
+        s.mode(),
+        SettingsModalMode::OmpProviders { .. }
+    ));
+}
+
+/// Info rows are read-only: Enter, Space, and `d` are all no-ops and never leave Browse.
+#[test]
+fn info_rows_ignore_enter_space_and_reset() {
+    for key in ["omp_agent_version", "omp_agent_command", "omp_vibe_capable"] {
+        let mut s = make_state();
+        navigate_to(&mut s, key);
+        for code in [KeyCode::Enter, KeyCode::Char(' '), KeyCode::Char('d')] {
+            let out = handle_settings_key(&mut s, &press(code));
+            assert!(
+                matches!(out, SettingsKeyOutcome::Unchanged),
+                "{code:?} on Info row `{key}` must be a no-op, got {out:?}"
+            );
+            assert!(
+                matches!(s.mode(), SettingsModalMode::Browse),
+                "{code:?} on Info row `{key}` must stay in Browse, got {:?}",
+                s.mode()
+            );
+        }
+    }
+}
+
+/// Clicking an Info row only selects it — a second click still emits no action.
+#[test]
+fn mouse_click_on_info_row_selects_without_action() {
+    let mut s = make_state();
+    synth_rects(&mut s);
+    let row_y = row_idx_for(&s, "omp_agent_version") as u16;
+    for _ in 0..2 {
+        let out = handle_settings_mouse(
+            &mut s,
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            72,
+            row_y,
+        );
+        assert!(
+            matches!(out, SettingsKeyOutcome::Changed),
+            "click on an Info row selects it but must not emit an Action, got {out:?}"
+        );
+        assert!(matches!(s.mode(), SettingsModalMode::Browse));
     }
 }
 
