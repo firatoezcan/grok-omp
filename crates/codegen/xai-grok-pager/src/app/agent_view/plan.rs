@@ -63,7 +63,10 @@ impl AgentView {
         &self,
         appearance: &crate::appearance::AppearanceConfig,
     ) -> bool {
-        (self.plan_mode_active || appearance.show_plan_chip) && self.plan_preview_available()
+        // Vibe mode is mutually exclusive with plan mode agent-side; while it
+        // is active the plan chip would lie about the live toolset.
+        let vibe_active = self.vibe_mode_pending.unwrap_or(self.vibe_mode_active);
+        (self.plan_mode_active || appearance.show_plan_chip) && self.plan_preview_available() && !vibe_active
     }
     fn inline_plan_content(&self) -> Option<&str> {
         self.plan_approval_view

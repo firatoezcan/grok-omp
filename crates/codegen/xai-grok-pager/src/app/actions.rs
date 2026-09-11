@@ -661,6 +661,13 @@ pub enum Action {
     /// Set plan mode on/off. Per-session, ACP-mediated (not persisted to config.toml).
     /// `/plan <desc>` uses `EnterPlanMode` instead because it also starts a turn.
     SetPlanMode(PlanModeKind),
+    /// Enter OMP vibe mode. If a description is provided, also start a turn with that text as the prompt.
+    EnterVibeMode {
+        description: Option<String>,
+    },
+    /// Set vibe mode on/off/toggle. Per-session, ACP-mediated (not persisted to config.toml).
+    /// `/vibe <desc>` uses `EnterVibeMode` instead because it also starts a turn.
+    SetVibeMode(VibeModeKind),
     /// Open the centered feedback modal (full TUI only; minimal mode refuses visibly).
     /// The payload's images were drained at slash-execution time; the modal composer adopts them as chips.
     OpenFeedbackModal(crate::views::feedback_modal::OpenFeedbackModal),
@@ -1114,6 +1121,17 @@ impl PlanModeKind {
     pub fn from_bool(b: bool) -> Self {
         if b { Self::On } else { Self::Off }
     }
+}
+/// On/off/toggle state for vibe mode (`/vibe`).
+/// `Toggle` resolves against `vibe_mode_pending.unwrap_or(vibe_mode_active)` in the dispatcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VibeModeKind {
+    /// Agent in `SessionMode::Vibe`: read-only director toolset + vibe_* worker tools.
+    On,
+    /// Agent in `SessionMode::Default`.
+    Off,
+    /// Flip the current effective state (bare `/vibe`).
+    Toggle,
 }
 /// What user gesture triggered a turn cancel; sent as `session/cancel`'s `_meta.cancelTrigger`.
 /// The shell's deny-list treats every gesture value as a stop, so new variants need no shell change.

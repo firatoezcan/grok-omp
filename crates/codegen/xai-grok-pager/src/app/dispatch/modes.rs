@@ -105,6 +105,157 @@ pub(super) fn dispatch_enter_plan_mode(
     }
 }
 
+/// Enter OMP vibe mode (`/vibe [prompt]`).
+/// Mirrors `dispatch_enter_plan_mode`: with a description the mode switch must
+/// land before the prompt, so the SendPrompt is wrapped in SetModeThenPrompt.
+/// Vibe and plan are mutually exclusive agent-side — entering vibe while plan
+/// is active is refused here instead of round-tripping a guaranteed error.
+pub(super) fn dispatch_enter_vibe_mode(
+    app: &mut AppView,
+    description: Option<String>,
+) -> Vec<Effect> {
+    let ActiveView::Agent(id) = app.active_view else {
+        return vec![];
+    };
+    let Some(agent) = app.agents.get_mut(&id) else {
+        return vec![];
+    };
+
+    let in_vibe = agent.vibe_mode_pending.unwrap_or(agent.vibe_mode_active);
+    let in_plan = agent.plan_mode_pending.unwrap_or(agent.plan_mode_active);
+    if !in_vibe && in_plan {
+        app.show_toast("Exit plan mode first.");
+        return vec![];
+    }
+    if in_vibe && description.is_none() {
+        app.show_toast("Already in vibe mode. /vibe off to exit.");
+        return vec![];
+    }
+
+    let Some(session_id) = agent.session.session_id.clone() else {
+        agent.show_toast(NO_SESSION_NOTICE);
+        return vec![];
+    };
+
+    let mode_id = acp::SessionModeId::new(xai_grok_tools::types::SessionMode::Vibe.as_id());
+
+    if let Some(desc) = description {
+        // Optimistic pending + banner before the drain: `note_peek_page_flip`
+        // reborrows `app`, so `agent` must not be held across it.
+        if !in_vibe {
+            agent.vibe_mode_pending = Some(true);
+            agent.show_mode_switch_banner("Vibe");
+        }
+        // Enqueue and drain: maybe_drain_queue does all synchronous turn setup
+        // (scrollback, start_turn, prompt_id) and returns a SendPrompt. Wrap it
+        // in SetModeThenPrompt so the mode switch completes before the prompt is
+        // sent — unless vibe is already active, where a plain prompt suffices.
+        let skill_token_ranges = agent
+            .prompt
+            .slash_controller
+            .recognized_token_ranges(&desc, &agent.session.models);
+        agent
+            .session
+            .enqueue_prompt_with_skill_tokens(desc, skill_token_ranges);
+        let drain = maybe_drain_queue(agent);
+        note_peek_page_flip(app, id, drain.page_flip_entry);
+        let mut effects = Vec::with_capacity(1);
+        for eff in drain.effects {
+            match eff {
+                Effect::SendPrompt {
+                    agent_id,
+                    text,
+                    prompt_id,
+                    skill_token_ranges,
+                    ..
+                } if !in_vibe => {
+                    effects.push(Effect::SetModeThenPrompt {
+                        session_id: session_id.clone(),
+                        mode_id: mode_id.clone(),
+                        agent_id,
+                        text,
+                        prompt_id,
+                        skill_token_ranges,
+                    });
+                }
+                other => effects.push(other),
+            }
+        }
+        // If drain was empty (not idle), emit only the mode switch; the prompt
+        // stays queued and drains when the agent idles.
+        if effects.is_empty() && !in_vibe {
+            effects.push(Effect::SetSessionMode {
+                session_id,
+                mode_id,
+            });
+        }
+        effects
+    } else {
+        agent.vibe_mode_pending = Some(true);
+        agent.show_mode_switch_banner("Vibe");
+        vec![Effect::SetSessionMode {
+            session_id,
+            mode_id,
+        }]
+    }
+}
+
+/// Set vibe mode (on / off / toggle).
+/// Mirrors `set_plan_mode`: optimistic `vibe_mode_pending`, confirmed by the
+/// `CurrentModeUpdate` broadcast in `detect_plan_mode_change`.
+pub(super) fn set_vibe_mode(
+    app: &mut AppView,
+    kind: crate::app::actions::VibeModeKind,
+) -> Vec<Effect> {
+    let ActiveView::Agent(id) = app.active_view else {
+        return vec![];
+    };
+    let Some(agent) = app.agents.get_mut(&id) else {
+        return vec![];
+    };
+
+    let Some(session_id) = agent.session.session_id.clone() else {
+        agent.show_toast(NO_SESSION_NOTICE);
+        return vec![];
+    };
+
+    let prev = agent.vibe_mode_pending.unwrap_or(agent.vibe_mode_active);
+    let new = match kind {
+        crate::app::actions::VibeModeKind::On => true,
+        crate::app::actions::VibeModeKind::Off => false,
+        crate::app::actions::VibeModeKind::Toggle => !prev,
+    };
+
+    if prev == new {
+        app.show_toast(if new {
+            "Already in vibe mode. /vibe off to exit."
+        } else {
+            "Vibe mode is not active."
+        });
+        return vec![];
+    }
+    // Vibe and plan are mutually exclusive agent-side; refuse early instead of
+    // round-tripping a guaranteed set_mode error.
+    if new && agent.plan_mode_pending.unwrap_or(agent.plan_mode_active) {
+        app.show_toast("Exit plan mode first.");
+        return vec![];
+    }
+
+    agent.vibe_mode_pending = Some(new);
+    agent.show_mode_switch_banner(if new { "Vibe" } else { "Normal" });
+
+    let mode_id = acp::SessionModeId::new(if new {
+        xai_grok_tools::types::SessionMode::Vibe.as_id()
+    } else {
+        xai_grok_tools::types::SessionMode::Default.as_id()
+    });
+
+    vec![Effect::SetSessionMode {
+        session_id,
+        mode_id,
+    }]
+}
+
 /// Set plan mode (on / off).
 /// PAGER-owned and ACP-mediated, per-session.
 /// Optimistic flow: captures effective state (`pending.or(active)`), sets `plan_mode_pending`, refreshes modals, and toasts.

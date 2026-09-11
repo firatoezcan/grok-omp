@@ -5,7 +5,9 @@ pub(super) fn prompt_mode_from_session_mode_id(session_mode_id: &acp::SessionMod
     match SessionMode::from_id(session_mode_id.0.as_ref()) {
         SessionMode::Plan => PromptMode::Plan,
         SessionMode::Ask => PromptMode::Ask,
-        SessionMode::Default => PromptMode::Agent,
+        // Vibe is an OMP-agent mode; this shell's own agent has no vibe
+        // toolset, so it degrades to the plain agent prompt mode.
+        SessionMode::Vibe | SessionMode::Default => PromptMode::Agent,
     }
 }
 /// Inverse of [`prompt_mode_from_session_mode_id`]: the mode id a client displays for a prompt mode.

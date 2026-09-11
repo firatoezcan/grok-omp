@@ -63,6 +63,7 @@ pub mod transcript;
 pub mod tutorial;
 pub mod usage;
 pub mod view_plan;
+pub mod vibe;
 pub mod vim_mode;
 pub mod voice;
 pub mod workflow;
@@ -94,6 +95,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(loop_cmd::LoopCommand),
         Arc::new(plan::PlanCommand),
         Arc::new(view_plan::ViewPlanCommand),
+        Arc::new(vibe::VibeCommand),
         Arc::new(remember::RememberCommand),
         Arc::new(recap::RecapCommand),
         Arc::new(rewind::RewindCommand),

@@ -922,6 +922,7 @@ impl AgentView {
             .current_model_name()
             .unwrap_or_else(|| "unknown".to_string());
         let effective_plan = self.plan_mode_pending.unwrap_or(self.plan_mode_active);
+        let effective_vibe = self.vibe_mode_pending.unwrap_or(self.vibe_mode_active);
         let casual_commenting = self.is_casual_commenting();
         let prompt_focused = if self.plan_approval_view.is_some() {
             self.plan_approval_view
@@ -943,12 +944,17 @@ impl AgentView {
             bg: PromptBg::Default,
             accent_color_override: if let Some(c) = self.prompt_input_mode.accent_color(&theme) {
                 Some(c)
+            } else if effective_vibe {
+                Some(theme.accent_verify)
             } else if effective_plan || casual_commenting {
                 Some(theme.accent_plan)
             } else {
                 None
             },
-            border_color_override: if effective_plan || casual_commenting {
+            border_color_override: if effective_vibe {
+                crate::render::color::blend_color(theme.bg_base, theme.accent_verify, 0.4)
+                    .or(Some(theme.accent_verify))
+            } else if effective_plan || casual_commenting {
                 crate::render::color::blend_color(theme.bg_base, theme.accent_plan, 0.4)
                     .or(Some(theme.accent_plan))
             } else {
@@ -2483,7 +2489,7 @@ impl AgentView {
             .plan_approval_view
             .as_ref()
             .is_some_and(|pav| pav.focus == PlanApprovalFocus::Commenting);
-        let plan_label: Option<&str> = if effective_plan || casual_commenting {
+        let plan_label: Option<&str> = if !effective_vibe && (effective_plan || casual_commenting) {
             let commenting_range: Option<&std::ops::Range<usize>> = if approval_is_commenting {
                 self.plan_approval_view
                     .as_ref()
@@ -2508,8 +2514,18 @@ impl AgentView {
         } else {
             None
         };
-        let flags: Vec<PromptFlag> =
+        let mut flags: Vec<PromptFlag> =
             mode_flags(plan_label, self.session.permission_label(), &theme);
+        if effective_vibe {
+            flags.insert(
+                0,
+                PromptFlag {
+                    text: "vibe",
+                    color: Some(theme.accent_verify),
+                    bold: false,
+                },
+            );
+        }
         let multiline = self.multiline_mode;
         let warning = self.credit_balance.as_ref().and_then(|bal| {
             crate::views::credit_bar::usage_warning_for_session(

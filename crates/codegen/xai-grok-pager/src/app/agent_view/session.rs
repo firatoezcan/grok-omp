@@ -326,6 +326,8 @@ impl AgentView {
             question_scroll_region: None,
             plan_mode_active: false,
             plan_mode_pending: None,
+            vibe_mode_active: false,
+            vibe_mode_pending: None,
             deferred_session_mode: None,
             deferred_permission_mode: None,
             pending_extensions_fetch: false,

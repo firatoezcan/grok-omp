@@ -2045,10 +2045,56 @@ class ExtSurface {
 		// OMP's implicit cancel do exactly what send-now means.
 		if (method === "session/prompt") {
 			const p = frame.params ?? {};
+			const promptText = promptBlocksText(p.prompt);
+			// `/vibe` passthrough: the pager forwards unknown slash commands as
+			// prompt text (and other ACP clients may send it raw). Translate to
+			// session/set_mode against the patched OMP's vibe arm — stock OMP
+			// answers with an error, which is surfaced to the client verbatim.
+			const vibeMatch = /^\/vibe(?:[ \t]+([^\n]*))?(?:\n|$)/.exec(promptText.trim());
+			if (vibeMatch) {
+				const arg = (vibeMatch[1] ?? "").trim();
+				const current = this.modeConfig?.currentValue;
+				let target;
+				let rest = "";
+				if (/^(off|disable|exit)$/i.test(arg)) {
+					target = this.defaultModeId();
+				} else if (/^(on|enable)$/i.test(arg)) {
+					target = "vibe";
+				} else if (arg === "") {
+					target = current === "vibe" ? this.defaultModeId() : "vibe";
+				} else {
+					target = "vibe";
+					rest = arg;
+				}
+				const setId = `xai-int-${++this.internalSeq}`;
+				const rec = { kind: "vibeMode", clientId: frame.id };
+				if (rest) {
+					// `/vibe <prompt>`: enter vibe, then run the prompt. The prompt
+					// entry carries clientId === agentId === the pager's request id so
+					// its response passes through like a normal session/prompt.
+					rec.followUp = {
+						queueId: p._meta?.promptId ?? `prompt-${frame.id}`,
+						kind: "prompt",
+						text: rest,
+						version: 0,
+						params: { sessionId: p.sessionId, prompt: [{ type: "text", text: rest }] },
+						clientId: frame.id,
+						agentId: frame.id,
+					};
+				}
+				this.internalIds.set(setId, rec);
+				this.outToAgent.push({
+					jsonrpc: "2.0",
+					id: setId,
+					method: "session/set_mode",
+					params: { sessionId: p.sessionId ?? this.session?.sessionId, modeId: target },
+				});
+				return { action: "defer" };
+			}
 			const entry = {
 				queueId: p._meta?.promptId ?? `prompt-${frame.id}`,
 				kind: "prompt",
-				text: promptBlocksText(p.prompt),
+				text: promptText,
 				version: 0,
 				frame,
 				clientId: frame.id,
@@ -2521,6 +2567,26 @@ class ExtSurface {
 				this.noteTurnSettled(frame);
 				this.settleTurn(frame.id, frame.result?.stopReason);
 			}
+			if (rec.kind === "vibeMode") {
+				// `/vibe` interception: the set_mode response settles the client's
+				// prompt request. On error the client gets the error verbatim; on
+				// success a `/vibe <prompt>` follow-up is dispatched (or held behind
+				// a running turn) and its own response answers the client.
+				if (frame.error !== undefined) {
+					this.outToClient.push({ jsonrpc: "2.0", id: rec.clientId, error: frame.error });
+				} else if (rec.followUp) {
+					if (this.running) this.held.push(rec.followUp);
+					else this.dispatchEntry(rec.followUp);
+					this.broadcastQueue();
+				} else {
+					this.outToClient.push({
+						jsonrpc: "2.0",
+						id: rec.clientId,
+						result: { stopReason: "end_turn" },
+					});
+				}
+				return true;
+			}
 			if (rec.kind === "sessionList" && frame.result !== undefined) {
 				this.lastSessionRows = this.translateSessionList(frame.result, {}).sessions;
 				this.outToClient.push(this.notif("_x.ai/sessions/changed", {
@@ -2711,12 +2777,12 @@ class ExtSurface {
 		});
 	}
 
-	/** The non-plan mode to toggle back to. */
+	/** The non-modal mode to toggle back to (skips plan AND vibe). */
 	defaultModeId() {
 		const opts = this.modeConfig?.options ?? this.session?.modes?.availableModes ?? [];
 		for (const o of opts) {
 			const id = o?.value ?? o?.id ?? o;
-			if (id && id !== "plan") return id;
+			if (id && id !== "plan" && id !== "vibe") return id;
 		}
 		return "default";
 	}

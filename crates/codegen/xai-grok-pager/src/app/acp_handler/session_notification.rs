@@ -1695,14 +1695,19 @@ pub(super) fn detect_plan_mode_change(
     let mode = SessionMode::from_id(cmu.current_mode_id.0.as_ref());
     let was_active = agent.plan_mode_active;
     let now_active = mode.is_plan();
+    let was_vibe = agent.vibe_mode_active;
+    let now_vibe = mode.is_vibe();
     let user_requested = agent.plan_mode_pending.is_some();
     agent.plan_mode_active = now_active;
     agent.plan_mode_pending = None;
-    if was_active != now_active {
+    agent.vibe_mode_active = now_vibe;
+    agent.vibe_mode_pending = None;
+    if was_active != now_active || was_vibe != now_vibe {
         tracing::info!(
             mode_id = %cmu.current_mode_id.0,
             plan_active = now_active,
-            "Plan mode state updated (from CurrentModeUpdate)"
+            vibe_active = now_vibe,
+            "Session mode state updated (from CurrentModeUpdate)"
         );
     }
     Some(match (was_active, now_active) {

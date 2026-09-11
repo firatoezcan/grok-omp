@@ -1272,6 +1272,14 @@ pub struct AgentView {
     /// Cleared to `None` when `detect_plan_mode_change()` confirms real state.
     /// The cycle logic uses `plan_mode_pending.unwrap_or(plan_mode_active)` so rapid Shift+Tab presses advance correctly without waiting for ACP.
     pub(crate) plan_mode_pending: Option<bool>,
+    /// Whether OMP vibe mode is currently active (agent directs worker
+    /// sessions; its own toolset is read-only). Confirmed by
+    /// `current_mode_update` in `detect_plan_mode_change`.
+    pub(crate) vibe_mode_active: bool,
+    /// Optimistic vibe-mode state set by `/vibe`; cleared to `None` when
+    /// `detect_plan_mode_change()` confirms real state. Mirrors
+    /// `plan_mode_pending`.
+    pub(crate) vibe_mode_pending: Option<bool>,
     /// Session mode to apply once this agent's ACP session exists. Set when the agent is spawned from the dashboard with `/plan` active (the session does not exist yet, so the mode can't be sent immediately).
     /// Consumed in the `SessionCreated` / `WorktreeSessionCreated` handlers, mirroring `AgentSession.deferred_model_switch`.
     pub(crate) deferred_session_mode: Option<xai_grok_tools::types::SessionMode>,
