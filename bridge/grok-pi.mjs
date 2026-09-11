@@ -155,10 +155,10 @@ delete process.env.GROK_EXTERNAL_OTEL;
 // --- Voice (local STT shim) -------------------------------------------------
 // The pager dictates over wss://{api_base}/v1/stt (TLS + bearer mandatory) —
 // bridge/specs/voice.md. stt-shim.mjs terminates that socket on 127.0.0.1 and
-// feeds OMP's `__omp_worker_stt` (Parakeet/Whisper, local). Enabled when
-// GROK_PI_VOICE is unset and the STT model is already cached (i.e. `omp setup
-// speech` ran inside this profile); GROK_PI_VOICE=1 forces it on (the shim
-// then reports "run omp setup speech" to the pager), =0 disables.
+// feeds OMP's `__omp_worker_stt` (Parakeet/Whisper, local). The worker
+// downloads the model lazily on first use (same path `omp setup speech`
+// exercises), so no upfront gate: voice is on whenever the shim can launch.
+// GROK_PI_VOICE=0 disables; =1 is accepted for symmetry but unnecessary.
 let sttShim = null;
 const VOICE_MODE = process.env.GROK_PI_VOICE || undefined;
 if (VOICE_MODE !== "0" && VOICE_MODE !== "false") {
@@ -175,16 +175,6 @@ if (VOICE_MODE !== "0" && VOICE_MODE !== "false") {
 		if (VOICE_MODE) process.stderr.write("grok-pi: voice requested but no stt-shim/bun found; voice disabled\n");
 	} else {
 		sttShim = await startSttShim(shimCmd);
-		if (sttShim && !sttShim.modelCached && VOICE_MODE === undefined) {
-			// Auto mode without a model: stay silent rather than offer a toggle
-			// that always fails.
-			sttShim.proc.kill("SIGTERM");
-			sttShim = null;
-			process.stderr.write(
-				"grok-pi: voice off — no local STT model in the isolated profile.\n" +
-					`  install: PI_CODING_AGENT_DIR=${OMP_AGENT_DIR} omp setup speech   (or GROK_PI_VOICE=1 to force)\n`,
-			);
-		}
 		if (sttShim) {
 			// Point the pager's STT socket at the shim. The seeded config.toml is
 			// re-copied every launch, so append/replace the [voice] table here.

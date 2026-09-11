@@ -52,7 +52,6 @@ function flagValue(name) {
 	return i >= 0 && i + 1 < args.length ? args[i + 1] : undefined;
 }
 const CHECK_ONLY = args.includes("--check");
-const REQUIRE_CACHED = args.includes("--require-cached") || process.env.GROK_PI_STT_REQUIRE_CACHED === "1";
 const PORT = Number.parseInt(flagValue("--port") ?? process.env.GROK_PI_STT_PORT ?? "0", 10) || 0;
 const CERT_DIR = resolve(
 	flagValue("--dir") ??
@@ -376,29 +375,73 @@ const server = Bun.serve({
 				} catch {}
 			};
 
-			if (REQUIRE_CACHED && !MODEL_CACHED) {
-				fail(
-					`local STT model "${MODEL_KEY}" is not downloaded — run ` +
-						`\`PI_CODING_AGENT_DIR=${process.env.PI_CODING_AGENT_DIR ?? "~/.omp/agent"} omp setup speech\``,
-				);
-				return;
-			}
+			// Lazy model download: the worker fetches a missing model inside
+			// stream_start (same path `omp setup speech` exercises) and reports
+			// `progress` events. We surface them as non-final partials — any
+			// non-empty partial disarms the pager's 10s no-speech watchdog, so a
+			// first-run download can't kill the session, and the user sees live
+			// progress in the prompt overlay instead of a dead mic.
+			conn.downloading = !isModelCached(MODEL_KEY);
+			conn.lastProgressAt = 0;
+			conn.fileProgress = new Map();
+			const progressText = () => {
+				if (!conn.downloading) return "Loading speech model…";
+				let loaded = 0, total = 0;
+				for (const f of conn.fileProgress.values()) {
+					loaded += f.loaded;
+					total += f.total;
+				}
+				const pct = total > 0 ? ` ${Math.min(99, Math.round((loaded / total) * 100))}%` : "";
+				return `Downloading speech model…${pct}`;
+			};
+			const sendProgress = (force = false) => {
+				if (conn.done) return;
+				const now = Date.now();
+				if (!force && now - conn.lastProgressAt < 800) return;
+				conn.lastProgressAt = now;
+				send({ type: "transcript.partial", text: progressText(), is_final: false, speech_final: false });
+			};
+			// Keepalive while the model downloads/loads — the watchdog only
+			// re-arms after real speech, so this can't mask a dead mic forever.
+			// First emit happens after transcript.created below: the pager's
+			// wait_ready rejects any event that arrives before it.
+			conn.progressTimer = setInterval(() => sendProgress(), 4000);
+			conn.progressTimer.unref?.();
 
 			const worker = spawnWorker({
 				onMessage(msg) {
 					if (!msg || conn.done) return;
 					switch (msg.type) {
 						case "partial":
-							// Volatile in-progress preview.
+							// Volatile in-progress preview. Real speech disarms the
+							// pager's watchdog for good — the keepalive can stop.
+							stopProgress(conn);
 							send({ type: "transcript.partial", text: msg.text ?? "", is_final: false, speech_final: false });
 							break;
 						case "segment":
 							// Endpointed utterance — speech_final is what commits text
 							// into the pager's prompt box.
+							stopProgress(conn);
 							send({ type: "transcript.partial", text: msg.text ?? "", is_final: true, speech_final: true });
 							break;
+						case "progress": {
+							// Model download/load progress → interim partial (see
+							// above: keeps the watchdog disarmed + shows progress).
+							const ev = msg.event ?? {};
+							// Only the model's own ready event (it carries the ASR
+							// task) ends the download phase — runtime-install
+							// phases (sherpa-onnx-node npm install) also emit
+							// ready/done and must not flip the label early.
+							if ((ev.status === "ready" || ev.status === "done") && ev.task) conn.downloading = false;
+							if (ev.file && typeof ev.loaded === "number") {
+								conn.fileProgress.set(ev.file, { loaded: ev.loaded, total: ev.total ?? 0 });
+							}
+							sendProgress();
+							break;
+						}
 						case "stream_done":
 							conn.done = true;
+							stopProgress(conn);
 							send({
 								type: "transcript.done",
 								text: msg.text ?? "",
@@ -410,18 +453,20 @@ const server = Bun.serve({
 							setTimeout(() => killWorker(conn), 250);
 							break;
 						case "error":
+							stopProgress(conn);
 							send({ type: "error", message: String(msg.error ?? "stt worker error") });
 							break;
 						case "log":
 							if (msg.level !== "debug") log(`worker ${msg.level}: ${msg.msg ?? ""}`);
 							break;
-						// pong / progress / transcription / downloaded: not used
-						// by the streaming path; drop.
+						// pong / transcription / downloaded: not used by the
+						// streaming path; drop.
 					}
 				},
 				onExit(err) {
 					if (conn.done) return;
 					conn.done = true;
+					stopProgress(conn);
 					send({ type: "error", message: err.message });
 					try {
 						ws.close(1011);
@@ -436,6 +481,9 @@ const server = Bun.serve({
 
 			// Ready gate: the pager awaits this ≤10s before streaming audio.
 			send({ type: "transcript.created" });
+			// First progress partial — disarms the 10s no-speech watchdog while
+			// the model downloads/loads (cold load can exceed 10s even cached).
+			sendProgress(true);
 
 			// Model load is deferred inside the worker; audio that arrives while
 			// it loads is buffered by the endpointer.
@@ -469,12 +517,21 @@ const server = Bun.serve({
 			const conn = ws.data.conn;
 			if (!conn) return;
 			conn.done = true;
+			stopProgress(conn);
 			killWorker(conn);
 		},
 	},
 });
 
+function stopProgress(conn) {
+	if (conn.progressTimer) {
+		clearInterval(conn.progressTimer);
+		conn.progressTimer = null;
+	}
+}
+
 function killWorker(conn) {
+	stopProgress(conn);
 	const worker = conn.worker;
 	conn.worker = null;
 	if (!worker) return;

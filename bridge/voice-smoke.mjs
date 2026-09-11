@@ -6,7 +6,7 @@ import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 
 const REPO = resolve(import.meta.dir, "..");
-const GROK_HOME = "/tmp/grok-pi-test-home";
+const GROK_HOME = process.env.SMOKE_GROK_HOME ?? "/tmp/grok-pi-test-home";
 const SHIM_LOG = `${GROK_HOME}/stt-shim.log`;
 const logBefore = existsSync(SHIM_LOG) ? readFileSync(SHIM_LOG, "utf8").length : 0;
 
