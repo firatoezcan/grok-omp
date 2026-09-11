@@ -1688,6 +1688,7 @@ class ExtSurface {
 			update: {
 				sessionUpdate: "subagent_progress",
 				subagent_id: rec.subagentId,
+				parent_session_id: this.session?.sessionId,
 				child_session_id: rec.childSessionId,
 				duration_ms: Date.now() - rec.startedAt,
 				turn_count: rec.turns,

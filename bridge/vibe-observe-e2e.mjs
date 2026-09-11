@@ -128,6 +128,7 @@ check("subagent_type/description from spawn", spawned[0]?.params?.update?.subage
 const progress = findAll((f) => f.params?.update?.sessionUpdate === "subagent_progress" && f.params?.update?.subagent_id === "w1", mark);
 check("vibe_wait screens → subagent_progress", progress.length >= 1, `count=${progress.length} last=${JSON.stringify(progress.at(-1)?.params?.update).slice(0, 260)}`);
 check("progress carries turn/tool counts", progress.at(-1)?.params?.update?.turn_count >= 1, `turns=${progress.at(-1)?.params?.update?.turn_count} tools=${progress.at(-1)?.params?.update?.tool_call_count}`);
+check("progress carries parent_session_id (pager schema requires it)", progress.every((f) => f.params?.update?.parent_session_id === SID), `missing=${progress.filter((f) => f.params?.update?.parent_session_id !== SID).length}/${progress.length}`);
 
 const interjection = findAll((f) => f.params?.update?.sessionUpdate === "user_message_chunk" && f.params?.update?._meta?.interjection === true, mark);
 check("async-result → interjection user_message_chunk", interjection.length === 1 && interjection[0].params.update.content.text.includes("audit complete: clean"), `count=${interjection.length} text=${interjection[0]?.params?.update?.content?.text?.slice(0, 120)}`);
