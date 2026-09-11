@@ -86,9 +86,10 @@ if (existsSync(DEFAULT_CONFIG) && !existsSync(ISOLATED_CONFIG)) {
 //      used verbatim (e.g. "/path/to/omp acp --advisor").
 //   2. GROK_PI_OMP_CMD  — the omp binary (or a full "... acp" command line);
 //      "acp" is appended when absent and --advisor is added per GROK_PI_ADVISOR.
-//   3. A patched OMP build at a known location — the oh-my-pi source clone's
-//      compiled binary (vibe-mode DRIVING patch, bridge/specs/vibe-mode.md) or
-//      a copy dropped into $GROK_HOME/omp-build/omp.
+//   3. A patched OMP build at a known location — built from the oh-my-pi
+//      source clone branch `grok-omp/vibe-acp` @ 9081533 (vibe-mode DRIVING
+//      patch, bridge/specs/vibe-mode.md) at the clone's dist/omp, or a copy
+//      dropped into $GROK_HOME/omp-build/omp.
 //   4. Stock `omp` on PATH — vibe mode stays observe-only.
 const PATCHED_OMP_CANDIDATES = [
 	join(homedir(), "Projects", "Freelancing", "personal", "oh-my-pi", "packages", "coding-agent", "dist", "omp"),
