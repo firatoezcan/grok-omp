@@ -351,6 +351,22 @@ impl AgentView {
                     self.send_now_awaiting_confirm = Some(server_id);
                     return InputOutcome::Changed;
                 }
+                // A disabled OMP command (Settings › OMP) must not run: the interject would promote
+                // the row to a prompt and the agent would execute it. Refuse like the local arm.
+                if let Some(wire) = self.shared_queue.iter().find(|e| e.id == *server_id)
+                    && let Some(invocation) = crate::slash::parse_invocation(wire.text.trim())
+                    && self
+                        .prompt
+                        .slash_controller
+                        .registry()
+                        .is_disabled(invocation.token)
+                {
+                    self.show_toast(&format!(
+                        "/{} is disabled in Settings › OMP",
+                        invocation.token
+                    ));
+                    return InputOutcome::Changed;
+                }
                 return InputOutcome::Action(Action::QueueInterjectShared {
                     id: server_id,
                     expected_version: row.version,
@@ -362,6 +378,23 @@ impl AgentView {
         // Local rows: only plain prompts and raw skill rows can re-send (others would send display text, not payload)
         if self.queue_row_prompt_like(id) != Some(true) {
             self.show_toast("Can't send this now: it runs when the current turn ends");
+            return InputOutcome::Changed;
+        }
+        // A disabled OMP command (Settings › OMP) must not leave the pager: send-now would forward
+        // the row as prompt text and the agent would execute it. Refuse and keep the row, matching
+        // the send-path and edit-gate refusals.
+        if let Some(prompt) = self.session.pending_prompts.iter().find(|p| p.id == id)
+            && let Some(invocation) = crate::slash::parse_invocation(prompt.text.trim())
+            && self
+                .prompt
+                .slash_controller
+                .registry()
+                .is_disabled(invocation.token)
+        {
+            self.show_toast(&format!(
+                "/{} is disabled in Settings › OMP",
+                invocation.token
+            ));
             return InputOutcome::Changed;
         }
         if let Some(prompt) = self.remove_local_queue_row(id) {

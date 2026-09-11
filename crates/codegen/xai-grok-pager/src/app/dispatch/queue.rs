@@ -281,6 +281,31 @@ pub(super) fn maybe_drain_queue(agent: &mut AgentView) -> QueueDrain {
         return QueueDrain::blocked();
     }
 
+    // A queued `/cmd` prompt must not reach the agent once the command is disabled (Settings › OMP).
+    // The send path refuses at submit time, but a row can be queued while enabled and disabled before
+    // the turn settles — and direct `enqueue_prompt` callers (dashboard dispatch, deferred startup)
+    // never pass the send-path gate. Re-checking at drain time is the last point the toggle can hold.
+    // Front-only: a disabled command merged as a combined follower is mid-text and reaches the model
+    // as literal text, never as an execution — the same as a user typing it mid-prompt.
+    if let Some(front) = agent.session.pending_prompts.front()
+        && matches!(front.kind, QueueEntryKind::Prompt | QueueEntryKind::Command)
+        && let Some(invocation) = crate::slash::parse_invocation(front.text.trim())
+        && agent
+            .prompt
+            .slash_controller
+            .registry()
+            .is_disabled(invocation.token)
+    {
+        let name = invocation.token.to_string();
+        agent.session.dequeue_prompt();
+        push_and_page_flip(
+            &mut agent.scrollback,
+            RenderBlock::system(format!("/{name} is disabled in Settings › OMP")),
+        );
+        // The row is gone and no turn started, so the next row can drain now.
+        return maybe_drain_queue(agent);
+    }
+
     // Row the user is actively editing (if any)
     // The front-row case is already handled above; pass it so a combined drain also stops before an edited *follower* instead of merging it away
     let editing_id = match &agent.prompt_mode {
@@ -1054,6 +1079,37 @@ pub(super) fn dispatch_queue_interject_shared(
     expected_version: u64,
     new_text: Option<String>,
 ) -> Vec<Effect> {
+    // A disabled OMP command (Settings › OMP) must not leave the pager: the interject promotes the
+    // row to a prompt and the agent would execute it. The effective text is the edited override when
+    // present, else the server row's own text — the producer gate covers the latter, this is the
+    // last point the toggle can hold for the edited override.
+    let ActiveView::Agent(agent_id) = app.active_view else {
+        return vec![];
+    };
+    let Some(agent) = app.agents.get(&agent_id) else {
+        return vec![];
+    };
+    let effective_text = new_text.as_deref().or_else(|| {
+        agent
+            .shared_queue
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.text.as_str())
+    });
+    if let Some(invocation) =
+        effective_text.and_then(|text| crate::slash::parse_invocation(text.trim()))
+        && agent
+            .prompt
+            .slash_controller
+            .registry()
+            .is_disabled(invocation.token)
+    {
+        let name = invocation.token.to_string();
+        with_active_agent(app, |agent| {
+            agent.show_toast(&format!("/{name} is disabled in Settings › OMP"));
+        });
+        return vec![];
+    }
     match active_agent_session_id(app) {
         Some(session_id) => {
             with_active_agent(app, |agent| {
@@ -1835,6 +1891,61 @@ mod tests {
         assert_eq!(effects.len(), 1);
         assert!(matches!(&effects[0], Effect::SendPrompt { text, .. } if text == "queued"));
         assert_eq!(app.agents[&id].session.queue_len(), 0);
+    }
+
+    /// A `/cmd` queued while enabled must not reach the agent after the command is disabled
+    /// (Settings › OMP): the drain re-checks the registry and drops the row instead of sending it.
+    #[test]
+    fn drain_queue_drops_prompt_for_disabled_command() {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+
+        // Register `/security` as an ACP-advertised command, mirroring the OMP available-commands sync.
+        {
+            let agent = app.agents.get_mut(&id).unwrap();
+            let models = agent.session.models.clone();
+            agent.prompt.sync_acp_commands(
+                &[acp::AvailableCommand::new("security", "Security review")],
+                None,
+                &models,
+            );
+        }
+
+        app.agents.get_mut(&id).unwrap().session.state = AgentState::TurnRunning;
+        enqueue_local(&mut app, id, "/security");
+        enqueue_local(&mut app, id, "follow-up");
+
+        // Disabled after the rows were queued.
+        app.agents
+            .get_mut(&id)
+            .unwrap()
+            .set_disabled_commands(&["security".to_string()]);
+        app.agents.get_mut(&id).unwrap().session.state = AgentState::Idle;
+
+        let effects = dispatch(Action::DrainQueue, &mut app);
+
+        assert!(
+            !effects.iter().any(
+                |e| matches!(e, Effect::SendPrompt { text, .. } if text.starts_with("/security"))
+            ),
+            "disabled command must not reach the agent"
+        );
+        // The follower drains once the disabled row is dropped.
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendPrompt { text, .. } if text == "follow-up")),
+            "the next queued prompt still drains"
+        );
+        assert_eq!(app.agents[&id].session.queue_len(), 0);
+        let sb = &app.agents[&id].scrollback;
+        assert!(
+            (0..sb.len()).any(|i| matches!(
+                sb.entry(i).map(|e| &e.block),
+                Some(RenderBlock::System(block)) if block.text.contains("/security is disabled")
+            )),
+            "the drop is surfaced in scrollback"
+        );
     }
 
     #[test]

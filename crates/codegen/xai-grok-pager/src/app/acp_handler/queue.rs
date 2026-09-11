@@ -276,6 +276,24 @@ pub(super) fn handle_queue_changed(notif: &acp::ExtNotification, app: &mut AppVi
         let fire = app.agents.get_mut(&aid).and_then(|agent| {
             agent.resolve_send_now_awaiting_confirm(&raw_entries, running_prompt_id.as_deref())
         });
+        // A command disabled (Settings › OMP) between park and confirm must not fire: the interject
+        // promotes the row to a prompt and the agent would execute a leading `/name`.
+        let fire = fire.filter(|(id, _)| {
+            app.agents.get(&aid).is_none_or(|agent| {
+                agent
+                    .shared_queue
+                    .iter()
+                    .find(|e| e.id == *id)
+                    .and_then(|e| crate::slash::parse_invocation(e.text.trim()))
+                    .is_none_or(|invocation| {
+                        !agent
+                            .prompt
+                            .slash_controller
+                            .registry()
+                            .is_disabled(invocation.token)
+                    })
+            })
+        });
         if let Some((id, expected_version)) = fire {
             if let Some(agent) = app.agents.get_mut(&aid) {
                 // Same arming contract as `dispatch_queue_interject_shared`.

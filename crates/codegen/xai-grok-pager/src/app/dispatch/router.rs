@@ -1360,15 +1360,29 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::OpenMemoryModal => {
             if let ActiveView::Agent(id) = app.active_view
                 && let Some(agent) = app.agents.get(&id)
-                && let Some(session_id) = agent.session.session_id.clone()
             {
-                return vec![Effect::SendPrompt {
-                    agent_id: id,
-                    session_id,
-                    text: "/memory".to_string(),
-                    prompt_id: uuid::Uuid::new_v4().to_string(),
-                    skill_token_ranges: Vec::new(),
-                }];
+                // The modal drives `/memory` as a raw prompt: honor the Settings › OMP toggle.
+                let disabled = agent
+                    .prompt
+                    .slash_controller
+                    .registry()
+                    .is_disabled("memory");
+                let session_id = agent.session.session_id.clone();
+                if disabled {
+                    with_active_agent(app, |agent| {
+                        agent.show_toast("/memory is disabled in Settings › OMP");
+                    });
+                    return vec![];
+                }
+                if let Some(session_id) = session_id {
+                    return vec![Effect::SendPrompt {
+                        agent_id: id,
+                        session_id,
+                        text: "/memory".to_string(),
+                        prompt_id: uuid::Uuid::new_v4().to_string(),
+                        skill_token_ranges: Vec::new(),
+                    }];
+                }
             }
             vec![]
         }

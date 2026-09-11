@@ -44,6 +44,22 @@ pub(super) fn dispatch_interject_on(
     agent.ephemeral_tip.clear_on_submit();
     agent.release_hook_block_hold();
 
+    // A disabled OMP command (Settings › OMP) must not leave the pager: the interjection lands as a
+    // queued prompt agent-side and a leading `/name` would execute. Refuse like the send path.
+    if let Some(invocation) = crate::slash::parse_invocation(text.trim())
+        && agent
+            .prompt
+            .slash_controller
+            .registry()
+            .is_disabled(invocation.token)
+    {
+        agent.show_toast(&format!(
+            "/{} is disabled in Settings › OMP",
+            invocation.token
+        ));
+        return vec![];
+    }
+
     let Some(session_id) = agent.session.session_id.clone() else {
         agent.show_toast(NO_SESSION_NOTICE);
         return vec![];
@@ -123,6 +139,23 @@ pub(super) fn dispatch_send_prompt_now(
                 )
             });
         agent.show_toast("Reconnecting, please wait...");
+        return vec![];
+    }
+
+    // A disabled OMP command (Settings › OMP) must not leave the pager: send-now forwards the text
+    // as a prompt and the agent would execute a leading `/name`. The queue-row producer refuses
+    // earlier (keeping the row); this is the last point the toggle can hold.
+    if let Some(invocation) = crate::slash::parse_invocation(text.trim())
+        && agent
+            .prompt
+            .slash_controller
+            .registry()
+            .is_disabled(invocation.token)
+    {
+        agent.show_toast(&format!(
+            "/{} is disabled in Settings › OMP",
+            invocation.token
+        ));
         return vec![];
     }
 
