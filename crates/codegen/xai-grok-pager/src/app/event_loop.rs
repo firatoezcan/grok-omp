@@ -1962,6 +1962,9 @@ pub(crate) async fn run(
     // Animation tick: only scheduled when there are running entries.
     let mut tick_interval = tick_interval;
     let mut animation_tick_at: Option<Instant> = None;
+    // Spacebar-hold push-to-talk: OS auto-repeat cadence tracker (see `space_hold.rs`).
+    // Its release deadline joins the select! below so a held bar that stops repeating ends recording.
+    let mut space_hold = super::space_hold::SpaceHold::default();
     let ack_deadlines = crate::app::prompt_ack::PromptAckDeadlines::from_process_env();
 
     // Whether the extra Kitty keyboard layer (WASD release events) is currently pushed for the /gboom game
@@ -2561,6 +2564,17 @@ pub(crate) async fn run(
             }
         };
 
+        // Spacebar-hold release: fires when the auto-repeat stream has been idle
+        // long enough that the bar must be up (non-Kitty terminals never send a
+        // release event, so the idle gap is the release signal).
+        let space_hold_release_at = space_hold.release_deadline().map(Instant::from_std);
+        let space_hold_release = async {
+            match space_hold_release_at {
+                Some(at) => sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+
         // Blocked-writer watermark check. Recovery detects here, not in the ack arm: an escape-only stall's final payload produces a Written wakeup but no gate ack.
         // escape-only stall's final payload produces a Written wakeup but no gate ack.
         let writer_progress_sync = terminal.backend_mut().writer_mut().writer_sync().clone();
@@ -2797,6 +2811,7 @@ pub(crate) async fn run(
                 let result = drain_and_process(
                     ev, &mut input_rx, &mut app, &mut tasks, &progress_tx,
                     &mut csi_filter, &mut x10_filter, &mut xt_filter,
+                    &mut space_hold,
                     live_input_started_at,
                 ).await;
                 if let Some(window) =
@@ -2845,6 +2860,18 @@ pub(crate) async fn run(
 
                 // Sync appearance watcher when auto-mode toggles.
                 sync_appearance_watcher(&mut appearance_watcher);
+            }
+
+            // Spacebar-hold release deadline: the auto-repeat stream went idle,
+            // so the bar is up — stop the hold-owned recording.
+            _ = space_hold_release => {
+                if space_hold.expire(std::time::Instant::now()) {
+                    let effs = dispatch::dispatch(Action::VoiceStop, &mut app);
+                    if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
+                        break;
+                    }
+                    presenter.request(false);
+                }
             }
 
             _ = stall_flush => {}
@@ -3693,6 +3720,7 @@ async fn drain_and_process(
     csi_filter: &mut super::csi_filter::CsiFragmentFilter,
     x10_filter: &mut super::x10_filter::X10ReassemblyFilter,
     xt_filter: &mut super::xt_filter::XtversionFilter,
+    space_hold: &mut super::space_hold::SpaceHold,
     live_input_started_at: std::time::Instant,
 ) -> DrainResult {
     let mut needs_draw = false;
@@ -3846,6 +3874,57 @@ async fn drain_and_process(
             return false;
         }
 
+        // Spacebar-hold push-to-talk (OS auto-repeat cadence; see `space_hold.rs`).
+        // Runs before the voice-chord intercept so a bare Space release during an
+        // active hold is consumed here instead of being claimed as a chord release.
+        // Startup replay is exempt: its arrival times are stale, so cadence is meaningless.
+        let mut forwarded_outcome: Option<InputOutcome> = None;
+        if let Event::Key(ke) = ev
+            && !routed.is_startup_replay
+        {
+            let was_active = space_hold.active();
+            match space_hold.pre_route(ke, routed.arrived_at, app) {
+                super::space_hold::SpaceHoldPre::Consumed => {
+                    if was_active && !space_hold.active() {
+                        let effs = dispatch::dispatch(Action::VoiceStop, app);
+                        if process_effects(effs, tasks, app, progress_tx) {
+                            return true;
+                        }
+                        needs_draw = true;
+                        had_non_resize_change = true;
+                    }
+                    return false;
+                }
+                super::space_hold::SpaceHoldPre::Observe => {
+                    let outcome = app.handle_input_at_with_paste_provenance(
+                        ev,
+                        routed.arrived_at,
+                        routed.paste_provenance,
+                    );
+                    if space_hold.post_route(app) {
+                        let effs =
+                            dispatch::dispatch(Action::EnableVoiceMode, app);
+                        if process_effects(effs, tasks, app, progress_tx) {
+                            return true;
+                        }
+                        needs_draw = true;
+                        had_non_resize_change = true;
+                    }
+                    forwarded_outcome = Some(outcome);
+                }
+                super::space_hold::SpaceHoldPre::Ignore => {
+                    if was_active && !space_hold.active() {
+                        let effs = dispatch::dispatch(Action::VoiceStop, app);
+                        if process_effects(effs, tasks, app, progress_tx) {
+                            return true;
+                        }
+                        needs_draw = true;
+                        had_non_resize_change = true;
+                    }
+                }
+            }
+        }
+
         // Voice capture chord (Ctrl+Space or F8), handled here before normal routing so the release reaches us and the key never lands as text
         // A release is only ours when a hold session owns it
         // A bare Space release (Ctrl lifted first) thus stops hold-to-talk without eating every Space release during normal typing
@@ -3884,11 +3963,13 @@ async fn drain_and_process(
         let _rescue_guard = routed
             .is_startup_replay
             .then(crate::input::suppress_os_modifier_rescue);
-        match app.handle_input_at_with_paste_provenance(
-            ev,
-            routed.arrived_at,
-            routed.paste_provenance,
-        ) {
+        match forwarded_outcome.unwrap_or_else(|| {
+            app.handle_input_at_with_paste_provenance(
+                ev,
+                routed.arrived_at,
+                routed.paste_provenance,
+            )
+        }) {
             InputOutcome::Action(action) => {
                 let effs = dispatch::dispatch(action, app);
                 if process_effects(effs, tasks, app, progress_tx) {
@@ -5056,6 +5137,7 @@ mod tests {
             &mut csi_filter,
             &mut x10_filter,
             &mut xt_filter,
+            &mut super::super::space_hold::SpaceHold::default(),
             std::time::Instant::now(),
         )
         .await;
@@ -5106,6 +5188,7 @@ mod tests {
             &mut csi_filter,
             &mut x10_filter,
             &mut xt_filter,
+            &mut super::super::space_hold::SpaceHold::default(),
             std::time::Instant::now(),
         )
         .await;

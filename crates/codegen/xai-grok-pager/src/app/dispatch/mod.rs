@@ -61,6 +61,7 @@ pub(crate) use session::lifecycle::{abandon_unused_home_session, maybe_create_ho
 pub(crate) use settings::ui::refresh_open_settings_modals;
 pub(crate) use status::commit_minimal_update_notice;
 pub(crate) use turn::{reconcile_overdue_cancels, reconcile_overdue_turn_ends};
+pub(crate) use voice::{space_hold_prompt_len, space_hold_prompt_mut};
 
 // Test-only consumers (cfg(test) mods elsewhere in the crate); a plain re-export trips -D unused-imports in the lib build
 #[cfg(test)]

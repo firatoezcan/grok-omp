@@ -62,6 +62,7 @@ mod mouse;
 mod queue_edit;
 pub(crate) mod screen_mode_relaunch;
 mod session_load_barrier;
+mod space_hold;
 pub mod signal_handler;
 mod startup_failure;
 mod turn_completion;

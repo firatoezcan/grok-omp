@@ -2,6 +2,7 @@
 
 use crate::app::actions::Effect;
 use crate::app::app_view::{ActiveView, AppView, VoiceState, VoiceTarget};
+use crate::views::prompt_widget::PromptWidget;
 
 /// Promote live interim into the bound prompt, then hard-reset (no trailing final).
 /// Returns the promoted fragment and its caret for callers that captured text earlier.
@@ -28,7 +29,7 @@ pub(super) fn merge_prompt_with_voice_interim(
 /// The prompt box dictation should target for the current view.
 /// That is a top-level row's peek reply when one is open, the new-agent dispatch input otherwise, or the active agent's prompt.
 /// A non-top-level peek (subagent / roster, which can't accept a reply) maps to the dispatch box.
-fn voice_target_for_view(app: &AppView) -> Option<VoiceTarget> {
+pub(crate) fn voice_target_for_view(app: &AppView) -> Option<VoiceTarget> {
     use crate::views::dashboard::DashboardRowId;
     match app.active_view {
         ActiveView::Agent(id) => Some(VoiceTarget::Agent(id)),
@@ -47,6 +48,45 @@ fn voice_target_for_view(app: &AppView) -> Option<VoiceTarget> {
         }
         _ => None,
     }
+}
+
+/// The composer a spacebar-hold gesture would dictate into on the current view.
+/// Unlike [`voice_target_for_view`] this also resolves the welcome prompt: a
+/// hold there starts recording the same way the voice chord does (the dispatch
+/// leaves home for a session first).
+fn space_hold_prompt(app: &AppView) -> Option<&PromptWidget> {
+    if matches!(app.active_view, ActiveView::Welcome) {
+        return Some(&app.welcome_prompt);
+    }
+    match voice_target_for_view(app)? {
+        VoiceTarget::Agent(id) => app.agents.get(&id).map(|agent| &agent.prompt),
+        VoiceTarget::DashboardPeekReply(_) => {
+            app.dashboard.as_ref().map(|d| &d.peek_reply)
+        }
+        VoiceTarget::DashboardDispatch => app.dashboard.as_ref().map(|d| &d.dispatch),
+    }
+}
+
+/// Mutable counterpart of [`space_hold_prompt`], for tracking back the spaces a
+/// confirmed hold typed before it was recognized.
+pub(crate) fn space_hold_prompt_mut(app: &mut AppView) -> Option<&mut PromptWidget> {
+    if matches!(app.active_view, ActiveView::Welcome) {
+        return Some(&mut app.welcome_prompt);
+    }
+    match voice_target_for_view(app)? {
+        VoiceTarget::Agent(id) => app.agents.get_mut(&id).map(|agent| &mut agent.prompt),
+        VoiceTarget::DashboardPeekReply(_) => {
+            app.dashboard.as_mut().map(|d| &mut d.peek_reply)
+        }
+        VoiceTarget::DashboardDispatch => app.dashboard.as_mut().map(|d| &mut d.dispatch),
+    }
+}
+
+/// Text length of the hold-target composer, or `None` when the current view has
+/// none. The space-hold tracker uses it to tell "the space landed as text" from
+/// "a modal or overlay ate the keystroke".
+pub(crate) fn space_hold_prompt_len(app: &AppView) -> Option<usize> {
+    space_hold_prompt(app).map(|prompt| prompt.text().len())
 }
 
 /// That keybinding bypasses the slash registry (`/voice` is instead hidden and upsold via the deny list).
