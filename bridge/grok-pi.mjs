@@ -16,7 +16,7 @@
 import { existsSync } from "node:fs";
 import { dirname, join, resolve, delimiter } from "node:path";
 import { homedir } from "node:os";
-import { mkdirSync, copyFileSync, chmodSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, copyFileSync, chmodSync, readFileSync, writeFileSync } from "node:fs";
 
 // When compiled, process.execPath is the binary; when run under bun, argv[1].
 const selfDir = dirname(process.execPath.endsWith("bun") ? resolve(process.argv[1]) : process.execPath);
@@ -126,6 +126,146 @@ Object.assign(process.env, {
 delete process.env.SENTRY_DSN;
 delete process.env.GROK_EXTERNAL_OTEL;
 
+// --- Voice (local STT shim) -------------------------------------------------
+// The pager dictates over wss://{api_base}/v1/stt (TLS + bearer mandatory) —
+// bridge/specs/voice.md. stt-shim.mjs terminates that socket on 127.0.0.1 and
+// feeds OMP's `__omp_worker_stt` (Parakeet/Whisper, local). Enabled when
+// GROK_PI_VOICE is unset and the STT model is already cached (i.e. `omp setup
+// speech` ran inside this profile); GROK_PI_VOICE=1 forces it on (the shim
+// then reports "run omp setup speech" to the pager), =0 disables.
+let sttShim = null;
+const VOICE_MODE = process.env.GROK_PI_VOICE || undefined;
+if (VOICE_MODE !== "0" && VOICE_MODE !== "false") {
+	const shimCmd = process.env.GROK_PI_STT_SHIM
+		? process.env.GROK_PI_STT_SHIM.split(/\s+/)
+		: existsSync(join(selfDir, "grok-pi-stt"))
+			? [join(selfDir, "grok-pi-stt")]
+			: (() => {
+					const bunExe = process.execPath.endsWith("bun") ? process.execPath : Bun.which("bun");
+					const script = join(selfDir, "stt-shim.mjs");
+					return bunExe && existsSync(script) ? [bunExe, script] : null;
+				})();
+	if (!shimCmd) {
+		if (VOICE_MODE) process.stderr.write("grok-pi: voice requested but no stt-shim/bun found; voice disabled\n");
+	} else {
+		sttShim = await startSttShim(shimCmd);
+		if (sttShim && !sttShim.modelCached && VOICE_MODE === undefined) {
+			// Auto mode without a model: stay silent rather than offer a toggle
+			// that always fails.
+			sttShim.proc.kill("SIGTERM");
+			sttShim = null;
+			process.stderr.write(
+				"grok-pi: voice off — no local STT model in the isolated profile.\n" +
+					`  install: PI_CODING_AGENT_DIR=${OMP_AGENT_DIR} omp setup speech   (or GROK_PI_VOICE=1 to force)\n`,
+			);
+		}
+		if (sttShim) {
+			// Point the pager's STT socket at the shim. The seeded config.toml is
+			// re-copied every launch, so append/replace the [voice] table here.
+			try {
+				const cfgPath = join(GROK_HOME, "config.toml");
+				const lines = readFileSync(cfgPath, "utf8").split("\n");
+				const kept = [];
+				let skipping = false;
+				for (const line of lines) {
+					const header = line.match(/^\s*\[\[?([^\]]+)\]?\]/);
+					if (header) {
+						skipping = header[1].trim() === "voice" || header[1].trim().startsWith("voice.");
+						if (skipping) continue;
+					}
+					if (!skipping) kept.push(line);
+				}
+				while (kept.length && kept[kept.length - 1].trim() === "") kept.pop();
+				kept.push("", "[voice]", `api_base = "https://127.0.0.1:${sttShim.port}"`, "");
+				writeFileSync(cfgPath, kept.join("\n"), { mode: 0o600 });
+			} catch (e) {
+				process.stderr.write(`grok-pi: could not seed [voice] config (${e?.message ?? e}); voice disabled\n`);
+				sttShim.proc.kill("SIGTERM");
+				sttShim = null;
+			}
+		}
+		if (sttShim) {
+			// The pager demands TLS + a bearer; the shim ignores the token.
+			// XAI_API_KEY=dummy also flips is_api_key_auth, which force-enables
+			// voice and skips the SuperGrok tier gate — but never clobber a real
+			// key the user exported.
+			if (!process.env.XAI_API_KEY) process.env.XAI_API_KEY = "local-voice";
+			// Trust the shim's CA. If the user already has an extra bundle,
+			// concatenate so their roots survive.
+			let bundle = sttShim.caPath;
+			const existingBundle = process.env.GROK_EXTRA_CA_BUNDLE ?? process.env.SSL_CERT_FILE;
+			if (existingBundle && existsSync(existingBundle) && existingBundle !== sttShim.caPath) {
+				try {
+					bundle = join(GROK_HOME, "voice", "extra-ca-bundle.pem");
+					writeFileSync(
+						bundle,
+						readFileSync(sttShim.caPath, "utf8") + "\n" + readFileSync(existingBundle, "utf8"),
+						{ mode: 0o600 },
+					);
+				} catch {
+					bundle = sttShim.caPath;
+				}
+			}
+			process.env.GROK_EXTRA_CA_BUNDLE = bundle;
+		}
+	}
+}
+
+/**
+ * Spawn the shim and read its single ready line:
+ *   {"type":"ready","port":N,"caPath":"…","modelCached":bool}
+ * Returns null (shim dead / timed out) so the caller can run voice-off.
+ * Shim stderr is drained into a log file — the pager owns the TTY.
+ */
+async function startSttShim(cmd) {
+	const logPath = join(GROK_HOME, "stt-shim.log");
+	let proc;
+	try {
+		proc = Bun.spawn(cmd, {
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "pipe",
+			env: process.env,
+		});
+	} catch (e) {
+		process.stderr.write(`grok-pi: stt-shim spawn failed (${e?.message ?? e}); voice disabled\n`);
+		return null;
+	}
+	// Drain stderr → log file so a noisy worker never stalls on a full pipe.
+	void (async () => {
+		try {
+			for await (const chunk of proc.stderr) appendFileSync(logPath, Buffer.from(chunk));
+		} catch {}
+	})();
+	const firstLine = (async () => {
+		let buf = "";
+		try {
+			for await (const chunk of proc.stdout) {
+				buf += Buffer.from(chunk).toString("utf8");
+				const nl = buf.indexOf("\n");
+				if (nl >= 0) return buf.slice(0, nl);
+			}
+		} catch {}
+		return null;
+	})();
+	const timeout = new Promise(r => setTimeout(() => r("timeout"), 10_000));
+	const line = await Promise.race([firstLine, proc.exited.then(() => null), timeout]);
+	if (typeof line !== "string") {
+		process.stderr.write("grok-pi: stt-shim did not report ready; voice disabled\n");
+		proc.kill("SIGTERM");
+		return null;
+	}
+	try {
+		const ready = JSON.parse(line);
+		if (ready.type !== "ready") throw new Error(ready.message ?? "not ready");
+		return { proc, port: ready.port, caPath: ready.caPath, modelCached: ready.modelCached === true };
+	} catch (e) {
+		process.stderr.write(`grok-pi: stt-shim bad ready line (${e?.message ?? e}); voice disabled\n`);
+		proc.kill("SIGTERM");
+		return null;
+	}
+}
+
 if (!existsSync(PAGER)) {
 	process.stderr.write(
 		`grok-pi: pager binary not found at ${PAGER}\n` +
@@ -143,4 +283,10 @@ if (!existsSync(AGENT)) {
 const args = [PAGER, "--no-leader", "--agent-command", AGENT, ...process.argv.slice(2)];
 const proc = Bun.spawn(args, { stdio: ["inherit", "inherit", "inherit"], env: process.env });
 const code = await proc.exited;
+// The pager owns the session lifecycle; voice dies with it.
+if (sttShim) {
+	try {
+		sttShim.proc.kill("SIGTERM");
+	} catch {}
+}
 process.exit(code ?? 0);
