@@ -291,6 +291,26 @@ pub(crate) fn sanitize_user_error(raw: &str) -> String {
     }
     result
 }
+
+/// Parse an `x.ai/omp/connect*` response into `OmpConnectStatus`.
+/// The adapter answers with the status object directly (no `result` wrapper), but we accept
+/// both shapes for forward-compat.
+pub(crate) fn omp_connect_status_result(
+    resp: Result<acp::ExtResponse, acp::Error>,
+) -> Result<crate::views::settings_modal::OmpConnectStatus, String> {
+    match resp {
+        Ok(resp) => {
+            let wrapper: serde_json::Value =
+                serde_json::from_str(resp.0.get()).unwrap_or_default();
+            let inner = wrapper.get("result").unwrap_or(&wrapper);
+            serde_json::from_value::<crate::views::settings_modal::OmpConnectStatus>(
+                inner.clone(),
+            )
+            .map_err(|_| "couldn't read connect status".to_string())
+        }
+        Err(e) => Err(sanitize_user_error(&format!("provider connect failed: {e}"))),
+    }
+}
 /// Additive session creation flags passed from the CLI through AppView into effects.
 /// `--no-ask-user` always strips the tool, regardless of which profile was selected.
 /// `_meta["x.ai/session"].kind` is stamped `"chat"` so the shell takes the `require_gateway` / thin profile.
@@ -1181,6 +1201,30 @@ pub(crate) async fn persist_setting(
                 return Err(kind_mismatch("omp_disabled_commands", "StringList", &value));
             };
             xai_grok_shell::util::config::set_omp_disabled_commands(l)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        "omp_advisor_enabled" => {
+            let SettingValue::Bool(b) = value else {
+                return Err(kind_mismatch("omp_advisor_enabled", "Bool", &value));
+            };
+            xai_grok_shell::util::config::set_omp_advisor_enabled(b)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        "omp_voice_enabled" => {
+            let SettingValue::Bool(b) = value else {
+                return Err(kind_mismatch("omp_voice_enabled", "Bool", &value));
+            };
+            xai_grok_shell::util::config::set_omp_voice_enabled(b)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        "omp_stt_model" => {
+            let SettingValue::Enum(s) = value else {
+                return Err(kind_mismatch("omp_stt_model", "Enum", &value));
+            };
+            xai_grok_shell::util::config::set_omp_stt_model(s.to_string())
                 .await
                 .map_err(|e| e.to_string())
         }

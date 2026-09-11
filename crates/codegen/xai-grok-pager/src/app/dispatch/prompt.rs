@@ -642,6 +642,9 @@ pub(super) fn dispatch_send_prompt_submission(
                     voice_stt_language: voice_stt_language_from_app,
                     omp_agent: app.is_omp_agent,
                     omp_commands: agent.session.available_commands.clone(),
+                    omp_agent_info: app.omp_agent_info.clone(),
+                    omp_agent_command: app.omp_agent_command.clone(),
+                    omp_vibe_capable: app.omp_vibe_capable,
                 },
             };
 

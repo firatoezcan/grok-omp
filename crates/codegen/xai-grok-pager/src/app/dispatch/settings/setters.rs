@@ -831,14 +831,19 @@ pub(in crate::app::dispatch) fn set_compact_mode(app: &mut AppView, new: bool) -
 }
 
 /// State-only mutation for `omp_disabled_commands`.
-/// Stores the list in `current_ui` and fans `set_disabled_commands` out to every OMP agent's
-/// command registry so the completion dropdown and the send-path gate update immediately.
+/// Stores the list in `current_ui` and fans `set_disabled_commands` out to every slash surface —
+/// agent prompts, the welcome prompt, and the dashboard dispatch input — so the completion
+/// dropdown and the send-path gate update immediately everywhere.
 /// Never touches disk; never emits effects.
 pub(super) fn set_omp_disabled_commands_inner(app: &mut AppView, list: Vec<String>) {
     app.current_ui.omp_disabled_commands = list;
     let disabled = app.omp_disabled_commands().to_vec();
     for agent in app.agents.values_mut() {
         agent.set_disabled_commands(&disabled);
+    }
+    app.welcome_prompt.set_disabled_commands(&disabled);
+    if let Some(dashboard) = app.dashboard.as_mut() {
+        dashboard.dispatch.set_disabled_commands(&disabled);
     }
 }
 
@@ -882,6 +887,96 @@ pub(in crate::app::dispatch) fn set_omp_command_enabled(
         if enabled { "enabled" } else { "disabled" }
     ));
     effects
+}
+
+/// State-only mutation for `omp_advisor_enabled`.
+/// Called by the commit path AND by [`apply_setting_rollback`](super::ui::apply_setting_rollback).
+pub(super) fn set_omp_advisor_enabled_inner(app: &mut AppView, new: bool) {
+    app.current_ui.omp_advisor_enabled = new;
+}
+
+/// Enable/disable the OMP advisor. SHELL-owned; persists to `[ui].omp_advisor_enabled` via
+/// `Effect::PersistSetting`. The launcher reads it at `grok-pi` start — restart-required.
+pub(in crate::app::dispatch) fn set_omp_advisor_enabled(
+    app: &mut AppView,
+    new: bool,
+) -> Vec<Effect> {
+    let prev = app.current_ui.omp_advisor_enabled;
+    if prev == new {
+        return vec![];
+    }
+    set_omp_advisor_enabled_inner(app, new);
+    refresh_open_settings_modals(app);
+    tracing::info!(target: "settings", key = "omp_advisor_enabled", value = new, "setting changed");
+    app.show_toast(&format!(
+        "{} (restart to apply)",
+        save_success_toast("Advisor", new),
+    ));
+    vec![Effect::PersistSetting {
+        key: "omp_advisor_enabled",
+        value: crate::settings::SettingValue::Bool(new),
+        rollback_value: crate::settings::SettingValue::Bool(prev),
+    }]
+}
+
+/// State-only mutation for `omp_voice_enabled`.
+/// Called by the commit path AND by [`apply_setting_rollback`](super::ui::apply_setting_rollback).
+pub(super) fn set_omp_voice_enabled_inner(app: &mut AppView, new: bool) {
+    app.current_ui.omp_voice_enabled = new;
+}
+
+/// Enable/disable OMP voice dictation (the STT shim). SHELL-owned; persists to
+/// `[ui].omp_voice_enabled` via `Effect::PersistSetting`. The launcher maps it to
+/// `GROK_PI_VOICE` — restart-required.
+pub(in crate::app::dispatch) fn set_omp_voice_enabled(
+    app: &mut AppView,
+    new: bool,
+) -> Vec<Effect> {
+    let prev = app.current_ui.omp_voice_enabled;
+    if prev == new {
+        return vec![];
+    }
+    set_omp_voice_enabled_inner(app, new);
+    refresh_open_settings_modals(app);
+    tracing::info!(target: "settings", key = "omp_voice_enabled", value = new, "setting changed");
+    app.show_toast(&format!(
+        "{} (restart to apply)",
+        save_success_toast("Voice dictation", new),
+    ));
+    vec![Effect::PersistSetting {
+        key: "omp_voice_enabled",
+        value: crate::settings::SettingValue::Bool(new),
+        rollback_value: crate::settings::SettingValue::Bool(prev),
+    }]
+}
+
+/// State-only mutation for `omp_stt_model`.
+/// Called by the commit path AND by [`apply_setting_rollback`](super::ui::apply_setting_rollback).
+pub(super) fn set_omp_stt_model_inner(app: &mut AppView, canonical: &str) {
+    app.current_ui.omp_stt_model = Some(canonical.to_string());
+}
+
+/// Set the OMP STT model (`fast` | `balanced` | `turbo` | `parakeet`). SHELL-owned; persists to
+/// `[ui].omp_stt_model` via `Effect::PersistSetting`. The launcher exports it as
+/// `GROK_PI_STT_MODEL` — restart-required.
+pub(in crate::app::dispatch) fn set_omp_stt_model(
+    app: &mut AppView,
+    value: String,
+) -> Vec<Effect> {
+    let canonical = crate::settings::canonical_omp_stt_model(Some(&value));
+    let prev = crate::settings::canonical_omp_stt_model(app.current_ui.omp_stt_model.as_deref());
+    if prev == canonical && app.current_ui.omp_stt_model.is_some() {
+        return vec![];
+    }
+    set_omp_stt_model_inner(app, canonical);
+    refresh_open_settings_modals(app);
+    tracing::info!(target: "settings", key = "omp_stt_model", value = canonical, "setting changed");
+    app.show_toast(&format!("\u{2713} Voice model: {canonical} (restart to apply)"));
+    vec![Effect::PersistSetting {
+        key: "omp_stt_model",
+        value: crate::settings::SettingValue::Enum(canonical),
+        rollback_value: crate::settings::SettingValue::Enum(prev),
+    }]
 }
 
 /// State-only mutation for `show_timestamps`.

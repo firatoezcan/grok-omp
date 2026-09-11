@@ -1190,6 +1190,12 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             }
             vec![]
         }
+        TaskResult::OmpProvidersLoaded { agent_id, result } => {
+            super::settings::ui::handle_omp_providers_loaded(app, agent_id, result)
+        }
+        TaskResult::OmpConnectStatusUpdate { agent_id, result } => {
+            super::settings::ui::handle_omp_connect_status(app, agent_id, result)
+        }
         TaskResult::McpAuthTriggerDone {
             agent_id,
             server_name,

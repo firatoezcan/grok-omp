@@ -181,7 +181,13 @@ pub async fn connect(
         cancel: bridge.cancel,
         location: AgentLocation::Thread(bridge.thread_handle),
     };
-    initialize_connection(endpoint, &flags, auth_manager).await
+    let mut conn = initialize_connection(endpoint, &flags, auth_manager).await?;
+    // When the bridge adapter didn't stamp `_meta.ompAgentCommand`, the spawn command itself is
+    // the best available answer for Settings › OMP › Agent command.
+    if conn.omp_agent_command.is_none() {
+        conn.omp_agent_command = Some(command.to_string());
+    }
+    Ok(conn)
 }
 
 #[cfg(test)]

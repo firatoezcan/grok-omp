@@ -28,12 +28,117 @@ const AGENT = process.env.GROK_PI_AGENT ?? join(selfDir, "grok-pi-agent");
 const GROK_HOME = process.env.GROK_HOME ?? join(homedir(), ".local", "share", "grok-pi");
 mkdirSync(GROK_HOME, { recursive: true });
 
-// Seed the de-brand config (SPEC §8.1) if absent or stale.
+// Seed the de-brand config (SPEC §8.1). The seeded file wins per key, but the
+// user's own keys (e.g. `[ui]` settings written by the pager's Settings modal)
+// must survive — a blind copy would wipe them every launch. `[voice]` is
+// stripped: the STT shim rewrites it below once the port is known.
 const seeded = join(selfDir, "config.toml");
 const target = join(GROK_HOME, "config.toml");
-if (existsSync(seeded) && (!existsSync(target) || true)) {
-	copyFileSync(seeded, target);
-	chmodSync(target, 0o600);
+
+/** Parse a TOML file into { tables: Map<name, {keys: Map<key, line>, lines: string[]}>, order: [name] }.
+ *  Line-oriented: `keys` maps `key = value` pairs inside `[table]` sections;
+ *  `lines` keeps the table's raw body (comments included). */
+function parseTomlTables(text) {
+	const tables = new Map();
+	const order = [];
+	// Lines before the first table header (file-level comments, top-level keys).
+	const preamble = [];
+	let current = null;
+	for (const line of text.split("\n")) {
+		const header = line.match(/^\s*\[([^\]]+)\]/);
+		if (header) {
+			current = header[1].trim();
+			if (!tables.has(current)) {
+				tables.set(current, { keys: new Map(), lines: [] });
+				order.push(current);
+			}
+			continue;
+		}
+		if (!current) {
+			preamble.push(line);
+			continue;
+		}
+		const entry = tables.get(current);
+		entry.lines.push(line);
+		const kv = line.match(/^\s*([A-Za-z0-9_-]+)\s*=/);
+		if (kv) entry.keys.set(kv[1], line.trim());
+	}
+	return { tables, order, preamble };
+}
+/** Read one `[ui]` key from a TOML file. Returns the raw value string or undefined. */
+function readUiKey(path, key) {
+	if (!existsSync(path)) return undefined;
+	try {
+		const { tables } = parseTomlTables(readFileSync(path, "utf8"));
+		const line = tables.get("ui")?.keys.get(key);
+		if (!line) return undefined;
+		return line.slice(line.indexOf("=") + 1).trim().replace(/^"|"$/g, "");
+	} catch {
+		return undefined;
+	}
+}
+
+/** Merge seeded config into the user's: seeded keys win, user extras survive. */
+function mergeSeededConfig(seededPath, targetPath) {
+	const seededText = readFileSync(seededPath, "utf8");
+	if (!existsSync(targetPath)) {
+		writeFileSync(targetPath, seededText, { mode: 0o600 });
+		return;
+	}
+	const seed = parseTomlTables(seededText);
+	const user = parseTomlTables(readFileSync(targetPath, "utf8"));
+	const out = [];
+	// Seed preamble (file-level comments / top-level keys) leads the output.
+	for (const line of seed.preamble) out.push(line);
+	for (const name of seed.order) {
+		out.push(`[${name}]`);
+		const seedEntry = seed.tables.get(name);
+		const userKeys = user.tables.get(name)?.keys;
+		// Seeded body verbatim (comments kept), then user keys the seed doesn't define.
+		for (const line of seedEntry.lines) out.push(line);
+		if (userKeys) for (const [k, line] of userKeys) if (!seedEntry.keys.has(k)) out.push(line);
+		out.push("");
+	}
+	// User tables absent from the seed are appended verbatim (minus [voice]).
+	for (const name of user.order) {
+		if (seed.tables.has(name) || name === "voice" || name.startsWith("voice.")) continue;
+		out.push(`[${name}]`);
+		for (const line of user.tables.get(name).lines) out.push(line);
+		out.push("");
+	}
+	writeFileSync(targetPath, out.join("\n"), { mode: 0o600 });
+}
+
+if (existsSync(seeded)) {
+	try {
+		mergeSeededConfig(seeded, target);
+	} catch (e) {
+		process.stderr.write(`grok-pi: config merge failed (${e?.message ?? e}); reseeding\n`);
+		copyFileSync(seeded, target);
+		chmodSync(target, 0o600);
+	}
+}
+
+// [ui] settings the launcher honors (written by the pager's Settings › OMP
+// section). Env vars still win over the file.
+const UI_ADVISOR = readUiKey(target, "omp_advisor_enabled");
+const UI_VOICE = readUiKey(target, "omp_voice_enabled");
+const UI_STT_MODEL = readUiKey(target, "omp_stt_model");
+
+// `[ui].omp_advisor_enabled` (Settings › OMP › Advisor) gates the advisor when
+// `GROK_PI_ADVISOR` is unset; the env var still wins.
+if (process.env.GROK_PI_ADVISOR === undefined && UI_ADVISOR === "false") {
+	process.env.GROK_PI_ADVISOR = "0";
+}
+// `[ui].omp_voice_enabled` (Settings › OMP › Voice dictation) gates the STT shim
+// when `GROK_PI_VOICE` is unset; the env var still wins.
+if (process.env.GROK_PI_VOICE === undefined && UI_VOICE === "false") {
+	process.env.GROK_PI_VOICE = "0";
+}
+// `[ui].omp_stt_model` (Settings › OMP › Voice model) feeds the shim's
+// `GROK_PI_STT_MODEL` when the env var is unset.
+if (process.env.GROK_PI_STT_MODEL === undefined && UI_STT_MODEL) {
+	process.env.GROK_PI_STT_MODEL = UI_STT_MODEL;
 }
 
 // --- Isolated OMP home -----------------------------------------------------

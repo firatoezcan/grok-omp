@@ -1180,6 +1180,8 @@ pub(crate) async fn run(
     app.leader_mode = connection.leader_status_rx.is_some();
     app.is_grok_shell = connection.is_grok_shell;
     app.is_omp_agent = connection.is_omp_agent;
+    app.omp_agent_info = connection.omp_agent_info.clone();
+    app.omp_agent_command = connection.omp_agent_command.clone();
     app.screen_mode = term_state.screen_mode;
     // `AppView::new` precedes the terminal's resolved screen mode
     // Rebuild the registry at this I/O boundary; the later config-aware rebuild preserves this mode while adding the optional mouse-reporting action

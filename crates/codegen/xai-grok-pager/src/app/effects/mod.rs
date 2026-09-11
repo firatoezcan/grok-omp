@@ -2435,6 +2435,127 @@ pub(crate) fn execute(
                     }
                 });
         }
+        Effect::FetchOmpProviders { agent_id, session_id } => {
+            let tx = acp_tx.clone();
+            tasks
+                .spawn(async move {
+                    let params = serde_json::json!({
+                        "sessionId": session_id.0.to_string(),
+                    });
+                    let req = acp::ExtRequest::new(
+                        "x.ai/omp/providers",
+                        serde_json::value::to_raw_value(&params)
+                            .expect("serialize omp/providers params")
+                            .into(),
+                    );
+                    let result = match acp_send(req, &tx).await {
+                        Ok(resp) => {
+                            let wrapper: serde_json::Value = serde_json::from_str(
+                                    resp.0.get(),
+                                )
+                                .unwrap_or_default();
+                            let inner = wrapper.get("result").unwrap_or(&wrapper);
+                            inner
+                                .get("providers")
+                                .cloned()
+                                .and_then(|v| {
+                                    serde_json::from_value::<
+                                        Vec<crate::views::settings_modal::OmpProviderInfo>,
+                                    >(v)
+                                    .ok()
+                                })
+                                .ok_or_else(|| "couldn't load provider list".to_string())
+                        }
+                        Err(e) => Err(sanitize_user_error(&format!(
+                            "couldn't load provider list: {e}"
+                        ))),
+                    };
+                    TaskResult::OmpProvidersLoaded { agent_id, result }
+                });
+        }
+        Effect::OmpConnect {
+            agent_id,
+            session_id,
+            provider,
+            api_key,
+        } => {
+            let tx = acp_tx.clone();
+            tasks
+                .spawn(async move {
+                    let params = serde_json::json!({
+                        "sessionId": session_id.0.to_string(),
+                        "provider": provider,
+                        "apiKey": api_key,
+                    });
+                    let req = acp::ExtRequest::new(
+                        "x.ai/omp/connect",
+                        serde_json::value::to_raw_value(&params)
+                            .expect("serialize omp/connect params")
+                            .into(),
+                    );
+                    let result = omp_connect_status_result(acp_send(req, &tx).await);
+                    TaskResult::OmpConnectStatusUpdate { agent_id, result }
+                });
+        }
+        Effect::OmpConnectStatus { agent_id, session_id } => {
+            let tx = acp_tx.clone();
+            tasks
+                .spawn(async move {
+                    // Poll cadence: the adapter's login child prints the auth URL and code
+                    // prompt asynchronously; ~600ms keeps the sheet live without hammering.
+                    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                    let params = serde_json::json!({
+                        "sessionId": session_id.0.to_string(),
+                    });
+                    let req = acp::ExtRequest::new(
+                        "x.ai/omp/connect_status",
+                        serde_json::value::to_raw_value(&params)
+                            .expect("serialize omp/connect_status params")
+                            .into(),
+                    );
+                    let result = omp_connect_status_result(acp_send(req, &tx).await);
+                    TaskResult::OmpConnectStatusUpdate { agent_id, result }
+                });
+        }
+        Effect::OmpConnectSubmitCode {
+            agent_id,
+            session_id,
+            code,
+        } => {
+            let tx = acp_tx.clone();
+            tasks
+                .spawn(async move {
+                    let params = serde_json::json!({
+                        "sessionId": session_id.0.to_string(),
+                        "code": code,
+                    });
+                    let req = acp::ExtRequest::new(
+                        "x.ai/omp/connect_code",
+                        serde_json::value::to_raw_value(&params)
+                            .expect("serialize omp/connect_code params")
+                            .into(),
+                    );
+                    let result = omp_connect_status_result(acp_send(req, &tx).await);
+                    TaskResult::OmpConnectStatusUpdate { agent_id, result }
+                });
+        }
+        Effect::OmpConnectCancel { agent_id, session_id } => {
+            let tx = acp_tx.clone();
+            tasks
+                .spawn(async move {
+                    let params = serde_json::json!({
+                        "sessionId": session_id.0.to_string(),
+                    });
+                    let req = acp::ExtRequest::new(
+                        "x.ai/omp/connect_cancel",
+                        serde_json::value::to_raw_value(&params)
+                            .expect("serialize omp/connect_cancel params")
+                            .into(),
+                    );
+                    let result = omp_connect_status_result(acp_send(req, &tx).await);
+                    TaskResult::OmpConnectStatusUpdate { agent_id, result }
+                });
+        }
         Effect::McpAuthTrigger { agent_id, session_id, server_name } => {
             let tx = acp_tx.clone();
             tasks

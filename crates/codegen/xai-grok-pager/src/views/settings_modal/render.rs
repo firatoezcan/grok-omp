@@ -5,8 +5,8 @@ use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 use super::state::{
-    CONTENT_MIN_WIDTH, MAX_THOUGHTS_WIDTH_WIDENED_MARGIN, MODAL_TITLE, RowEntry,
-    STANDARD_MAX_WIDTH, SettingsModalState, SettingsMode, SettingsModeKind,
+    CONTENT_MIN_WIDTH, MAX_THOUGHTS_WIDTH_WIDENED_MARGIN, MODAL_TITLE, OmpProviderInputKind,
+    RowEntry, STANDARD_MAX_WIDTH, SettingsModalState, SettingsMode, SettingsModeKind,
     TITLE_LEADING_DECORATION_W, effective_enum_choices, group_children, mode_is_consent_chooser,
 };
 use crate::render::line_utils::truncate_str;
@@ -97,6 +97,15 @@ pub fn render_settings_modal(
                     MODAL_TITLE
                 }
             }
+            SettingsMode::OmpProviders { key, .. } | SettingsMode::OmpProviderInput { key, .. } => {
+                if let Some(meta) = state.registry.find(key) {
+                    breadcrumb_owned =
+                        format!("{MODAL_TITLE} {} {}", crate::glyphs::chevron(), meta.label);
+                    &breadcrumb_owned
+                } else {
+                    MODAL_TITLE
+                }
+            }
             _ => MODAL_TITLE,
         }
     };
@@ -131,7 +140,7 @@ pub fn render_settings_modal(
     // Must agree with the `docs_footer_area` split below; a mismatch would reserve a row nothing paints (or paint into the body)
     let has_tip_footer = !matches!(
         state.state.mode_kind(),
-        SettingsModeKind::EditingString | SettingsModeKind::EditingInt
+        SettingsModeKind::EditingString | SettingsModeKind::EditingInt | SettingsModeKind::OmpProviderInput
     ) && !mode_is_consent_chooser(&state.state.mode);
     let footer_lines = if has_tip_footer {
         modal_window::footer_lines_with_tip_gap(full_area, &sizing, shortcuts)
@@ -188,6 +197,8 @@ pub fn render_settings_modal(
             | SettingsModeKind::PickingGroup
             | SettingsModeKind::EditingString
             | SettingsModeKind::OmpCommands
+            | SettingsModeKind::OmpProviders
+            | SettingsModeKind::OmpProviderInput
             | SettingsModeKind::EditingInt
     );
     match state.state.mode_kind() {
@@ -205,6 +216,15 @@ pub fn render_settings_modal(
             state.reset_hit_rects();
             let rects = render_omp_commands(buf, inner_area, state, &theme);
             state.picker_choice_rects = rects;
+        }
+        SettingsModeKind::OmpProviders => {
+            state.reset_hit_rects();
+            let rects = render_omp_providers(buf, inner_area, state, &theme);
+            state.picker_choice_rects = rects;
+        }
+        SettingsModeKind::OmpProviderInput => {
+            state.reset_hit_rects();
+            render_omp_provider_input(buf, inner_area, state, &theme);
         }
         SettingsModeKind::EditingString | SettingsModeKind::EditingInt => {
             state.reset_hit_rects();
@@ -630,11 +650,13 @@ pub(super) fn render_rows(
                 let is_selected = row_idx == state.selected;
                 let is_expanded = expanded_snapshot.contains(key);
 
-                // Group/OmpCommands rows carry no scalar value; render a chevron row that opens the
-                // sub-sheet (skips the value/edited machinery below). OmpCommands shows a "N disabled" summary.
+                // Group/OmpCommands/OmpProviders rows carry no scalar value; render a chevron row
+                // that opens the sub-sheet (skips the value/edited machinery below). OmpCommands
+                // shows a "N disabled" summary; OmpProviders shows "N connected" once loaded.
+
                 if matches!(
                     meta.kind,
-                    SettingKind::Group { .. } | SettingKind::OmpCommands
+                    SettingKind::Group { .. } | SettingKind::OmpCommands | SettingKind::OmpProviders
                 ) {
                     let is_hovered = hover_row_snapshot == Some(row_idx);
                     let summary = if matches!(meta.kind, SettingKind::OmpCommands) {
@@ -643,6 +665,14 @@ pub(super) fn render_rows(
                             Some(format!("{disabled} disabled"))
                         } else {
                             None
+                        }
+                    } else if matches!(meta.kind, SettingKind::OmpProviders) {
+                        match &state.omp_providers {
+                            crate::views::settings_modal::OmpProvidersData::Loaded(list) => {
+                                let connected = list.iter().filter(|p| p.connected).count();
+                                Some(format!("{connected} connected"))
+                            }
+                            _ => None,
                         }
                     } else {
                         None
@@ -816,7 +846,7 @@ fn compute_filtered_row_heights(state: &SettingsModalState, area_width: u16) -> 
                 };
                 if matches!(
                     meta.kind,
-                    SettingKind::Group { .. } | SettingKind::OmpCommands
+                    SettingKind::Group { .. } | SettingKind::OmpCommands | SettingKind::OmpProviders
                 ) {
                     let mut h: u16 = 1;
                     if state.expanded_keys.contains(key) {
@@ -1593,6 +1623,395 @@ fn render_omp_commands(
     rects
 }
 
+/// Render the OMP providers sub-sheet: title, description, one scrollable row per provider
+/// (`<marker> name · env-hint … <status>`), and — while a connect is in flight or just
+/// finished — a status block with the auth URL / transcript tail / outcome. Returns the
+/// per-provider hit-rects (parallel to `omp_providers_list()`) for mouse routing.
+fn render_omp_providers(
+    buf: &mut Buffer,
+    area: Rect,
+    state: &SettingsModalState,
+    theme: &Theme,
+) -> Vec<Rect> {
+    let (group_key, provider_idx) = match &state.state.mode {
+        SettingsMode::OmpProviders { key, provider_idx } => (*key, *provider_idx),
+        _ => unreachable!("omp providers renderer requires OmpProviders state"),
+    };
+    let Some(group_meta) = state.registry.find(group_key) else {
+        return Vec::new();
+    };
+    if area.width == 0 || area.height == 0 {
+        return Vec::new();
+    }
+
+    let header_rows = render_sub_pane_header(
+        buf,
+        area,
+        theme,
+        group_meta.label,
+        group_meta.description,
+        2,
+    );
+    if area.height <= header_rows {
+        return Vec::new();
+    }
+    let mut y = area.y + header_rows;
+
+    // ── Connect status block (in-flight or just finished) ─────────
+    if let Some(connect) = &state.omp_connect {
+        let dim = Style::default().fg(theme.gray_dim).bg(theme.bg_base);
+        let ok = Style::default().fg(theme.accent_user).bg(theme.bg_base);
+        let err = Style::default().fg(theme.accent_error).bg(theme.bg_base);
+        let mut lines: Vec<(String, Style)> = Vec::new();
+        match connect.status.as_str() {
+            "starting" => lines.push(("Starting login…".to_string(), dim)),
+            "waiting_browser" => {
+                lines.push(("Waiting for browser login…".to_string(), dim));
+                if let Some(url) = connect.auth_url.as_deref().or(connect.launch_url.as_deref()) {
+                    lines.push((url.to_string(), ok));
+                }
+            }
+            "needs_code" => lines.push(("Paste the authorization code below…".to_string(), dim)),
+            "verifying" => lines.push(("Verifying code…".to_string(), dim)),
+            "done" | "connected" => {
+                lines.push((
+                    "\u{2713} Connected — takes effect on the next grok-pi launch".to_string(),
+                    ok,
+                ));
+            }
+            "failed" => {
+                let msg = connect.error.as_deref().unwrap_or("login failed");
+                lines.push((format!("\u{2717} {msg}"), err));
+            }
+            _ => {}
+        }
+        // Transcript tail gives the user the adapter's own progress lines (e.g. device codes).
+        if connect.in_flight() {
+            for line in connect.lines.iter().rev().take(2).rev() {
+                if !line.contains("http") || connect.auth_url.is_none() {
+                    lines.push((line.clone(), dim));
+                }
+            }
+        }
+        let had_lines = !lines.is_empty();
+        for (text, style) in lines {
+            if y >= area.y + area.height {
+                break;
+            }
+            let shown: std::borrow::Cow<'_, str> = if text.width() <= area.width as usize {
+                std::borrow::Cow::Borrowed(text.as_str())
+            } else {
+                std::borrow::Cow::Owned(truncate_str(&text, area.width as usize))
+            };
+            let w = (shown.width() as u16).min(area.width);
+            buf.set_span(area.x, y, &Span::styled(shown.as_ref(), style), w);
+            y = y.saturating_add(1);
+        }
+        if had_lines && y < area.y + area.height {
+            y = y.saturating_add(1); // gap between status block and list
+        }
+    }
+
+    let providers = state.omp_providers_list();
+    let list_y = y;
+    let max_rows_h = (area.y + area.height).saturating_sub(list_y) as usize;
+    if max_rows_h == 0 {
+        return Vec::new();
+    }
+
+    match &state.omp_providers {
+        crate::views::settings_modal::OmpProvidersData::Idle
+        | crate::views::settings_modal::OmpProvidersData::Loading => {
+            let style = Style::default().fg(theme.gray_dim).bg(theme.bg_base);
+            let text = "Loading providers…";
+            let w = (text.width() as u16).min(area.width);
+            buf.set_span(area.x, list_y, &Span::styled(text, style), w);
+            return Vec::new();
+        }
+        crate::views::settings_modal::OmpProvidersData::Error(e) => {
+            let style = Style::default().fg(theme.accent_error).bg(theme.bg_base);
+            let text = format!("Couldn't load providers: {e}");
+            let shown: std::borrow::Cow<'_, str> = if text.width() <= area.width as usize {
+                std::borrow::Cow::Borrowed(text.as_str())
+            } else {
+                std::borrow::Cow::Owned(truncate_str(&text, area.width as usize))
+            };
+            let w = (shown.width() as u16).min(area.width);
+            buf.set_span(area.x, list_y, &Span::styled(shown.as_ref(), style), w);
+            return Vec::new();
+        }
+        crate::views::settings_modal::OmpProvidersData::Loaded(_) => {}
+    }
+
+    if providers.is_empty() {
+        let style = Style::default().fg(theme.gray_dim).bg(theme.bg_base);
+        let text = "No connectable providers";
+        let w = (text.width() as u16).min(area.width);
+        buf.set_span(area.x, list_y, &Span::styled(text, style), w);
+        return Vec::new();
+    }
+
+    let needs_overflow = providers.len() > max_rows_h;
+    let visible_h = if needs_overflow {
+        max_rows_h.saturating_sub(1).max(1)
+    } else {
+        max_rows_h
+    };
+    let scroll_offset = if provider_idx >= visible_h {
+        provider_idx + 1 - visible_h
+    } else {
+        0
+    };
+    let visible_end = (scroll_offset + visible_h).min(providers.len());
+
+    let mut rects: Vec<Rect> = vec![Rect::default(); providers.len()];
+    let mut y = list_y;
+    for (i, provider) in providers
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(visible_end - scroll_offset)
+    {
+        if y >= area.y + area.height {
+            break;
+        }
+        let is_focused = i == provider_idx;
+        let is_hovered = !is_focused && state.hover_row == Some(i);
+        let bg = settings_list_row_bg(theme, is_focused, is_hovered);
+        let row_rect = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: 1,
+        };
+        buf.set_style(row_rect, Style::default().bg(bg));
+        if let Some(ov) = settings_row_overlay(theme, is_focused, is_hovered) {
+            buf.set_style(row_rect, ov);
+        }
+        rects[i] = row_rect;
+
+        let marker = if provider.connected {
+            crate::glyphs::filled_dot()
+        } else {
+            "\u{25CB}"
+        };
+        let marker_style = if provider.connected {
+            Style::default().fg(theme.accent_user).bg(bg)
+        } else {
+            Style::default().fg(theme.gray).bg(bg)
+        };
+        let name_style = if is_focused {
+            Style::default()
+                .fg(theme.text_primary)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text_primary).bg(bg)
+        };
+        let hint_style = Style::default().fg(theme.gray).bg(bg);
+        let (value_text, value_style) = match provider.source.as_deref() {
+            Some("api_key") => ("api key", Style::default().fg(theme.accent_user).bg(bg)),
+            Some("oauth") => ("oauth", Style::default().fg(theme.accent_user).bg(bg)),
+            Some("env") => ("env", Style::default().fg(theme.accent_user).bg(bg)),
+            _ => (
+                match provider.kind.as_str() {
+                    "oauth" => "oauth",
+                    _ => "connect",
+                },
+                Style::default().fg(theme.gray).bg(bg),
+            ),
+        };
+
+        // " <marker>  name · env-hint … <value> " (value right-aligned with a pad).
+        buf.set_span(area.x, y, &Span::styled(" ", name_style), 1.min(area.width));
+        if area.width > 1 {
+            buf.set_span(
+                area.x + 1,
+                y,
+                &Span::styled(marker, marker_style),
+                PICKER_MARKER_W.min(area.width - 1),
+            );
+        }
+        let name_x = area.x.saturating_add(PICKER_PREFIX_W);
+        let value_w = value_text.width() as u16;
+        let value_x = (area.x + area.width)
+            .saturating_sub(value_w + 1)
+            .max(name_x);
+        if value_x > name_x {
+            let name_room = (value_x - name_x).saturating_sub(1) as usize;
+            let name_shown: std::borrow::Cow<'_, str> = if provider.name.width() <= name_room {
+                std::borrow::Cow::Borrowed(provider.name.as_str())
+            } else {
+                std::borrow::Cow::Owned(truncate_str(&provider.name, name_room))
+            };
+            let name_w = (name_shown.width() as u16).min(value_x - name_x - 1);
+            buf.set_span(
+                name_x,
+                y,
+                &Span::styled(name_shown.as_ref(), name_style),
+                name_w,
+            );
+
+            // Env hint after the name (" · $ENV"), truncated to the remaining room.
+            let hint = provider
+                .env
+                .as_deref()
+                .map(|e| format!("${e}"))
+                .unwrap_or_default();
+            let after_name_x = name_x.saturating_add(name_w);
+            if !hint.is_empty() && after_name_x + PICKER_SEPARATOR_W < value_x {
+                buf.set_span(
+                    after_name_x,
+                    y,
+                    &Span::styled(PICKER_SEPARATOR, hint_style),
+                    PICKER_SEPARATOR_W.min(value_x - after_name_x),
+                );
+                let hint_x = after_name_x + PICKER_SEPARATOR_W;
+                let hint_room = (value_x - hint_x).saturating_sub(1) as usize;
+                if hint_room > 0 {
+                    let hint_shown: std::borrow::Cow<'_, str> = if hint.width() <= hint_room {
+                        std::borrow::Cow::Borrowed(hint.as_str())
+                    } else {
+                        std::borrow::Cow::Owned(truncate_str(&hint, hint_room))
+                    };
+                    let hint_w = (hint_shown.width() as u16).min(value_x - hint_x - 1);
+                    buf.set_span(
+                        hint_x,
+                        y,
+                        &Span::styled(hint_shown.as_ref(), hint_style),
+                        hint_w,
+                    );
+                }
+            }
+        }
+        if value_x + value_w <= area.x + area.width {
+            buf.set_span(value_x, y, &Span::styled(value_text, value_style), value_w);
+        }
+        y = y.saturating_add(1);
+    }
+
+    if needs_overflow && visible_end < providers.len() && y < area.y + area.height {
+        let more_count = providers.len() - visible_end;
+        let overflow_style = Style::default().fg(theme.gray_dim).bg(theme.bg_base);
+        let raw = format!("\u{2026} {more_count} more");
+        let overflow_w = (raw.width() as u16).min(area.width);
+        buf.set_span(
+            area.x,
+            y,
+            &Span::styled(raw.as_str(), overflow_style),
+            overflow_w,
+        );
+    }
+    rects
+}
+
+/// Render the provider credential editor: a single-line input (masked for API keys, plain for
+/// OAuth codes) under the sheet header. Esc returns to the providers sheet.
+fn render_omp_provider_input(
+    buf: &mut Buffer,
+    area: Rect,
+    state: &mut SettingsModalState,
+    theme: &Theme,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    state.editor_adornment_rects = (Rect::default(), Rect::default());
+
+    let SettingsMode::OmpProviderInput {
+        provider_id,
+        kind,
+        editor,
+        ..
+    } = &state.state.mode
+    else {
+        unreachable!("provider input renderer requires OmpProviderInput state");
+    };
+    let masked = *kind == OmpProviderInputKind::ApiKey;
+    let title = match kind {
+        OmpProviderInputKind::ApiKey => format!("API key for {provider_id}"),
+        OmpProviderInputKind::Code => "Paste the authorization code".to_string(),
+    };
+    let description = match kind {
+        OmpProviderInputKind::ApiKey => {
+            "Stored in the agent's credential store; takes effect on the next grok-pi launch."
+        }
+        OmpProviderInputKind::Code => {
+            "Finish the login in your browser, then paste the code (or full redirect URL) here."
+        }
+    };
+
+    let header_rows = render_sub_pane_header(buf, area, theme, &title, description, 3);
+    if area.height <= header_rows {
+        return;
+    }
+    let input_y = area.y + header_rows;
+
+    let input_bg = theme.bg_visual;
+    let cursor_style = Style::default().fg(theme.accent_user).bg(input_bg);
+    let input_style = Style::default().fg(theme.text_primary).bg(input_bg);
+
+    let input_row_rect = Rect {
+        x: area.x,
+        y: input_y,
+        width: area.width,
+        height: 1,
+    };
+    buf.set_style(input_row_rect, Style::default().bg(theme.bg_base));
+    buf.set_style(input_row_rect, Style::default().bg(input_bg));
+
+    let buffer_room = area.width as usize;
+    if buffer_room == 0 {
+        return;
+    }
+    let cursor_reserve = 1usize;
+    let visible_buffer_w = buffer_room.saturating_sub(cursor_reserve);
+
+    let buffer = editor.text();
+    if buffer.is_empty() {
+        let placeholder = "<paste here>";
+        let placeholder_style = Style::default().fg(theme.gray_dim).bg(input_bg);
+        let w = (placeholder.width() as u16).min(visible_buffer_w as u16);
+        buf.set_span(
+            area.x,
+            input_y,
+            &Span::styled(placeholder, placeholder_style),
+            w,
+        );
+        buf.set_span(
+            area.x,
+            input_y,
+            &Span::styled(crate::glyphs::selection_bar(), cursor_style),
+            1,
+        );
+    } else {
+        let viewport = editor.viewport(buffer_room);
+        let visible = &buffer[viewport.visible_byte_range.clone()];
+        // Masked input renders one bullet per visible character (API keys are ASCII, so the
+        // byte range equals the char range); the cursor column is unchanged.
+        let display: std::borrow::Cow<'_, str> = if masked {
+            std::borrow::Cow::Owned("\u{2022}".repeat(visible.chars().count()))
+        } else {
+            std::borrow::Cow::Borrowed(visible)
+        };
+        let visible_width = (display.width() as u16).min(buffer_room as u16);
+        buf.set_span(
+            area.x,
+            input_y,
+            &Span::styled(display.as_ref(), input_style),
+            visible_width,
+        );
+        let cursor_x =
+            area.x + (viewport.cursor_display_column as u16).min(buffer_room as u16 - 1);
+        buf.set_span(
+            cursor_x,
+            input_y,
+            &Span::styled(crate::glyphs::selection_bar(), cursor_style),
+            1,
+        );
+    }
+}
+
 /// Layout metadata for one picker choice.
 struct PickerChoiceLayout {
     height: u16,
@@ -2322,6 +2741,9 @@ pub(super) fn value_display(
         SettingValue::String(s) => {
             if s.is_empty() && matches!(meta.kind, SettingKind::DynamicEnum { .. }) {
                 "(no override)".to_string()
+            } else if s.is_empty() && matches!(meta.kind, SettingKind::Info) {
+                // Read-only status row with no live value yet (e.g. before initialize completes).
+                "\u{2014}".to_string()
             } else {
                 s.clone()
             }
@@ -2822,9 +3244,12 @@ pub(super) fn build_shortcuts(state: &SettingsModalState) -> Vec<Shortcut<'stati
             let locked = state
                 .focused_setting()
                 .is_some_and(|(key, _)| state.row_lock(key).is_some());
-            let enter_label = match state.focused_setting() {
-                Some((_, meta)) if matches!(meta.kind, SettingKind::Bool { .. }) => "Enter toggle",
-                _ => "Enter edit",
+            let focused_kind = state.focused_setting().map(|(_, m)| &m.kind);
+            let enter_label = match focused_kind {
+                Some(SettingKind::Bool { .. }) => Some("Enter toggle"),
+                // Info rows are read-only: no edit affordance.
+                Some(SettingKind::Info) => None,
+                _ => Some("Enter edit"),
             };
             let mut shortcuts = vec![
                 Shortcut {
@@ -2839,16 +3264,20 @@ pub(super) fn build_shortcuts(state: &SettingsModalState) -> Vec<Shortcut<'stati
                 },
             ];
             if !locked {
-                shortcuts.push(Shortcut {
-                    label: "Space toggle",
-                    clickable: false,
-                    id: 0,
-                });
-                shortcuts.push(Shortcut {
-                    label: enter_label,
-                    clickable: false,
-                    id: 0,
-                });
+                if !matches!(focused_kind, Some(SettingKind::Info)) {
+                    shortcuts.push(Shortcut {
+                        label: "Space toggle",
+                        clickable: false,
+                        id: 0,
+                    });
+                }
+                if let Some(label) = enter_label {
+                    shortcuts.push(Shortcut {
+                        label,
+                        clickable: false,
+                        id: 0,
+                    });
+                }
             }
             shortcuts.extend([
                 Shortcut {
@@ -2862,7 +3291,7 @@ pub(super) fn build_shortcuts(state: &SettingsModalState) -> Vec<Shortcut<'stati
                     id: 0,
                 },
             ]);
-            if !locked {
+            if !locked && !matches!(focused_kind, Some(SettingKind::Info)) {
                 shortcuts.push(Shortcut {
                     label: "d reset",
                     clickable: false,
@@ -3001,6 +3430,53 @@ pub(super) fn build_shortcuts(state: &SettingsModalState) -> Vec<Shortcut<'stati
             },
             Shortcut {
                 label: "Esc cancel",
+                clickable: false,
+                id: 0,
+            },
+        ],
+        SettingsMode::OmpProviders { .. } => vec![
+            Shortcut {
+                label: "\u{2191}/\u{2193}/j/k nav",
+                clickable: false,
+                id: 0,
+            },
+            Shortcut {
+                label: "Enter connect",
+                clickable: false,
+                id: 0,
+            },
+            Shortcut {
+                label: "o oauth",
+                clickable: false,
+                id: 0,
+            },
+            Shortcut {
+                label: "r refresh",
+                clickable: false,
+                id: 0,
+            },
+            Shortcut {
+                label: "x cancel login",
+                clickable: false,
+                id: 0,
+            },
+            Shortcut {
+                label: "Esc back",
+                clickable: false,
+                id: 0,
+            },
+        ],
+        SettingsMode::OmpProviderInput { kind, .. } => vec![
+            Shortcut {
+                label: match kind {
+                    OmpProviderInputKind::ApiKey => "Enter save key",
+                    OmpProviderInputKind::Code => "Enter submit code",
+                },
+                clickable: false,
+                id: 0,
+            },
+            Shortcut {
+                label: "Esc back",
                 clickable: false,
                 id: 0,
             },

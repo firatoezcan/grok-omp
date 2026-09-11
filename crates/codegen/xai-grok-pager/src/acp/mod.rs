@@ -90,6 +90,12 @@ pub struct AcpConnection {
     pub is_grok_shell: bool,
     /// Whether the agent is an Oh My Pi instance (`_meta.ompAgent` or `agent_info.name == "oh-my-pi"`).
     pub is_omp_agent: bool,
+    /// Connected OMP agent identity (`agentInfo` from initialize), formatted `"<name> <version>"`.
+    /// `None` for non-OMP agents or when the agent omits `agentInfo`.
+    pub omp_agent_info: Option<String>,
+    /// Command used to spawn the OMP agent (`_meta.ompAgentCommand` stamped by the bridge adapter).
+    /// `None` when the adapter didn't stamp it.
+    pub omp_agent_command: Option<String>,
     /// Auth methods advertised by the agent.
     pub auth_methods: Vec<acp::AuthMethod>,
     /// Cancellation token to stop the agent.
@@ -259,6 +265,8 @@ pub(in crate::acp) async fn initialize_connection(
         rx,
         models: agent.models,
         is_omp_agent: agent.is_omp_agent,
+        omp_agent_info: agent.omp_agent_info,
+        omp_agent_command: agent.omp_agent_command,
         is_grok_shell: agent.is_grok_shell,
         auth_methods: agent.auth_methods,
         cancel,
@@ -463,6 +471,8 @@ pub(crate) struct InitializedAgent {
     pub(crate) is_grok_shell: bool,
     pub(crate) is_omp_agent: bool,
     pub(crate) auth_methods: Vec<acp::AuthMethod>,
+    pub(crate) omp_agent_info: Option<String>,
+    pub(crate) omp_agent_command: Option<String>,
     pub(crate) default_auth_method_id: Option<acp::AuthMethodId>,
     pub(crate) available_commands: Vec<acp::AvailableCommand>,
     pub(crate) cancel_rewind_enabled: bool,
@@ -503,6 +513,21 @@ async fn initialize(tx: &AcpAgentTx, flags: &ConnectFlags) -> Result<Initialized
             .agent_info
             .as_ref()
             .is_some_and(|i| i.name == "oh-my-pi");
+    // OMP identity for the Settings › OMP status rows: `"<name> <version>"` from `agentInfo`,
+    // and the adapter-stamped spawn command (`_meta.ompAgentCommand`).
+    let omp_agent_info = resp.agent_info.as_ref().map(|i| {
+        if i.version.is_empty() {
+            i.name.clone()
+        } else {
+            format!("{} {}", i.name, i.version)
+        }
+    });
+    let omp_agent_command = resp
+        .meta
+        .as_ref()
+        .and_then(|m| m.get("ompAgentCommand"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let models: ModelState = resp
         .meta
         .as_ref()
@@ -523,6 +548,8 @@ async fn initialize(tx: &AcpAgentTx, flags: &ConnectFlags) -> Result<Initialized
         models,
         is_omp_agent,
         is_grok_shell,
+        omp_agent_info,
+        omp_agent_command,
         auth_methods: resp.auth_methods,
         default_auth_method_id,
         available_commands,

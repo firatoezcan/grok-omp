@@ -181,11 +181,21 @@ pub enum SettingKind {
     /// enabled/disabled toggle. The toggle state persists as `[ui].omp_disabled_commands`
     /// (`SettingValue::StringList`). Children are runtime data, not registry keys.
     OmpCommands,
+    /// A navigational row that opens a sub-sheet listing connectable OMP providers with their
+    /// auth status (stored credential / env var / none) and a per-provider connect affordance
+    /// (API-key entry or OAuth login via the bridge adapter's `x.ai/omp/*` rail). The row carries
+    /// no persisted value — provider credentials live in the agent's own auth store, not UiConfig.
+    OmpProviders,
     /// A navigational row that opens a sub-sheet of `children` (other registered settings, by key). Children are hidden
     /// from the top-level list (rendered only inside the sub-sheet).
     Group {
         children: &'static [SettingKey],
     },
+    /// A read-only status row: renders a live value from `PagerLocalSnapshot` (e.g. the connected
+    /// OMP agent's version) but accepts no edit, toggle, or reset. `SettingValue::String` carries
+    /// the display text; `default_value_for` returns an empty string because there is nothing to
+    /// reset to.
+    Info,
 }
 
 /// One row in the registry.
@@ -293,6 +303,16 @@ pub struct PagerLocalSnapshot {
     /// Slash commands the connected OMP agent advertised via `available_commands_update`
     /// (cloned from `AgentSession::available_commands`; carries name + description).
     pub omp_commands: Vec<acp::AvailableCommand>,
+    /// Connected OMP agent identity from the initialize response (`agentInfo`), formatted as
+    /// `"<name> <version>"`. `None` until initialize completes or for non-OMP agents.
+    pub omp_agent_info: Option<String>,
+    /// The command used to spawn the OMP agent (`_meta.ompAgentCommand` stamped by the bridge
+    /// adapter, else the resolved `--agent-command`). `None` when unknown.
+    pub omp_agent_command: Option<String>,
+    /// Whether the connected OMP build advertises the `vibe` session mode
+    /// (`session/new` → `modes.availableModes` contains `"vibe"`, reported via
+    /// `x.ai/omp/capabilities`). `None` until the first session response arrives.
+    pub omp_vibe_capable: Option<bool>,
 }
 
 impl Default for PagerLocalSnapshot {
@@ -318,6 +338,9 @@ impl Default for PagerLocalSnapshot {
             voice_stt_language: xai_grok_voice::STT_LANGUAGE_DEFAULT.to_string(),
             omp_agent: false,
             omp_commands: Vec::new(),
+            omp_agent_info: None,
+            omp_agent_command: None,
+            omp_vibe_capable: None,
         }
     }
 }
@@ -330,6 +353,18 @@ pub fn canonical_voice_capture_mode(value: Option<&str>) -> &'static str {
         "toggle"
     } else {
         "hold"
+    }
+}
+
+/// Canonicalize a raw OMP STT model name to a registry choice.
+/// Case-insensitive and trimmed; unknown, blank, and `None` all fall back to the `parakeet`
+/// default (the shim's own fallback when `GROK_PI_STT_MODEL` is unset).
+pub fn canonical_omp_stt_model(value: Option<&str>) -> &'static str {
+    match value.unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+        "fast" => "fast",
+        "balanced" => "balanced",
+        "turbo" => "turbo",
+        _ => "parakeet",
     }
 }
 
@@ -700,6 +735,29 @@ pub fn current_value_for(
 
         // omp_disabled_commands: the OMP sheet's persisted toggle state (SHELL-owned `[ui]` list).
         "omp_disabled_commands" => Some(SettingValue::StringList(ui.omp_disabled_commands.clone())),
+        // omp_providers: nav row; the sheet reads live auth state, so the scalar value is a placeholder.
+        "omp_providers" => Some(SettingValue::String(String::new())),
+
+        // SHELL: `[ui].omp_advisor_enabled` — the launcher reads it at `grok-pi` start.
+        "omp_advisor_enabled" => Some(SettingValue::Bool(ui.omp_advisor_enabled)),
+        // SHELL: `[ui].omp_voice_enabled` — the launcher maps it to `GROK_PI_VOICE`.
+        "omp_voice_enabled" => Some(SettingValue::Bool(ui.omp_voice_enabled)),
+        // SHELL: `[ui].omp_stt_model` — canonicalized; None falls back to "parakeet".
+        "omp_stt_model" => Some(SettingValue::Enum(canonical_omp_stt_model(
+            ui.omp_stt_model.as_deref(),
+        ))),
+        // Info rows: live values from the snapshot; `None` renders as "—" via `value_display`.
+        "omp_agent_version" => Some(SettingValue::String(
+            pager.omp_agent_info.clone().unwrap_or_default(),
+        )),
+        "omp_agent_command" => Some(SettingValue::String(
+            pager.omp_agent_command.clone().unwrap_or_default(),
+        )),
+        "omp_vibe_capable" => Some(SettingValue::String(match pager.omp_vibe_capable {
+            Some(true) => "yes".to_string(),
+            Some(false) => "no".to_string(),
+            None => String::new(),
+        })),
         _ => None,
     }
 }
@@ -722,6 +780,10 @@ pub fn default_value_for(meta: &SettingMeta) -> SettingValue {
         SettingKind::Group { .. } => SettingValue::Bool(false),
         // OmpCommands rows persist a `StringList`; the default is "everything enabled".
         SettingKind::OmpCommands => SettingValue::StringList(Vec::new()),
+        // OmpProviders rows carry no persisted value; the sheet reads live auth state from the agent.
+        SettingKind::OmpProviders => SettingValue::String(String::new()),
+        // Info rows are read-only; there is no persisted default to reset to.
+        SettingKind::Info => SettingValue::String(String::new()),
     }
 }
 
@@ -1191,6 +1253,25 @@ mod tests {
                          the OMP sheet's default is 'everything enabled'",
                     );
                 }
+                ("omp_advisor_enabled", SettingKind::Bool { default }) => {
+                    assert_eq!(
+                        *default, ui.omp_advisor_enabled,
+                        "omp_advisor_enabled default drifts from UiConfig::default()"
+                    );
+                }
+                ("omp_voice_enabled", SettingKind::Bool { default }) => {
+                    assert_eq!(
+                        *default, ui.omp_voice_enabled,
+                        "omp_voice_enabled default drifts from UiConfig::default()"
+                    );
+                }
+                ("omp_stt_model", SettingKind::Enum { default, .. }) => {
+                    assert_eq!(
+                        *default,
+                        canonical_omp_stt_model(ui.omp_stt_model.as_deref()),
+                        "omp_stt_model default drifts from UiConfig::default()"
+                    );
+                }
 
                 _ => panic!(
                     "settings::defs::default_settings() contains entry `{}` with no \
@@ -1240,6 +1321,17 @@ mod tests {
                         pager.plan_mode_active,
                     );
                 }
+                // Info rows are read-only; the "default" is just "no live value yet".
+                ("omp_agent_version" | "omp_agent_command" | "omp_vibe_capable", SettingKind::Info) => {
+                    assert!(
+                        pager.omp_agent_info.is_none()
+                            && pager.omp_agent_command.is_none()
+                            && pager.omp_vibe_capable.is_none(),
+                        "PagerLocalSnapshot::default() must have no OMP status values"
+                    );
+                }
+                // omp_providers: nav row, no persisted or snapshot state.
+                ("omp_providers", SettingKind::OmpProviders) => {}
                 _ => panic!(
                     "settings::defs::default_settings() contains PAGER entry `{}` with no \
                      matching arm in defaults_match_pager_state. Add an arm.",
@@ -1276,6 +1368,9 @@ mod tests {
                     // `DynamicEnum` uses `SettingValue::String`.
                     | (SettingKind::DynamicEnum { .. }, SettingValue::String(_))
                     | (SettingKind::OmpCommands, SettingValue::StringList(_))
+                    // `Info` rows carry their display text as `SettingValue::String`.
+                    | (SettingKind::Info, SettingValue::String(_))
+                    | (SettingKind::OmpProviders, SettingValue::String(_))
             );
             assert!(
                 kind_matches,
@@ -1621,6 +1716,13 @@ mod tests {
                 }
                 (SettingKind::OmpCommands, SettingValue::StringList(l)) => {
                     assert!(l.is_empty(), "OmpCommands default must be the empty list");
+                }
+                (SettingKind::OmpProviders, SettingValue::String(s)) => {
+                    assert!(s.is_empty(), "OmpProviders default must be the empty string");
+                }
+                // Info rows carry their display text as `String`; the "default" is empty.
+                (SettingKind::Info, SettingValue::String(s)) => {
+                    assert!(s.is_empty(), "Info default must be empty (no live value)");
                 }
                 _ => panic!("default_value_for kind mismatch for `{}`", meta.key),
             }

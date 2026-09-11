@@ -8,7 +8,8 @@ use super::setters::{
     set_default_selected_permission_inner, set_display_refresh_auto_cadence_inner,
     set_follow_up_behavior_inner, set_fork_secondary_model_inner, set_group_tool_verbs_inner,
     set_hunk_tracker_mode_inner, set_invert_scroll_inner, set_keep_text_selection_inner,
-    set_max_thoughts_width_inner, set_multiline_mode, set_omp_disabled_commands_inner,
+    set_max_thoughts_width_inner, set_multiline_mode, set_omp_advisor_enabled_inner,
+    set_omp_disabled_commands_inner, set_omp_stt_model_inner, set_omp_voice_enabled_inner,
     set_page_flip_on_send_inner, set_prompt_suggestions_inner, set_remember_tool_approvals_inner,
     set_render_mermaid_inner, set_respect_manual_folds_inner, set_screen_mode_inner,
     set_scroll_lines_inner, set_scroll_mode_inner, set_scroll_speed_inner,
@@ -93,6 +94,9 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                 voice_stt_language: voice_stt_language_from_app.clone(),
                 omp_agent: app.is_omp_agent,
                 omp_commands: agent.session.available_commands.clone(),
+                omp_agent_info: app.omp_agent_info.clone(),
+                omp_agent_command: app.omp_agent_command.clone(),
+                omp_vibe_capable: app.omp_vibe_capable,
             };
         }
     }
@@ -235,6 +239,9 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
         voice_stt_language: voice_stt_language_from_app,
         omp_agent: app.is_omp_agent,
         omp_commands: agent.session.available_commands.clone(),
+        omp_agent_info: app.omp_agent_info.clone(),
+        omp_agent_command: app.omp_agent_command.clone(),
+        omp_vibe_capable: app.omp_vibe_capable,
     };
     let mut state = Box::new(SettingsModalState::new(
         registry,
@@ -620,6 +627,9 @@ pub(crate) fn build_pager_snapshot(app: &AppView) -> crate::settings::PagerLocal
             .active_agent()
             .map(|a| a.session.available_commands.clone())
             .unwrap_or_default(),
+        omp_agent_info: app.omp_agent_info.clone(),
+        omp_agent_command: app.omp_agent_command.clone(),
+        omp_vibe_capable: app.omp_vibe_capable,
     }
 }
 
@@ -758,6 +768,15 @@ pub(in crate::app::dispatch) fn action_for_reset(
         }
         ("omp_disabled_commands", SettingValue::StringList(l)) => {
             Some(Action::SetOmpDisabledCommands(l.clone()))
+        }
+        ("omp_advisor_enabled", SettingValue::Bool(b)) => {
+            Some(Action::SetOmpAdvisorEnabled(*b))
+        }
+        ("omp_voice_enabled", SettingValue::Bool(b)) => {
+            Some(Action::SetOmpVoiceEnabled(*b))
+        }
+        ("omp_stt_model", SettingValue::Enum(s)) => {
+            Some(Action::SetOmpSttModel((*s).to_string()))
         }
         // hunk_tracker_mode: canonical enum string round-trip.
         ("hunk_tracker_mode", SettingValue::Enum(s)) => {
@@ -996,6 +1015,15 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
         ("omp_disabled_commands", SettingValue::StringList(l)) => {
             set_omp_disabled_commands_inner(app, l.clone())
         }
+        ("omp_advisor_enabled", SettingValue::Bool(b)) => {
+            set_omp_advisor_enabled_inner(app, *b)
+        }
+        ("omp_voice_enabled", SettingValue::Bool(b)) => {
+            set_omp_voice_enabled_inner(app, *b)
+        }
+        ("omp_stt_model", SettingValue::Enum(s)) => {
+            set_omp_stt_model_inner(app, crate::settings::canonical_omp_stt_model(Some(s)));
+        }
         ("scroll_lines", SettingValue::Int(i)) => set_scroll_lines_inner(app, *i as u8),
         // vim_mode: direct inner call.
         ("vim_mode", SettingValue::Bool(b)) => set_vim_mode_inner(app, *b),
@@ -1089,4 +1117,220 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
     }
     refresh_open_settings_modals(app);
     companion_effects
+}
+
+// ---------------------------------------------------------------------------
+// OMP provider connect (Settings › OMP › Providers)
+// ---------------------------------------------------------------------------
+
+/// Resolve the active agent's `(AgentId, SessionId)` for `x.ai/omp/*` ext calls.
+/// Returns `None` when no agent/session is active (the sheet then shows an error).
+fn omp_ext_target(app: &AppView) -> Option<(crate::app::agent::AgentId, acp::SessionId)> {
+    let ActiveView::Agent(id) = app.active_view else {
+        return None;
+    };
+    let agent = app.agents.get(&id)?;
+    let session_id = agent.session.session_id.clone()?;
+    Some((id, session_id))
+}
+
+/// `Action::OmpFetchProviders`: mark the sheet loading and fetch `x.ai/omp/providers`.
+/// Also kicks a `connect_status` poll so a login left in flight by a closed/reopened modal
+/// resurfaces in the sheet.
+pub(in crate::app::dispatch) fn omp_fetch_providers(app: &mut AppView) -> Vec<Effect> {
+    let ActiveView::Agent(id) = app.active_view else {
+        return vec![];
+    };
+    if let Some(agent) = app.agents.get_mut(&id)
+        && let Some(crate::views::modal::ActiveModal::Settings { state }) =
+            agent.active_modal.as_mut()
+    {
+        state.omp_providers = crate::views::settings_modal::OmpProvidersData::Loading;
+    }
+    let Some((agent_id, session_id)) = omp_ext_target(app) else {
+        if let Some(agent) = app.agents.get_mut(&id)
+            && let Some(crate::views::modal::ActiveModal::Settings { state }) =
+                agent.active_modal.as_mut()
+        {
+            state.omp_providers = crate::views::settings_modal::OmpProvidersData::Error(
+                "no active session".to_string(),
+            );
+        }
+        return vec![];
+    };
+    vec![
+        Effect::FetchOmpProviders {
+            agent_id,
+            session_id: session_id.clone(),
+        },
+        Effect::OmpConnectStatus {
+            agent_id,
+            session_id,
+        },
+    ]
+}
+
+/// `Action::OmpConnectProvider`: store an API key or start the OAuth login.
+pub(in crate::app::dispatch) fn omp_connect_provider(
+    app: &mut AppView,
+    provider: String,
+    api_key: Option<String>,
+) -> Vec<Effect> {
+    let Some((agent_id, session_id)) = omp_ext_target(app) else {
+        app.show_toast("No active session");
+        return vec![];
+    };
+    vec![Effect::OmpConnect {
+        agent_id,
+        session_id,
+        provider,
+        api_key,
+    }]
+}
+
+/// `Action::OmpConnectSubmitCode`: feed a pasted code to the in-flight login.
+pub(in crate::app::dispatch) fn omp_connect_submit_code(
+    app: &mut AppView,
+    code: String,
+) -> Vec<Effect> {
+    let Some((agent_id, session_id)) = omp_ext_target(app) else {
+        app.show_toast("No active session");
+        return vec![];
+    };
+    vec![Effect::OmpConnectSubmitCode {
+        agent_id,
+        session_id,
+        code,
+    }]
+}
+
+/// `Action::OmpConnectCancel`: kill the in-flight login child.
+pub(in crate::app::dispatch) fn omp_connect_cancel(app: &mut AppView) -> Vec<Effect> {
+    let Some((agent_id, session_id)) = omp_ext_target(app) else {
+        return vec![];
+    };
+    vec![Effect::OmpConnectCancel {
+        agent_id,
+        session_id,
+    }]
+}
+
+/// `TaskResult::OmpProvidersLoaded`: store the fetched list on the open settings modal.
+pub(in crate::app::dispatch) fn handle_omp_providers_loaded(
+    app: &mut AppView,
+    agent_id: crate::app::agent::AgentId,
+    result: Result<Vec<crate::views::settings_modal::OmpProviderInfo>, String>,
+) -> Vec<Effect> {
+    if let Some(agent) = app.agents.get_mut(&agent_id)
+        && let Some(crate::views::modal::ActiveModal::Settings { state }) =
+            agent.active_modal.as_mut()
+    {
+        state.omp_providers = match result {
+            Ok(list) => crate::views::settings_modal::OmpProvidersData::Loaded(list),
+            Err(e) => crate::views::settings_modal::OmpProvidersData::Error(e),
+        };
+    }
+    vec![]
+}
+
+/// `TaskResult::OmpConnectStatusUpdate`: update the sheet's connect status, open the auth URL
+/// in the browser once, auto-enter the paste-code editor when the login asks for a code, toast
+/// on terminal states, and re-arm the status poll while a login is in flight.
+pub(in crate::app::dispatch) fn handle_omp_connect_status(
+    app: &mut AppView,
+    agent_id: crate::app::agent::AgentId,
+    result: Result<crate::views::settings_modal::OmpConnectStatus, String>,
+) -> Vec<Effect> {
+    let mut effects: Vec<Effect> = Vec::new();
+    let Some(agent) = app.agents.get_mut(&agent_id) else {
+        return effects;
+    };
+    let session_id = agent.session.session_id.clone();
+
+    let status = match result {
+        Ok(s) => s,
+        Err(e) => {
+            if let Some(crate::views::modal::ActiveModal::Settings { state }) =
+                agent.active_modal.as_mut()
+            {
+                state.omp_connect_pending = false;
+                state.omp_connect =
+                    Some(crate::views::settings_modal::OmpConnectStatus {
+                        status: "failed".to_string(),
+                        error: Some(e.clone()),
+                        ..Default::default()
+                    });
+            }
+            app.show_toast(&format!("Provider connect failed: {e}"));
+            return effects;
+        }
+    };
+
+    let Some(crate::views::modal::ActiveModal::Settings { state }) =
+        agent.active_modal.as_mut()
+    else {
+        // Modal closed: nothing to update, and no re-poll — the adapter-side login finishes
+        // (or dies) on its own; a later sheet entry re-fetches status.
+        return effects;
+    };
+
+    state.omp_connect_pending = false;
+    let prev_terminal = state
+        .omp_connect
+        .as_ref()
+        .is_some_and(|c| !c.in_flight() && c.status != "idle");
+
+    // Open the auth URL once per login. `state` borrows `agent.active_modal`, so the open
+    // happens after the state borrow ends below.
+    let url_to_open = if let Some(url) = status.auth_url.clone()
+        && status.in_flight()
+        && state.omp_connect_opened_url.as_deref() != Some(url.as_str())
+    {
+        state.omp_connect_opened_url = Some(url.clone());
+        Some(url)
+    } else {
+        None
+    };
+
+    // The login wants a pasted code: switch the sheet into the code editor.
+    if status.status == "needs_code"
+        && let Some(provider) = status.provider.clone()
+    {
+        state.enter_omp_provider_code_input(provider);
+    }
+
+    let provider_label = status.provider.clone().unwrap_or_default();
+    let succeeded = matches!(status.status.as_str(), "done" | "connected");
+    let failed = status.status == "failed";
+    let failure_msg = status.error.clone();
+    let still_in_flight = status.in_flight();
+    state.omp_connect = Some(status);
+
+    // Re-arm the poll while the login is in flight and the sheet is still open.
+    if still_in_flight && let Some(session_id) = session_id.clone() {
+        effects.push(Effect::OmpConnectStatus {
+            agent_id,
+            session_id,
+        });
+    }
+    if succeeded && let Some(session_id) = session_id {
+        effects.push(Effect::FetchOmpProviders {
+            agent_id,
+            session_id,
+        });
+    }
+    if let Some(url) = url_to_open {
+        agent.open_url_or_show(&url);
+    }
+
+    // Toasts need `app` back; the agent/state borrows end here.
+    if succeeded && !prev_terminal {
+        app.show_toast(&format!(
+            "\u{2713} {provider_label} connected — takes effect on restart"
+        ));
+    } else if failed && !prev_terminal {
+        let msg = failure_msg.unwrap_or_else(|| "login failed".to_string());
+        app.show_toast(&format!("\u{2717} {provider_label}: {msg}"));
+    }
+    effects
 }

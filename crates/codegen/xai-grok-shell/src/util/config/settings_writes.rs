@@ -396,3 +396,22 @@ pub async fn set_auto_update(value: bool) -> Result<()> {
 pub async fn set_omp_disabled_commands(value: Vec<String>) -> Result<()> {
     update_config(|cfg| cfg.ui.omp_disabled_commands = value).await
 }
+
+/// Persist the Oh My Pi advisor toggle (`[ui].omp_advisor_enabled`). The launcher reads it at
+/// `grok-pi` start to decide whether to pass `--advisor` and overlay `advisor.enabled` into the
+/// OMP config; `GROK_PI_ADVISOR=0` still wins. Takes effect on the next launch.
+pub async fn set_omp_advisor_enabled(enabled: bool) -> Result<()> {
+    update_config(|cfg| cfg.ui.omp_advisor_enabled = enabled).await
+}
+
+/// Persist the Oh My Pi voice dictation master switch (`[ui].omp_voice_enabled`). The launcher
+/// maps it to `GROK_PI_VOICE`; `false` disables the STT shim entirely. Takes effect on the next launch.
+pub async fn set_omp_voice_enabled(enabled: bool) -> Result<()> {
+    update_config(|cfg| cfg.ui.omp_voice_enabled = enabled).await
+}
+
+/// Persist the Oh My Pi STT model selector (`[ui].omp_stt_model`). The launcher exports it as
+/// `GROK_PI_STT_MODEL` for the STT shim. Takes effect on the next launch.
+pub async fn set_omp_stt_model(model: String) -> Result<()> {
+    update_config(|cfg| cfg.ui.omp_stt_model = Some(model)).await
+}

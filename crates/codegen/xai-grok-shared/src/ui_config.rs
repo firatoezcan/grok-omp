@@ -174,8 +174,27 @@ pub struct UiConfig {
     /// (Settings › OMP › Slash commands); empty/absent means every advertised command is enabled.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub omp_disabled_commands: Vec<String>,
+    /// Oh My Pi advisor: when `true` the launcher (`bridge/grok-pi.mjs`) passes `--advisor` and
+    /// overlays `advisor.enabled` into the OMP config. `GROK_PI_ADVISOR=0` still wins over this.
+    /// Read at launch only — a change takes effect on the next `grok-pi` start.
+    #[serde(default = "default_true")]
+    pub omp_advisor_enabled: bool,
+    /// Oh My Pi voice dictation master switch: when `false` the launcher disables the STT shim
+    /// (`GROK_PI_VOICE=0`) so no dictation keybind or capture path is installed.
+    /// Read at launch only — a change takes effect on the next `grok-pi` start.
+    #[serde(default = "default_true")]
+    pub omp_voice_enabled: bool,
+    /// Oh My Pi local STT model selector: `fast` | `balanced` | `turbo` | `parakeet`.
+    /// The launcher exports it as `GROK_PI_STT_MODEL`; the STT shim resolves the name.
+    /// Read at launch only — a change takes effect on the next `grok-pi` start.
+    #[serde(default)]
+    pub omp_stt_model: Option<String>,
 }
 
+
+fn default_true() -> bool {
+    true
+}
 fn status_line_should_not_be_saved(status_line: &StatusLineConfig) -> bool {
     status_line.is_default() || status_line.problem().is_some()
 }
@@ -294,6 +313,9 @@ impl Default for UiConfig {
             display_refresh: DisplayRefreshSettings::default(),
             status_line: StatusLineConfig::default(),
             omp_disabled_commands: Vec::new(),
+            omp_advisor_enabled: true,
+            omp_voice_enabled: true,
+            omp_stt_model: None,
         }
     }
 }
@@ -351,6 +373,8 @@ impl UiConfig {
         matches!(self.selection_highlight_duration_ms, Some(0))
     }
 }
+
+
 
 #[cfg(test)]
 mod tests {

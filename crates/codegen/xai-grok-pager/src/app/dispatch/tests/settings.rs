@@ -1158,7 +1158,7 @@ fn every_setting_has_action_for_reset_arm() {
     with_theme_test_env(|| {
         let reg = crate::settings::SettingsRegistry::defaults();
         for meta in reg.all() {
-            if matches!(meta.kind, crate::settings::SettingKind::Group { .. }) {
+            if matches!(meta.kind, crate::settings::SettingKind::Group { .. } | crate::settings::SettingKind::Info | crate::settings::SettingKind::OmpProviders) {
                 continue;
             }
             let default_value = crate::settings::default_value_for(meta);
@@ -1670,6 +1670,15 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
                 Action::SetOmpDisabledCommands(vec!["compact".to_string()]),
                 app,
             );
+        }
+        "omp_advisor_enabled" => {
+            let _ = dispatch(Action::SetOmpAdvisorEnabled(false), app);
+        }
+        "omp_voice_enabled" => {
+            let _ = dispatch(Action::SetOmpVoiceEnabled(false), app);
+        }
+        "omp_stt_model" => {
+            let _ = dispatch(Action::SetOmpSttModel("turbo".to_string()), app);
         }
         other => {
             panic!(

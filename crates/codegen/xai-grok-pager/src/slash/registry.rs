@@ -260,23 +260,38 @@ impl CommandRegistry {
         names
     }
 
-    /// True when `key` (canonical name or alias) resolves to a command the user disabled in
+    /// True when `key` (canonical name or alias) resolves to an ACP command the user disabled in
     /// Settings › OMP. Unlike `menu_hidden`, a disabled command must NOT execute when typed —
     /// the send path checks this before dispatching.
+    ///
+    /// ACP-sourced only: the Settings › OMP sheet advertises OMP commands, and names that collide
+    /// with a pager builtin are skipped at ingest (`is_reserved`), so the builtin keeps the name.
+    /// A disabled entry must never reach that builtin — disabling OMP's `model` must not hide or
+    /// block the pager's own `/model`.
+    ///
+    /// Deliberately scans `commands` instead of `key_to_index`: ACP keys keep their advertised
+    /// casing while the disabled list is normalized lowercase, so a map lookup would miss
+    /// case-variant names (same reason `is_restricted` scans).
     pub fn is_disabled(&self, key: &str) -> bool {
         if self.disabled.is_empty() {
             return false;
         }
         let key = Self::normalize_deny_name(key);
-        self.key_to_index
-            .get(&key)
-            .and_then(|idx| self.commands.get(*idx))
-            .is_some_and(|cmd| {
+        self.commands
+            .iter()
+            .zip(self.sources.iter())
+            .filter(|(_, source)| **source == CommandSource::Acp)
+            .map(|(cmd, _)| cmd)
+            .filter(|cmd| {
                 self.disabled.contains(&cmd.name().to_lowercase())
                     || cmd
                         .aliases()
                         .iter()
                         .any(|a| self.disabled.contains(&a.to_lowercase()))
+            })
+            .any(|cmd| {
+                cmd.name().eq_ignore_ascii_case(&key)
+                    || cmd.aliases().iter().any(|a| a.eq_ignore_ascii_case(&key))
             })
     }
 
@@ -554,8 +569,12 @@ impl CommandRegistry {
             // Menu-hidden and disabled commands keep their key entries (so `get_for_dispatch()` /
             // `is_disabled()` resolve a typed invocation) but emit no triggers.
             // This is the inverse of the restricted trade-off below.
+            // The disabled gate is ACP-only: the Settings › OMP sheet lists OMP-advertised names,
+            // and a name colliding with a builtin was skipped at ingest — the builtin must keep
+            // its trigger (disabling OMP's `model` must not hide the pager's `/model`).
             let menu_only = self.menu_hidden.contains(canonical)
-                || self.disabled.contains(&canonical.to_lowercase());
+                || (source == CommandSource::Acp
+                    && self.disabled.contains(&canonical.to_lowercase()));
 
             // Restricted commands (per-user deny list, e.g. tier restrictions) deliberately stay listed.
             // They keep their triggers/key entries so the dropdown, ghost completion, and palette show them like any other command (discoverability)
@@ -1364,5 +1383,109 @@ mod tests {
         // Out-of-range returns None (boundary and far-out)
         assert!(registry.commands_by_index(2).is_none());
         assert!(registry.commands_by_index(usize::MAX).is_none());
+    }
+
+    // ── Settings › OMP disabled commands ──────────────────────────
+
+    /// Enabled commands (builtin and ACP) keep their completion triggers; only disabled ACP
+    /// commands drop out of the dropdown while staying resolvable for `is_disabled`.
+    #[test]
+    fn disabled_commands_drop_triggers_enabled_ones_keep_theirs() {
+        let mut reg = CommandRegistry::new(vec![Arc::new(DummyCommand {
+            name: "exit",
+            aliases: &[],
+        })]);
+        reg.set_acp_commands(&[
+            agent_client_protocol::AvailableCommand::new(
+                "security".to_string(),
+                "Security scan".to_string(),
+            ),
+            agent_client_protocol::AvailableCommand::new(
+                "review".to_string(),
+                "Review diff".to_string(),
+            ),
+        ]);
+        assert!(reg.triggers().iter().any(|t| t.canonical == "security"));
+        assert!(reg.triggers().iter().any(|t| t.canonical == "review"));
+
+        reg.set_disabled_commands(&["security".to_string()]);
+
+        // Disabled: no trigger, still resolvable for the send-path gate.
+        assert!(
+            !reg.triggers().iter().any(|t| t.canonical == "security"),
+            "disabled command must not emit a completion trigger"
+        );
+        assert!(reg.is_disabled("security"));
+        assert!(reg.get_for_dispatch("security").is_some());
+
+        // Enabled commands are untouched: builtin and sibling ACP command keep their triggers.
+        assert!(reg.triggers().iter().any(|t| t.canonical == "exit"));
+        assert!(reg.triggers().iter().any(|t| t.canonical == "review"));
+        assert!(!reg.is_disabled("review"));
+        assert!(!reg.is_disabled("exit"));
+
+        // Re-enabling restores the trigger.
+        reg.set_disabled_commands(&[]);
+        assert!(reg.triggers().iter().any(|t| t.canonical == "security"));
+        assert!(!reg.is_disabled("security"));
+    }
+
+    /// The Settings › OMP sheet lists every advertised name, including ones that collide with a
+    /// pager builtin (skipped at ingest). Disabling such a name must not strip the builtin's
+    /// trigger or block its dispatch — the toggle governs the OMP command only.
+    #[test]
+    fn disabled_acp_name_colliding_with_builtin_leaves_builtin_alone() {
+        let mut reg = CommandRegistry::new(vec![Arc::new(DummyCommand {
+            name: "model",
+            aliases: &[],
+        })]);
+        // OMP advertises `model`; the registry skips it as reserved, the builtin keeps the name.
+        reg.set_acp_commands(&[agent_client_protocol::AvailableCommand::new(
+            "model".to_string(),
+            "Show current model selection".to_string(),
+        )]);
+        assert!(reg.is_builtin("model"));
+
+        reg.set_disabled_commands(&["model".to_string()]);
+
+        assert!(
+            reg.triggers().iter().any(|t| t.canonical == "model"),
+            "disabling a colliding OMP name must not hide the pager builtin"
+        );
+        assert!(
+            !reg.is_disabled("model"),
+            "the builtin must not be blocked on the send path"
+        );
+        assert!(reg.get_for_dispatch("model").is_some());
+    }
+
+    /// ACP keys keep their advertised casing while the disabled list is normalized lowercase;
+    /// `is_disabled` must still match case-variant names.
+    #[test]
+    fn is_disabled_matches_case_variant_acp_names() {
+        let mut reg = CommandRegistry::new(vec![]);
+        reg.set_acp_commands(&[agent_client_protocol::AvailableCommand::new(
+            "MyCommand".to_string(),
+            "Mixed case".to_string(),
+        )]);
+        reg.set_disabled_commands(&["mycommand".to_string()]);
+        assert!(reg.is_disabled("MyCommand"));
+        assert!(reg.is_disabled("mycommand"));
+        assert!(!reg.triggers().iter().any(|t| t.canonical == "MyCommand"));
+    }
+
+    /// The disabled list survives an ACP catalog resync (same as the restricted deny list).
+    #[test]
+    fn disabled_survives_acp_resync() {
+        let mut reg = CommandRegistry::new(vec![]);
+        let cmds = [agent_client_protocol::AvailableCommand::new(
+            "security".to_string(),
+            "Security scan".to_string(),
+        )];
+        reg.set_acp_commands(&cmds);
+        reg.set_disabled_commands(&["security".to_string()]);
+        reg.set_acp_commands(&cmds);
+        assert!(reg.is_disabled("security"));
+        assert!(!reg.triggers().iter().any(|t| t.canonical == "security"));
     }
 }

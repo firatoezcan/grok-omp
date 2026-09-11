@@ -661,6 +661,16 @@ pub struct AppView {
     /// `agent_info.name == "oh-my-pi"`). Gates the Settings › OMP section and the disabled-command
     /// enforcement so foreign agents never see or honor the OMP-only list.
     pub is_omp_agent: bool,
+    /// Connected OMP agent identity (`agentInfo` from the ACP initialize response), formatted as
+    /// `"<name> <version>"`. `None` until initialize completes or for non-OMP agents.
+    pub omp_agent_info: Option<String>,
+    /// Command used to spawn the OMP agent (`_meta.ompAgentCommand` stamped by the bridge adapter,
+    /// else the resolved `--agent-command`). `None` when unknown.
+    pub omp_agent_command: Option<String>,
+    /// Whether the connected OMP build advertises the `vibe` session mode, reported by the bridge
+    /// adapter via `x.ai/omp/capabilities` (`session/new` → `modes.availableModes` contains
+    /// `"vibe"`). `None` until the first session response arrives.
+    pub omp_vibe_capable: Option<bool>,
     /// App-level credit balance used to show the usage warning on the welcome screen before any agent session exists.
     pub credit_balance: Option<crate::views::credit_bar::CreditBalance>,
     /// App-level auto top-up rule paired with `credit_balance` for the warning.
@@ -1662,6 +1672,9 @@ impl AppView {
             leader_mode: false,
             is_grok_shell: true,
             is_omp_agent: false,
+            omp_agent_info: None,
+            omp_agent_command: None,
+            omp_vibe_capable: None,
             credit_balance: None,
             auto_topup: None,
             billing_poll_wanted: false,

@@ -3,7 +3,8 @@ use ratatui::layout::Rect;
 
 use super::render::int_step_sizes;
 use super::state::{
-    RowEntry, SettingsKeyOutcome, SettingsModalState, SettingsMode, SettingsModeKind,
+    OmpProviderInputKind, RowEntry, SettingsKeyOutcome, SettingsModalState, SettingsMode,
+    SettingsModeKind,
     action_for_bool, action_for_enum, action_for_enum_commit, action_for_int, action_for_string,
     effective_enum_choices, group_children, validate_string,
 };
@@ -39,6 +40,8 @@ pub fn handle_settings_key(state: &mut SettingsModalState, key: &KeyEvent) -> Se
         SettingsModeKind::PickingEnum => handle_picking_enum(state, key),
         SettingsModeKind::PickingGroup => handle_picking_group(state, key),
         SettingsModeKind::OmpCommands => handle_omp_commands(state, key),
+        SettingsModeKind::OmpProviders => handle_omp_providers(state, key),
+        SettingsModeKind::OmpProviderInput => handle_omp_provider_input(state, key),
         SettingsModeKind::EditingString | SettingsModeKind::EditingInt => {
             handle_editing_value(state, key)
         }
@@ -66,9 +69,17 @@ pub fn handle_settings_paste(state: &mut SettingsModalState, text: &str) -> Sett
             };
             apply_string_edit(state, validator, outcome)
         }
+        SettingsModeKind::OmpProviderInput => {
+            let SettingsMode::OmpProviderInput { editor, .. } = &mut state.state.mode else {
+                unreachable!("mode kind changed before paste")
+            };
+            let _ = editor.insert_paste_with_policy(text, safe_settings_char, usize::MAX);
+            SettingsKeyOutcome::Changed
+        }
         SettingsModeKind::Browse
         | SettingsModeKind::PickingEnum
         | SettingsModeKind::OmpCommands
+        | SettingsModeKind::OmpProviders
         | SettingsModeKind::PickingGroup
         | SettingsModeKind::EditingInt => SettingsKeyOutcome::Unchanged,
     }
@@ -303,6 +314,185 @@ fn handle_omp_commands(state: &mut SettingsModalState, key: &KeyEvent) -> Settin
             SettingsKeyOutcome::Changed
         }
         _ => SettingsKeyOutcome::Unchanged,
+    }
+}
+
+/// Key routing for the OMP providers sub-sheet.
+/// Up/Down (and j/k) move between providers; Enter connects the focused provider — API-key
+/// providers open the masked key editor, OAuth providers start `omp auth-broker login` via the
+/// adapter; `o` forces the OAuth path on `both`-kind providers; `r` refetches the list; `x`
+/// cancels an in-flight login; Esc returns to Browse (cancelling any in-flight login).
+fn handle_omp_providers(state: &mut SettingsModalState, key: &KeyEvent) -> SettingsKeyOutcome {
+    let (group_key, provider_idx) = match &state.state.mode {
+        SettingsMode::OmpProviders { key, provider_idx } => (*key, *provider_idx),
+        _ => unreachable!("omp providers handler requires OmpProviders state"),
+    };
+    let count = state.omp_providers_list().len();
+
+    match key.code {
+        KeyCode::Esc => {
+            state.transition_to_browse();
+            if state.omp_connect.as_ref().is_some_and(|c| c.in_flight()) {
+                return SettingsKeyOutcome::Action(Action::OmpConnectCancel);
+            }
+            return SettingsKeyOutcome::Changed;
+        }
+        KeyCode::Char('r') if key.modifiers.is_empty() => {
+            return SettingsKeyOutcome::Action(Action::OmpFetchProviders);
+        }
+        KeyCode::Char('x') if key.modifiers.is_empty() => {
+            if state.omp_connect.as_ref().is_some_and(|c| c.in_flight()) {
+                return SettingsKeyOutcome::Action(Action::OmpConnectCancel);
+            }
+            return SettingsKeyOutcome::Unchanged;
+        }
+        _ => {}
+    }
+
+    if count == 0 {
+        return SettingsKeyOutcome::Unchanged;
+    }
+
+    match key.code {
+        KeyCode::Down | KeyCode::Char('j') => {
+            if provider_idx + 1 >= count {
+                return SettingsKeyOutcome::Unchanged;
+            }
+            state.transition_to_omp_providers(group_key, provider_idx + 1);
+            SettingsKeyOutcome::Changed
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if provider_idx == 0 {
+                return SettingsKeyOutcome::Unchanged;
+            }
+            state.transition_to_omp_providers(group_key, provider_idx - 1);
+            SettingsKeyOutcome::Changed
+        }
+        KeyCode::PageDown => {
+            let next = (provider_idx + 10).min(count - 1);
+            if next == provider_idx {
+                return SettingsKeyOutcome::Unchanged;
+            }
+            state.transition_to_omp_providers(group_key, next);
+            SettingsKeyOutcome::Changed
+        }
+        KeyCode::PageUp => {
+            let next = provider_idx.saturating_sub(10);
+            if next == provider_idx {
+                return SettingsKeyOutcome::Unchanged;
+            }
+            state.transition_to_omp_providers(group_key, next);
+            SettingsKeyOutcome::Changed
+        }
+        // `o` forces the OAuth login even on `both`-kind providers (whose Enter opens the key editor).
+        KeyCode::Char('o') if key.modifiers.is_empty() => {
+            let Some(provider) = state.omp_providers_list().get(provider_idx) else {
+                return SettingsKeyOutcome::Unchanged;
+            };
+            let provider_id = provider.id.clone();
+            let is_oauth = matches!(provider.kind.as_str(), "oauth" | "both");
+            if !is_oauth || state.omp_connect_pending {
+                return SettingsKeyOutcome::Unchanged;
+            }
+            state.omp_connect_pending = true;
+            SettingsKeyOutcome::Action(Action::OmpConnectProvider {
+                provider: provider_id,
+                api_key: None,
+            })
+        }
+        KeyCode::Enter => {
+            let Some(provider) = state.omp_providers_list().get(provider_idx) else {
+                return SettingsKeyOutcome::Unchanged;
+            };
+            let provider_id = provider.id.clone();
+            let provider_kind = provider.kind.clone();
+            if state.omp_connect_pending {
+                return SettingsKeyOutcome::Unchanged;
+            }
+            match provider_kind.as_str() {
+                "oauth" => {
+                    state.omp_connect_pending = true;
+                    SettingsKeyOutcome::Action(Action::OmpConnectProvider {
+                        provider: provider_id,
+                        api_key: None,
+                    })
+                }
+                _ => {
+                    state.transition_to_omp_provider_input(
+                        group_key,
+                        provider_idx,
+                        provider_id,
+                        OmpProviderInputKind::ApiKey,
+                    );
+                    SettingsKeyOutcome::Changed
+                }
+            }
+        }
+        _ => SettingsKeyOutcome::Unchanged,
+    }
+}
+
+/// Key routing for the provider credential editor (masked API key or OAuth paste-code).
+/// Enter commits (empty input is ignored); Esc returns to the providers sheet — for the code
+/// prompt that also cancels the in-flight login.
+fn handle_omp_provider_input(state: &mut SettingsModalState, key: &KeyEvent) -> SettingsKeyOutcome {
+    let (group_key, provider_idx, provider_id, kind) = match &state.state.mode {
+        SettingsMode::OmpProviderInput {
+            key,
+            provider_idx,
+            provider_id,
+            kind,
+            ..
+        } => (*key, *provider_idx, provider_id.clone(), *kind),
+        _ => unreachable!("provider input handler requires OmpProviderInput state"),
+    };
+
+    match key.code {
+        KeyCode::Enter => {
+            let SettingsMode::OmpProviderInput { editor, .. } = &state.state.mode else {
+                unreachable!("provider input state changed during commit");
+            };
+            let text = editor.text().trim().to_owned();
+            state.transition_to_omp_providers(group_key, provider_idx);
+            if text.is_empty() {
+                return SettingsKeyOutcome::Changed;
+            }
+            match kind {
+                OmpProviderInputKind::ApiKey => {
+                    state.omp_connect_pending = true;
+                    SettingsKeyOutcome::Action(Action::OmpConnectProvider {
+                        provider: provider_id,
+                        api_key: Some(text),
+                    })
+                }
+                OmpProviderInputKind::Code => SettingsKeyOutcome::Action(
+                    Action::OmpConnectSubmitCode { code: text },
+                ),
+            }
+        }
+        KeyCode::Esc => {
+            state.transition_to_omp_providers(group_key, provider_idx);
+            if kind == OmpProviderInputKind::Code
+                && state.omp_connect.as_ref().is_some_and(|c| c.in_flight())
+            {
+                return SettingsKeyOutcome::Action(Action::OmpConnectCancel);
+            }
+            SettingsKeyOutcome::Changed
+        }
+        // The editor is single-line; nav keys belong to the list behind it.
+        KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Tab
+        | KeyCode::BackTab => SettingsKeyOutcome::Unchanged,
+        _ => {
+            let SettingsMode::OmpProviderInput { editor, .. } = &mut state.state.mode else {
+                unreachable!("provider input state changed before key handling");
+            };
+            let _ = editor.handle_key_with_insert_policy(key, safe_settings_char);
+            SettingsKeyOutcome::Changed
+        }
     }
 }
 
@@ -707,6 +897,10 @@ fn handle_browse(state: &mut SettingsModalState, key: &KeyEvent) -> SettingsKeyO
             if state.try_enter_omp_commands() {
                 return SettingsKeyOutcome::Changed;
             }
+            // An OMP providers row opens its sub-sheet and kicks off the async provider fetch
+            if state.try_enter_omp_providers() {
+                return SettingsKeyOutcome::Action(Action::OmpFetchProviders);
+            }
             // For Bool, Enter behaves like Space: both keys toggle
             if let Some(action) = state.toggle_focused_bool() {
                 return SettingsKeyOutcome::Action(action);
@@ -732,7 +926,7 @@ fn handle_browse(state: &mut SettingsModalState, key: &KeyEvent) -> SettingsKeyO
             // preserved. Headers and unmapped rows are no-ops; `d` only acts on a focused setting row.
             match state.focused_setting() {
                 // Group rows have no scalar default to reset.
-                Some((_, meta)) if matches!(meta.kind, SettingKind::Group { .. }) => {
+                Some((_, meta)) if matches!(meta.kind, SettingKind::Group { .. } | SettingKind::Info | SettingKind::OmpProviders) => {
                     SettingsKeyOutcome::Unchanged
                 }
                 // A locked row isn't the user's to change, by `d` any more than by Enter (which `try_enter_picking_enum` refuses)
@@ -864,6 +1058,12 @@ pub fn handle_settings_mouse(
             SettingsModeKind::OmpCommands => {
                 return handle_omp_commands(state, &synthetic);
             }
+            SettingsModeKind::OmpProviders => {
+                return handle_omp_providers(state, &synthetic);
+            }
+            SettingsModeKind::OmpProviderInput => {
+                return handle_omp_provider_input(state, &synthetic);
+            }
             SettingsModeKind::PickingGroup => {
                 return handle_picking_group(state, &synthetic);
             }
@@ -921,6 +1121,18 @@ pub fn handle_settings_mouse(
         return upgrade_if_breadcrumb_flipped(outcome, breadcrumb_hover_flipped);
     }
     let on_list = rect_contains(state.list_area, column, row);
+
+    // OmpProviders: hover tracks provider rects; a click connects the clicked provider.
+    // The sheet scrolls, so the wheel moves the focus like Up/Down.
+    if state.state.mode_kind() == SettingsModeKind::OmpProviders {
+        let outcome = handle_omp_providers_mouse(state, kind, column, row);
+        return upgrade_if_breadcrumb_flipped(outcome, breadcrumb_hover_flipped);
+    }
+
+    // OmpProviderInput: the credential editor is keyboard-only; clicks are no-ops.
+    if state.state.mode_kind() == SettingsModeKind::OmpProviderInput {
+        return upgrade_if_breadcrumb_flipped(SettingsKeyOutcome::Unchanged, breadcrumb_hover_flipped);
+    }
 
     // Mouse hover highlight (parity with scrollback).
     // Walk `state.row_rects` to find the row under the cursor and update `state.hover_row`
@@ -981,6 +1193,12 @@ pub fn handle_settings_mouse(
             if on_value || was_selected_already {
                 if state.try_enter_picking_group() {
                     return SettingsKeyOutcome::Changed;
+                }
+                if state.try_enter_omp_commands() {
+                    return SettingsKeyOutcome::Changed;
+                }
+                if state.try_enter_omp_providers() {
+                    return SettingsKeyOutcome::Action(Action::OmpFetchProviders);
                 }
                 if let Some(action) = state.toggle_focused_bool() {
                     return SettingsKeyOutcome::Action(action);
@@ -1198,6 +1416,64 @@ fn handle_omp_mouse(
         _ => SettingsKeyOutcome::Unchanged,
     }
 }
+
+/// Handle a mouse event while the modal is in `OmpProviders` mode.
+/// Click connects the clicked provider (same as Enter); the wheel moves focus (the sheet scrolls).
+fn handle_omp_providers_mouse(
+    state: &mut SettingsModalState,
+    kind: MouseEventKind,
+    column: u16,
+    row: u16,
+) -> SettingsKeyOutcome {
+    if matches!(kind, MouseEventKind::Moved) {
+        let new_hover = state
+            .picker_choice_rects
+            .iter()
+            .position(|r| r.height > 0 && rect_contains(*r, column, row));
+        if new_hover != state.hover_row {
+            state.hover_row = new_hover;
+            return SettingsKeyOutcome::Changed;
+        }
+        return SettingsKeyOutcome::Unchanged;
+    }
+    let (group_key, provider_idx) = match &state.state.mode {
+        SettingsMode::OmpProviders { key, provider_idx } => (*key, *provider_idx),
+        _ => unreachable!("omp providers mouse handler requires OmpProviders state"),
+    };
+    let count = state.omp_providers_list().len();
+    match kind {
+        MouseEventKind::ScrollDown => {
+            if count == 0 || provider_idx + 1 >= count {
+                return SettingsKeyOutcome::Unchanged;
+            }
+            let next = (provider_idx + 3).min(count - 1);
+            state.transition_to_omp_providers(group_key, next);
+            SettingsKeyOutcome::Changed
+        }
+        MouseEventKind::ScrollUp => {
+            if count == 0 || provider_idx == 0 {
+                return SettingsKeyOutcome::Unchanged;
+            }
+            state.transition_to_omp_providers(group_key, provider_idx.saturating_sub(3));
+            SettingsKeyOutcome::Changed
+        }
+        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+            let clicked_idx = state
+                .picker_choice_rects
+                .iter()
+                .position(|r| r.height > 0 && rect_contains(*r, column, row));
+            let Some(idx) = clicked_idx else {
+                return SettingsKeyOutcome::Unchanged;
+            };
+            state.transition_to_omp_providers(group_key, idx);
+            // Reuse the keyboard path: Enter on the focused provider.
+            let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+            handle_omp_providers(state, &enter)
+        }
+        _ => SettingsKeyOutcome::Unchanged,
+    }
+}
+
 
 /// Handle a mouse event while in `EditingValue` mode.
 /// Clicks on the Int editor's `[-]` / `[+]` adornments dispatch as keyboard-equivalent Down/Up steps; everything else is a no-op.

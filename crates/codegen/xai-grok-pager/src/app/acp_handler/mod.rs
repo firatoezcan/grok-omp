@@ -609,6 +609,7 @@ fn handle_ext_notification(notif: &acp::ExtNotification, app: &mut AppView) -> b
         }
         "x.ai/mcp/elicit_complete" => handle_mcp_elicit_complete(notif, app),
         "x.ai/mcp/servers_updated" => handle_mcp_servers_updated(notif, app),
+        "x.ai/omp/capabilities" => handle_omp_capabilities(notif, app),
         _ => false,
     }
 }
@@ -619,6 +620,24 @@ fn handle_version_mismatch(notif: &acp::ExtNotification, app: &mut AppView) -> b
         return false;
     };
     app.show_toast(&banner);
+    true
+}
+
+/// `x.ai/omp/capabilities` — emitted by the bridge adapter after session/new|load when the OMP
+/// build's `modes.availableModes` is known. `vibeCapable` gates the Settings › OMP "Vibe mode" row.
+fn handle_omp_capabilities(notif: &acp::ExtNotification, app: &mut AppView) -> bool {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(notif.params.get()) else {
+        tracing::warn!("Failed to parse x.ai/omp/capabilities");
+        return false;
+    };
+    let Some(vibe) = parsed.get("vibeCapable").and_then(|v| v.as_bool()) else {
+        return false;
+    };
+    if app.omp_vibe_capable == Some(vibe) {
+        return false;
+    }
+    app.omp_vibe_capable = Some(vibe);
+    crate::app::dispatch::refresh_open_settings_modals(app);
     true
 }
 

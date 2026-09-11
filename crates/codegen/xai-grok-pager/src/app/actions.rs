@@ -562,6 +562,30 @@ pub enum Action {
         name: String,
         enabled: bool,
     },
+    /// Commit the OMP advisor toggle. Persisted to `[ui].omp_advisor_enabled`; the launcher
+    /// reads it at `grok-pi` start. Restart-required.
+    SetOmpAdvisorEnabled(bool),
+    /// Commit the OMP voice dictation master switch. Persisted to `[ui].omp_voice_enabled`;
+    /// the launcher maps it to `GROK_PI_VOICE`. Restart-required.
+    SetOmpVoiceEnabled(bool),
+    /// Commit the OMP STT model selector. Persisted to `[ui].omp_stt_model`; the launcher
+    /// exports it as `GROK_PI_STT_MODEL`. Restart-required.
+    SetOmpSttModel(String),
+    /// Fetch the connectable-provider list for the OMP providers sheet (x.ai/omp/providers).
+    OmpFetchProviders,
+    /// Connect a provider: `api_key: Some(_)` stores the key in the agent's auth store;
+    /// `None` starts the OAuth login flow (x.ai/omp/connect).
+    OmpConnectProvider {
+        provider: String,
+        api_key: Option<String>,
+    },
+    /// Submit a pasted authorization code / redirect URL to an in-flight OAuth login
+    /// (x.ai/omp/connect_code).
+    OmpConnectSubmitCode {
+        code: String,
+    },
+    /// Cancel an in-flight provider OAuth login (x.ai/omp/connect_cancel).
+    OmpConnectCancel,
     /// Preview a theme without persisting; updates the live display only.
     /// Used by the picker on Up/Down and Esc (revert).
     PreviewTheme(String),
@@ -1758,6 +1782,34 @@ pub enum Effect {
         session_id: acp::SessionId,
         cache: bool,
     },
+    /// Fetch the connectable-provider list from the adapter (x.ai/omp/providers).
+    FetchOmpProviders {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+    },
+    /// Connect a provider via the adapter (x.ai/omp/connect): API-key write or OAuth login start.
+    OmpConnect {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        provider: String,
+        api_key: Option<String>,
+    },
+    /// Poll the in-flight provider login (x.ai/omp/connect_status).
+    OmpConnectStatus {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+    },
+    /// Submit a pasted code to the in-flight provider login (x.ai/omp/connect_code).
+    OmpConnectSubmitCode {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        code: String,
+    },
+    /// Cancel the in-flight provider login (x.ai/omp/connect_cancel).
+    OmpConnectCancel {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+    },
     /// Trigger MCP OAuth for a server (x.ai/mcp/auth_trigger).
     McpAuthTrigger {
         agent_id: AgentId,
@@ -2631,6 +2683,17 @@ pub enum TaskResult {
         external: bool,
         /// Presentation mode from `x.ai/auth/get_url`; `None` on older agents.
         mode: Option<String>,
+    },
+    /// Provider list fetched from the adapter (x.ai/omp/providers).
+    OmpProvidersLoaded {
+        agent_id: AgentId,
+        result: Result<Vec<crate::views::settings_modal::OmpProviderInfo>, String>,
+    },
+    /// Provider connect status update — covers connect, connect_status, connect_code, and
+    /// connect_cancel responses (all return the same status shape).
+    OmpConnectStatusUpdate {
+        agent_id: AgentId,
+        result: Result<crate::views::settings_modal::OmpConnectStatus, String>,
     },
     /// Auth code was submitted (fire-and-forget).
     AuthCodeSubmitted {

@@ -128,6 +128,7 @@ pub(super) fn ensure_dashboard_state(app: &mut AppView) {
 fn configure_dashboard_state(app: &mut AppView) {
     let bootstrap_commands = app.bootstrap_acp_commands.clone();
     let models = app.models.clone();
+    let disabled_commands = app.omp_disabled_commands().to_vec();
     let disable_plugins = app.appearance.disable_plugins;
     let default_yolo = app.default_yolo;
     let default_auto = app.auto_mode_gate
@@ -154,6 +155,9 @@ fn configure_dashboard_state(app: &mut AppView) {
             .slash_controller
             .registry_mut()
             .set_plugins_visible(!disable_plugins);
+        // Settings › OMP disabled list: the dispatch input offers ACP commands too, so the
+        // same names must drop out of its completion.
+        d.dispatch.set_disabled_commands(&disabled_commands);
         d.dispatch
             .sync_acp_commands(&bootstrap_commands, None, &models);
         d.models = models;
@@ -1487,6 +1491,9 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
                 voice_stt_language: voice_stt_language_from_app,
                 omp_agent: app.is_omp_agent,
                 omp_commands: Vec::new(),
+                omp_agent_info: app.omp_agent_info.clone(),
+                omp_agent_command: app.omp_agent_command.clone(),
+                omp_vibe_capable: app.omp_vibe_capable,
             },
         };
         command.run(&mut ctx, invocation.args)

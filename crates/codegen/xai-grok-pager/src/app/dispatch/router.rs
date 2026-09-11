@@ -85,7 +85,8 @@ use super::settings::setters::{
     set_default_model, set_default_selected_permission, set_display_refresh_auto_cadence,
     set_follow_up_behavior, set_fork_secondary_model, set_group_tool_verbs, set_hunk_tracker_mode,
     set_invert_scroll, set_keep_text_selection, set_max_thoughts_width, set_multiline_mode,
-    set_omp_command_enabled, set_omp_disabled_commands, set_page_flip_on_send,
+    set_omp_advisor_enabled, set_omp_command_enabled, set_omp_disabled_commands,
+    set_omp_stt_model, set_omp_voice_enabled, set_page_flip_on_send,
     set_prompt_suggestions, set_remember_tool_approvals, set_render_mermaid,
     set_respect_manual_folds, set_screen_mode, set_scroll_lines, set_scroll_mode, set_scroll_speed,
     set_show_thinking_blocks, set_show_tips, set_simple_mode, set_theme, set_timeline,
@@ -1149,6 +1150,17 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::SetOmpCommandEnabled { name, enabled } => {
             set_omp_command_enabled(app, name, enabled)
         }
+        Action::SetOmpAdvisorEnabled(v) => set_omp_advisor_enabled(app, v),
+        Action::SetOmpVoiceEnabled(v) => set_omp_voice_enabled(app, v),
+        Action::SetOmpSttModel(v) => set_omp_stt_model(app, v),
+        Action::OmpFetchProviders => super::settings::ui::omp_fetch_providers(app),
+        Action::OmpConnectProvider { provider, api_key } => {
+            super::settings::ui::omp_connect_provider(app, provider, api_key)
+        }
+        Action::OmpConnectSubmitCode { code } => {
+            super::settings::ui::omp_connect_submit_code(app, code)
+        }
+        Action::OmpConnectCancel => super::settings::ui::omp_connect_cancel(app),
         Action::PreviewTheme(v) => preview_theme(app, v),
         Action::PreviewAutoDarkTheme(v) => preview_auto_dark_theme(app, v),
         Action::PreviewAutoLightTheme(v) => preview_auto_light_theme(app, v),

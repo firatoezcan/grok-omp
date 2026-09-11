@@ -1146,6 +1146,204 @@ const EFFORT_TO_THINKING = {
 	max: "max",
 };
 
+// ---------------------------------------------------------------------------
+// OMP provider connect (Settings › OMP › Providers)
+// ---------------------------------------------------------------------------
+// OMP has no ACP surface for adding credentials, so the adapter owns it: API
+// keys are written straight into the isolated profile's agent.db
+// (auth_credentials, same row shape `AuthStorage.login` persists), and OAuth
+// providers run `omp auth-broker login <provider>` as a child whose stdout the
+// pager renders. The running `omp acp` caches credentials in memory, so a new
+// credential only takes effect on the next grok-pi start — the UI says so.
+
+/**
+ * API-key providers worth offering in the sheet: id, display name, and the env
+ * var OMP resolves for that provider (from pi-catalog descriptors). `env` is
+ * also how the sheet reports an env-sourced connection. Providers whose only
+ * auth is OAuth (or ambient cloud credentials) are absent here; the OAuth set
+ * below covers them.
+ */
+const OMP_API_KEY_PROVIDERS = [
+	{ id: "anthropic", name: "Anthropic", env: "ANTHROPIC_API_KEY" },
+	{ id: "openai", name: "OpenAI", env: "OPENAI_API_KEY" },
+	{ id: "google", name: "Google (Gemini API)", env: "GEMINI_API_KEY" },
+	{ id: "xai", name: "xAI", env: "XAI_API_KEY" },
+	{ id: "deepseek", name: "DeepSeek", env: "DEEPSEEK_API_KEY" },
+	{ id: "mistral", name: "Mistral", env: "MISTRAL_API_KEY" },
+	{ id: "groq", name: "Groq", env: "GROQ_API_KEY" },
+	{ id: "openrouter", name: "OpenRouter", env: "OPENROUTER_API_KEY" },
+	{ id: "together", name: "Together", env: "TOGETHER_API_KEY" },
+	{ id: "fireworks", name: "Fireworks", env: "FIREWORKS_API_KEY" },
+	{ id: "cerebras", name: "Cerebras", env: "CEREBRAS_API_KEY" },
+	{ id: "perplexity", name: "Perplexity", env: "PERPLEXITY_API_KEY" },
+	{ id: "github-copilot", name: "GitHub Copilot", env: "COPILOT_GITHUB_TOKEN" },
+	{ id: "kilo", name: "Kilo", env: "KILO_API_KEY" },
+	{ id: "moonshot", name: "Moonshot (Kimi)", env: "MOONSHOT_API_KEY" },
+	{ id: "zai", name: "Z.AI", env: "ZAI_API_KEY" },
+	{ id: "minimax", name: "MiniMax", env: "MINIMAX_API_KEY" },
+	{ id: "ollama-cloud", name: "Ollama Cloud", env: "OLLAMA_CLOUD_API_KEY" },
+	{ id: "huggingface", name: "Hugging Face", env: "HF_TOKEN" },
+	{ id: "siliconflow", name: "SiliconFlow", env: "SILICONFLOW_API_KEY" },
+	{ id: "novita", name: "Novita", env: "NOVITA_API_KEY" },
+	{ id: "deepinfra", name: "DeepInfra", env: "DEEPINFRA_API_KEY" },
+	{ id: "venice", name: "Venice", env: "VENICE_API_KEY" },
+	{ id: "vercel-ai-gateway", name: "Vercel AI Gateway", env: "VERCEL_AI_GATEWAY_API_KEY" },
+	{ id: "coreweave", name: "CoreWeave", env: "COREWEAVE_API_KEY" },
+	{ id: "baseten", name: "Baseten", env: "BASETEN_API_KEY" },
+	{ id: "nvidia", name: "NVIDIA", env: "NVIDIA_API_KEY" },
+	{ id: "azure", name: "Azure OpenAI", env: "AZURE_OPENAI_API_KEY" },
+	{ id: "qianfan", name: "Qianfan", env: "QIANFAN_API_KEY" },
+	{ id: "gmi-cloud", name: "GMI Cloud", env: "GMI_API_KEY" },
+	{ id: "nanogpt", name: "NanoGPT", env: "NANO_GPT_API_KEY" },
+	{ id: "lm-studio", name: "LM Studio", env: "LM_STUDIO_API_KEY" },
+	{ id: "vllm", name: "vLLM", env: "VLLM_API_KEY" },
+	{ id: "litellm", name: "LiteLLM", env: "LITELLM_API_KEY" },
+	{ id: "synthetic", name: "Synthetic", env: "SYNTHETIC_API_KEY" },
+	{ id: "opencode-zen", name: "OpenCode Zen", env: "OPENCODE_API_KEY" },
+	{ id: "zenmux", name: "ZenMux", env: "ZENMUX_API_KEY" },
+];
+
+/**
+ * OAuth-capable providers (`omp auth-broker login <id>`). Mirrored from
+ * `omp auth-broker list`; ids are the login targets, `storeAs` is the
+ * provider the credential lands under when it differs (device/paste variants).
+ */
+const OMP_OAUTH_PROVIDERS = [
+	{ id: "anthropic", name: "Anthropic (Claude Pro/Max)" },
+	{ id: "openai-codex", name: "ChatGPT Plus/Pro (Codex)" },
+	{ id: "openai-codex-device", name: "ChatGPT (Codex, headless/device)", storeAs: "openai-codex" },
+	{ id: "github-copilot", name: "GitHub Copilot" },
+	{ id: "google-gemini-cli", name: "Google Cloud Code Assist (Gemini CLI)" },
+	{ id: "google-antigravity", name: "Antigravity (Gemini 3, Claude, GPT-OSS)" },
+	{ id: "xai-oauth", name: "xAI Grok OAuth (SuperGrok / X Premium+)" },
+	{ id: "cursor", name: "Cursor" },
+	{ id: "devin", name: "Devin" },
+	{ id: "gitlab-duo", name: "GitLab Duo" },
+	{ id: "gitlab-duo-agent", name: "GitLab Duo Agent" },
+	{ id: "zai-coding-plan", name: "Z.AI GLM Coding Plan", storeAs: "zai" },
+	{ id: "kimi-code", name: "Kimi Code" },
+	{ id: "alibaba-coding-plan", name: "Alibaba Coding Plan" },
+
+	{ id: "alibaba-token-plan", name: "QwenCloud Token Plan" },
+	{ id: "qwen-portal", name: "Qwen Portal" },
+	{ id: "minimax-code", name: "MiniMax Token Plan (Intl)" },
+	{ id: "minimax-code-cn", name: "MiniMax Token Plan (China)" },
+	{ id: "xiaomi", name: "Xiaomi MiMo" },
+	{ id: "xiaomi-token-plan-sgp", name: "Xiaomi Token Plan (Singapore)" },
+	{ id: "xiaomi-token-plan-ams", name: "Xiaomi Token Plan (Europe)" },
+	{ id: "xiaomi-token-plan-cn", name: "Xiaomi Token Plan (China)" },
+	{ id: "deepseek", name: "DeepSeek (OAuth)" },
+	{ id: "moonshot", name: "Moonshot (Kimi, OAuth)" },
+	{ id: "muse-code", name: "Muse Code" },
+	{ id: "meta", name: "Meta Model API" },
+	{ id: "sakana", name: "Sakana AI" },
+	{ id: "umans", name: "Umans AI Coding Plan" },
+	{ id: "zhipu-coding-plan", name: "Zhipu Coding Plan" },
+	{ id: "firepass", name: "Fire Pass (Fireworks)" },
+	{ id: "cline-pass", name: "ClinePass" },
+	{ id: "commandcode", name: "Command Code" },
+	{ id: "aiand", name: "ai&" },
+	{ id: "abliteration", name: "Abliteration" },
+	{ id: "cerebras", name: "Cerebras (OAuth)" },
+	{ id: "openrouter", name: "OpenRouter (OAuth)" },
+];
+
+/** The `omp` binary the adapter spawns (argv[0] of the agent command). */
+function ompBinary(agentArgv) {
+	return agentArgv?.[0] ?? "omp";
+}
+
+/**
+ * agent.db path for the ISOLATED grok-pi profile. PI_CODING_AGENT_DIR is set
+ * by the launcher; the GROK_HOME fallback covers a bare `bun adapter.mjs` dev
+ * run. Never resolves to the real ~/.omp — when neither env is set we return
+ * null and the caller reports "profile unknown" instead of touching user auth.
+ */
+function ompAgentDbPath() {
+	const dir = process.env.PI_CODING_AGENT_DIR;
+	if (dir) return join(dir, "agent.db");
+	const grokHome = process.env.GROK_HOME;
+	if (grokHome) return join(grokHome, "omp", "agent", "agent.db");
+	return null;
+}
+
+/**
+ * Open (creating if needed) the isolated agent.db with the auth_credentials
+ * schema + change-revision trigger OMP installs. Mirrors
+ * SqliteAuthCredentialStore's DDL so a first-run profile gets a compatible
+ * store and cross-process readers see the revision bump.
+ */
+function openOmpAuthDb() {
+	const dbPath = ompAgentDbPath();
+	if (!dbPath) return null;
+	mkdirSync(dirname(dbPath), { recursive: true });
+	const db = new Database(dbPath);
+	db.run(`CREATE TABLE IF NOT EXISTS auth_credentials (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		provider TEXT NOT NULL,
+		credential_type TEXT NOT NULL,
+		data TEXT NOT NULL,
+		disabled_cause TEXT DEFAULT NULL,
+		identity_key TEXT DEFAULT NULL,
+		created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)),
+		updated_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
+	)`);
+	db.run(`CREATE TABLE IF NOT EXISTS auth_change_revision (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		revision INTEGER NOT NULL
+	)`);
+	db.run("INSERT OR IGNORE INTO auth_change_revision (id, revision) VALUES (1, 0)");
+	for (const event of ["insert", "update", "delete"]) {
+		db.run(`CREATE TRIGGER IF NOT EXISTS auth_change_revision_auth_credentials_${event}
+			AFTER ${event.toUpperCase()} ON auth_credentials
+			BEGIN
+				UPDATE auth_change_revision SET revision = revision + 1 WHERE id = 1;
+			END`);
+	}
+	return db;
+}
+
+/** Active (non-disabled) credential rows, optionally for one provider. */
+function listOmpCredentials(db, provider) {
+	const sql =
+		"SELECT id, provider, credential_type, data FROM auth_credentials WHERE disabled_cause IS NULL" +
+		(provider ? " AND provider = ?" : "") +
+		" ORDER BY id ASC";
+	try {
+		return provider ? db.query(sql).all(provider) : db.query(sql).all();
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Persist an API key exactly as `AuthStorage.login` does: credential_type
+ * 'api_key', data {"key","source":"login"}. Updating the existing active
+ * api_key row keeps one credential per provider; OAuth rows are untouched.
+ */
+function storeOmpApiKey(provider, key) {
+	const db = openOmpAuthDb();
+	if (!db) throw new Error("isolated OMP profile not found (PI_CODING_AGENT_DIR unset)");
+	try {
+		const data = JSON.stringify({ key, source: "login" });
+		const existing = listOmpCredentials(db, provider).find((r) => r.credential_type === "api_key");
+		if (existing) {
+			db.run(
+				"UPDATE auth_credentials SET data = ?, updated_at = CAST(strftime('%s','now') AS INTEGER) WHERE id = ?",
+				[data, existing.id],
+			);
+		} else {
+			db.run(
+				"INSERT INTO auth_credentials (provider, credential_type, data) VALUES (?, 'api_key', ?)",
+				[provider, data],
+			);
+		}
+		return ompAgentDbPath();
+	} finally {
+		db.close();
+	}
+}
+
 /**
  * Tracks session/agent state from agent→client frames and answers the pager's
  * `x.ai/*` extension requests. One instance per live run.
@@ -1221,8 +1419,17 @@ class ExtSurface {
 		this.extCache = null;
 		/** cwd → worktree label for rows created via git/worktree/*. */
 		this.knownWorktrees = new Map();
+		/** argv of the spawned agent command (for `omp auth-broker login`). */
+		this.agentArgv = null;
+		/** In-flight `omp auth-broker login` child: {proc, provider, phase, authUrl, lines, needsCode, error}. */
+		this.ompLogin = null;
 		/** request id → sessionId for session/load|resume|fork in flight. */
 		this.pendingSessionSwitch = new Map();
+		/** The command the adapter spawned (`opts.agent` / `OMP_ACP_CMD`), stamped
+		 *  into initialize `_meta.ompAgentCommand` for the pager's status row. */
+		this.agentCommand = null;
+		/** Last reported vibe capability (modes.availableModes contains "vibe"). */
+		this.vibeCapable = undefined;
 	}
 
 	// -- state capture ------------------------------------------------------
@@ -1241,7 +1448,19 @@ class ExtSurface {
 			this.agentInfo = frame.result.agentInfo;
 			// Stamp the OMP identity flag so the pager can gate OMP-only surfaces
 			// (Settings › OMP) without sniffing agentInfo.name.
-			frame.result._meta = { ...(frame.result._meta ?? {}), ompAgent: true };
+			frame.result._meta = { ...(frame.result._meta ?? {}), ompAgent: true, ompAgentCommand: this.agentCommand };
+		}
+
+		// Any session response carrying modes tells us whether this OMP build is
+		// vibe-capable (`modes.availableModes[].id === "vibe"`). Report it once per
+		// session switch so the pager's Settings › OMP "Vibe mode" row stays live.
+		const modes = frame.result?.modes;
+		if (modes?.availableModes) {
+			const vibeCapable = modes.availableModes.some(m => m?.id === "vibe");
+			if (this.vibeCapable !== vibeCapable) {
+				this.vibeCapable = vibeCapable;
+				extra.push(this.notif("_x.ai/omp/capabilities", { vibeCapable }));
+			}
 		}
 
 		// session/new result → session identity + model catalog.
@@ -2461,6 +2680,18 @@ class ExtSurface {
 				return this.err("x.ai/task/kill: OMP exposes no background-task registry over ACP; bash{async} completions arrive as ordinary tool_call results");
 			case "task/list":
 				return this.answer({ result: { tasks: [] } });
+			// -- OMP provider connect (Settings › OMP › Providers) -------------
+			case "omp/providers":
+				return { action: "answerAsync", promise: Promise.resolve().then(() => this.ompProvidersList()) };
+			case "omp/connect":
+				return { action: "answerAsync", promise: this.ompConnect(p) };
+			case "omp/connect_status":
+				return this.answer(this.ompConnectStatus());
+			case "omp/connect_code":
+				return { action: "answerAsync", promise: this.ompConnectCode(p) };
+			case "omp/connect_cancel":
+				return this.answer(this.ompConnectCancel());
+
 
 			// -- auth & billing (auth-accounts.md, usage-cost.md) ----------------
 			case "auth/info":
@@ -3138,6 +3369,213 @@ class ExtSurface {
 		};
 	}
 
+	// -- OMP provider connect -------------------------------------------------
+
+	/**
+	 * `x.ai/omp/providers`: every connectable provider with its auth status.
+	 * Status is read live from the isolated agent.db plus the process env, so a
+	 * key written by `omp/connect` shows up on the next call.
+	 */
+	ompProvidersList() {
+		const db = openOmpAuthDb();
+		const rows = db ? listOmpCredentials(db) : [];
+		const byProvider = new Map();
+		for (const r of rows) {
+			const list = byProvider.get(r.provider) ?? [];
+			list.push(r);
+			byProvider.set(r.provider, list);
+		}
+		const providers = [];
+		const seen = new Set();
+		const push = (id, name, kind, env) => {
+			if (seen.has(id)) return;
+			seen.add(id);
+			const creds = byProvider.get(id) ?? [];
+			const stored = creds.some((c) => c.credential_type === "oauth")
+				? "oauth"
+				: creds.length > 0
+					? "api_key"
+					: null;
+			const envSet = env ? Boolean(process.env[env]?.trim()) : false;
+			providers.push({
+				id,
+				name,
+				kind, // "api_key" | "oauth" | "both"
+				env: env ?? null,
+				connected: stored !== null || envSet,
+				source: stored ?? (envSet ? "env" : null),
+			});
+		};
+		for (const p of OMP_API_KEY_PROVIDERS) {
+			const oauth = OMP_OAUTH_PROVIDERS.find((o) => o.id === p.id);
+			push(p.id, p.name, oauth ? "both" : "api_key", p.env);
+		}
+		for (const o of OMP_OAUTH_PROVIDERS) {
+			push(o.id, o.name, "oauth", null);
+		}
+		// Stored credentials for providers outside both catalogs still surface —
+		// connected, connectable via key replace.
+		for (const [provider] of byProvider) {
+			if (!seen.has(provider)) push(provider, provider, "api_key", null);
+		}
+		if (db) db.close();
+		return { providers, dbPath: ompAgentDbPath() };
+	}
+
+	/**
+	 * `x.ai/omp/connect` {provider, apiKey?}: with an apiKey, persist it to the
+	 * isolated agent.db and finish. Without one, start `omp auth-broker login
+	 * <provider>` and return the initial state (the pager polls
+	 * omp/connect_status for the URL / code prompt / outcome).
+	 */
+	async ompConnect(p) {
+		const provider = typeof p.provider === "string" ? p.provider.trim() : "";
+		if (!provider) throw new Error("omp/connect: provider required");
+		const apiKey = typeof p.apiKey === "string" ? p.apiKey.trim() : "";
+		if (apiKey) {
+			const dbPath = storeOmpApiKey(provider, apiKey);
+			return { status: "connected", provider, kind: "api_key", dbPath, restartRequired: true };
+		}
+		const oauth = OMP_OAUTH_PROVIDERS.find((o) => o.id === provider);
+		if (!oauth) {
+			throw new Error(`omp/connect: ${provider} takes an API key (no OAuth flow); pass apiKey`);
+		}
+		this.ompLoginCancel();
+		const omp = ompBinary(this.agentArgv);
+		const proc = Bun.spawn([omp, "auth-broker", "login", provider], {
+			stdin: "pipe",
+			stdout: "pipe",
+			stderr: "pipe",
+			env: process.env,
+		});
+		const login = {
+			proc,
+			provider,
+			phase: "starting", // starting → waiting_url → waiting_browser | needs_code → done | failed
+			authUrl: null,
+			launchUrl: null,
+			instructions: null,
+			lines: [],
+			error: null,
+			exitCode: null,
+		};
+		this.ompLogin = login;
+
+		// Drain stdout/stderr: the login flow prints the auth URL, progress lines, and
+		// (for paste-code providers) a code prompt. Bun yields Uint8Array chunks —
+		// decode them (chunk.toString() would produce comma-separated byte values).
+		const decoder = new TextDecoder();
+		let stdoutBuf = "";
+		let stderrBuf = "";
+		void (async () => {
+			try {
+				for await (const chunk of proc.stdout) {
+					stdoutBuf += decoder.decode(chunk, { stream: true });
+					const parts = stdoutBuf.split("\n");
+					stdoutBuf = parts.pop() ?? "";
+					login.lines.push(...parts.filter((l) => l.trim()));
+					this.#ompLoginScan(login);
+				}
+			} catch {}
+		})();
+		void (async () => {
+			try {
+				for await (const chunk of proc.stderr) {
+					stderrBuf += decoder.decode(chunk, { stream: true });
+					const parts = stderrBuf.split("\n");
+					stderrBuf = parts.pop() ?? "";
+					login.lines.push(...parts.filter((l) => l.trim()));
+				}
+			} catch {}
+		})();
+		void proc.exited.then((code) => {
+			login.exitCode = code;
+			if (login.phase !== "done" && login.phase !== "failed") {
+				login.phase = code === 0 ? "done" : "failed";
+				if (code !== 0 && !login.error) {
+					login.error = login.lines.at(-1) ?? `omp auth-broker login exited ${code}`;
+				}
+			}
+		});
+		// Give the child a moment to print the auth URL so the first response
+		// usually already carries it; the pager polls for the rest.
+		const deadline = Date.now() + 8000;
+		while (Date.now() < deadline && login.phase === "starting" && !login.authUrl) {
+			await new Promise((r) => setTimeout(r, 100));
+		}
+		return this.ompConnectStatus();
+	}
+
+	/** Scan accumulated login output for the auth URL and code prompt. */
+	#ompLoginScan(login) {
+		for (const line of login.lines) {
+			if (!login.authUrl) {
+				const m = line.match(/https?:\/\/\S+/);
+				if (m && !/local shortcut/i.test(line)) login.authUrl = m[0];
+			}
+			if (/local shortcut.*https?:\/\/\S+/i.test(line)) {
+				login.launchUrl = line.match(/https?:\/\/\S+/)?.[0] ?? null;
+			}
+			// Device-code flows print "Enter code: XXXX" (a code to type into the browser),
+			// not a code to paste back — only "paste"/"redirect url" lines mean stdin input.
+			if (/paste the (authorization )?code|redirect url/i.test(line)) {
+				login.phase = "needs_code";
+			}
+		}
+		if (login.authUrl && login.phase === "starting") login.phase = "waiting_browser";
+	}
+
+	/** `x.ai/omp/connect_status`: current login state for the pager's poll. */
+	ompConnectStatus() {
+		const login = this.ompLogin;
+		if (!login) return { status: "idle" };
+		return {
+			status: login.phase,
+			provider: login.provider,
+			authUrl: login.authUrl,
+			launchUrl: login.launchUrl,
+			instructions: login.instructions,
+			lines: login.lines.slice(-20),
+			error: login.error,
+			restartRequired: login.phase === "done",
+		};
+	}
+
+	/** `x.ai/omp/connect_code` {code}: feed a pasted code/redirect URL to the login child's stdin. */
+	async ompConnectCode(p) {
+		const login = this.ompLogin;
+		if (!login || login.phase !== "needs_code") throw new Error("omp/connect_code: no login is waiting for a code");
+		const code = typeof p.code === "string" ? p.code.trim() : "";
+		if (!code) throw new Error("omp/connect_code: empty code");
+		login.phase = "verifying";
+		try {
+			login.proc.stdin.write(`${code}\n`);
+			await login.proc.stdin.flush();
+		} catch (e) {
+			throw new Error(`omp/connect_code: could not write to login process: ${e?.message ?? e}`);
+		}
+		return this.ompConnectStatus();
+	}
+
+	/** `x.ai/omp/connect_cancel`: kill an in-flight login child. */
+	ompConnectCancel() {
+		const login = this.ompLogin;
+		if (login && login.phase !== "done" && login.phase !== "failed") {
+			try {
+				login.proc.kill("SIGTERM");
+			} catch {}
+			login.phase = "failed";
+			login.error = "cancelled";
+		}
+		this.ompLogin = null;
+		return { status: "idle" };
+	}
+
+	ompLoginCancel() {
+		this.ompConnectCancel();
+	}
+
+
 	async worktreeRemove(p) {
 		const target = p.path ?? p.worktreePath ?? p.id;
 		if (typeof target !== "string" || !target) throw rpcError(-32602, "worktree path required");
@@ -3230,6 +3668,8 @@ async function runLive(opts) {
 	const emit = (obj) => writer.write(`${JSON.stringify(obj)}\n`);
 	const forward = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
 	const ext = new ExtSurface();
+	ext.agentArgv = argv;
+	ext.agentCommand = opts.agent;
 	// Enrich the model catalog before session/new so the picker gets vision,
 	// effort, and context-window metadata on first connect.
 	await ext.loadCatalog(argv);

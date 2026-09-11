@@ -224,7 +224,15 @@ fn setting_row_visible_hides_voice_rows_when_voice_mode_off() {
 fn rebuild_rows_drops_voice_settings_when_gate_turns_off() {
     let prev = crate::app::voice_mode_enabled();
     crate::app::set_voice_mode_enabled_for_test(true);
-    let mut state = make_state();
+    let mut state = SettingsModalState::new(
+        Arc::new(SettingsRegistry::defaults()),
+        UiConfig::default(),
+        // Voice rows live in the OMP section now — the test needs an OMP agent for them to list.
+        PagerLocalSnapshot {
+            omp_agent: true,
+            ..PagerLocalSnapshot::default()
+        },
+    );
     let has_voice_lang = |s: &SettingsModalState| {
         s.rows.iter().any(|r| {
             matches!(

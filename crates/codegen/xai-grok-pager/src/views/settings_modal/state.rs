@@ -58,6 +58,82 @@ pub enum SettingsKeyOutcome {
 }
 
 // ---------------------------------------------------------------------------
+// OMP provider connect (Settings › OMP › Providers)
+// ---------------------------------------------------------------------------
+
+/// One connectable provider row, as reported by the bridge adapter's `x.ai/omp/providers`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct OmpProviderInfo {
+    /// Provider id (the `omp auth-broker login` target / agent.db `provider` column).
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// `"api_key"` | `"oauth"` | `"both"`.
+    pub kind: String,
+    /// Env var that also satisfies this provider, if any.
+    pub env: Option<String>,
+    /// Whether a usable credential exists (stored or env).
+    #[serde(default)]
+    pub connected: bool,
+    /// Where the credential comes from: `"api_key"` | `"oauth"` | `"env"` | `None`.
+    pub source: Option<String>,
+}
+
+/// Fetch state for the providers sheet (async-loaded via `x.ai/omp/providers`).
+#[derive(Debug, Clone, Default)]
+pub enum OmpProvidersData {
+    /// Never fetched (sheet not opened yet).
+    #[default]
+    Idle,
+    Loading,
+    Loaded(Vec<OmpProviderInfo>),
+    Error(String),
+}
+
+/// Live status of an in-flight `omp auth-broker login` (or a completed connect),
+/// as reported by `x.ai/omp/connect*` responses.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct OmpConnectStatus {
+    /// `"idle"` | `"starting"` | `"waiting_browser"` | `"needs_code"` | `"verifying"`
+    /// | `"done"` | `"failed"` | `"connected"` (API-key writes report `connected`).
+    pub status: String,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default, rename = "authUrl")]
+    pub auth_url: Option<String>,
+    #[serde(default, rename = "launchUrl")]
+    pub launch_url: Option<String>,
+    /// Recent transcript lines from the login child (adapter keeps the last ~20).
+    #[serde(default)]
+    pub lines: Vec<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    /// True when a credential was written but the running agent won't see it until restart.
+    #[serde(default, rename = "restartRequired")]
+    pub restart_required: bool,
+}
+
+impl OmpConnectStatus {
+    /// Whether a login is still in flight (the pager keeps polling `omp/connect_status`).
+    pub fn in_flight(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "starting" | "waiting_browser" | "needs_code" | "verifying"
+        )
+    }
+}
+
+/// Which credential the `OmpProviderInput` editor collects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OmpProviderInputKind {
+    /// Masked API-key entry; Enter dispatches `Action::OmpConnectProvider { api_key }`.
+    ApiKey,
+    /// Authorization code / redirect URL for an in-flight OAuth login; Enter dispatches
+    /// `Action::OmpConnectSubmitCode`.
+    Code,
+}
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -95,6 +171,21 @@ pub enum SettingsModalMode {
         key: SettingKey,
         cmd_idx: usize,
     },
+    /// OMP providers sub-sheet: one row per connectable provider with its auth status.
+    /// `provider_idx` is the focused row within `omp_providers`. Enter starts a connect
+    /// (API-key editor or OAuth login); Esc returns to Browse.
+    OmpProviders {
+        key: SettingKey,
+        provider_idx: usize,
+    },
+    /// Credential entry for one provider (masked API key, or the OAuth paste-code prompt).
+    /// Esc returns to the providers sheet at `provider_idx`.
+    OmpProviderInput {
+        key: SettingKey,
+        provider_idx: usize,
+        provider_id: String,
+        kind: OmpProviderInputKind,
+    },
     /// Inline string/int editor. No live preview; Esc is a pure cancel.
     EditingValue {
         key: SettingKey,
@@ -114,6 +205,8 @@ pub(super) enum SettingsModeKind {
     PickingEnum,
     PickingGroup,
     OmpCommands,
+    OmpProviders,
+    OmpProviderInput,
     EditingString,
     EditingInt,
 }
@@ -123,6 +216,8 @@ impl SettingsState {
         match &self.mode {
             SettingsMode::Browse => SettingsModeKind::Browse,
             SettingsMode::OmpCommands { .. } => SettingsModeKind::OmpCommands,
+            SettingsMode::OmpProviders { .. } => SettingsModeKind::OmpProviders,
+            SettingsMode::OmpProviderInput { .. } => SettingsModeKind::OmpProviderInput,
             SettingsMode::FilterFocused => SettingsModeKind::FilterFocused,
             SettingsMode::PickingEnum { .. } => SettingsModeKind::PickingEnum,
             SettingsMode::PickingGroup { .. } => SettingsModeKind::PickingGroup,
@@ -149,6 +244,17 @@ pub(super) enum SettingsMode {
     OmpCommands {
         key: SettingKey,
         cmd_idx: usize,
+    },
+    OmpProviders {
+        key: SettingKey,
+        provider_idx: usize,
+    },
+    OmpProviderInput {
+        key: SettingKey,
+        provider_idx: usize,
+        provider_id: String,
+        kind: OmpProviderInputKind,
+        editor: LineEditor,
     },
     EditingString {
         key: SettingKey,
@@ -206,6 +312,15 @@ pub struct SettingsModalState {
     /// Clicking anywhere on `Settings › <label>` cancels back to Browse.
     /// `None` in Browse/FilterFocused. Cleared on mode transitions.
     pub settings_breadcrumb_rect: Option<Rect>,
+    /// Providers sheet data, fetched async via `x.ai/omp/providers` when the sheet opens.
+    pub omp_providers: OmpProvidersData,
+    /// Live status of the in-flight (or last) provider connect; `None` when no connect ran.
+    pub omp_connect: Option<OmpConnectStatus>,
+    /// The auth URL already handed to the browser, so a re-poll doesn't re-open it.
+    pub omp_connect_opened_url: Option<String>,
+    /// A connect request is in flight (prevents double-Enter spawning two logins).
+    pub omp_connect_pending: bool,
+
     /// Hover flag for the breadcrumb; hovering adds an underline.
     pub breadcrumb_hovered: bool,
     /// Keys whose description is expanded (Right/l to expand, Left/h to collapse).
@@ -254,6 +369,10 @@ impl SettingsModalState {
             editor_adornment_rects: (Rect::default(), Rect::default()),
             picker_choice_rects: Vec::new(),
             settings_breadcrumb_rect: None,
+            omp_providers: OmpProvidersData::Idle,
+            omp_connect: None,
+            omp_connect_opened_url: None,
+            omp_connect_pending: false,
             breadcrumb_hovered: false,
             expanded_keys: std::collections::HashSet::new(),
             hover_row: None,
@@ -311,6 +430,8 @@ impl SettingsModalState {
             SettingsMode::PickingEnum { key, .. }
             | SettingsMode::PickingGroup { key, .. }
             | SettingsMode::OmpCommands { key, .. }
+            | SettingsMode::OmpProviders { key, .. }
+            | SettingsMode::OmpProviderInput { key, .. }
             | SettingsMode::EditingString { key, .. }
             | SettingsMode::EditingInt { key, .. } => Some(*key),
             SettingsMode::Browse | SettingsMode::FilterFocused => None,
@@ -370,6 +491,22 @@ impl SettingsModalState {
             SettingsMode::OmpCommands { key, cmd_idx } => SettingsModalMode::OmpCommands {
                 key,
                 cmd_idx: *cmd_idx,
+            },
+            SettingsMode::OmpProviders { key, provider_idx } => SettingsModalMode::OmpProviders {
+                key,
+                provider_idx: *provider_idx,
+            },
+            SettingsMode::OmpProviderInput {
+                key,
+                provider_idx,
+                provider_id,
+                kind,
+                ..
+            } => SettingsModalMode::OmpProviderInput {
+                key,
+                provider_idx: *provider_idx,
+                provider_id: provider_id.clone(),
+                kind: *kind,
             },
             SettingsMode::EditingString { key, .. } | SettingsMode::EditingInt { key, .. } => {
                 SettingsModalMode::EditingValue { key }
@@ -525,6 +662,25 @@ impl SettingsModalState {
         self.picker_last_click = None;
     }
 
+    pub(super) fn transition_to_omp_providers(&mut self, key: SettingKey, provider_idx: usize) {
+        self.state.mode = SettingsMode::OmpProviders { key, provider_idx };
+    }
+
+    pub(super) fn transition_to_omp_provider_input(
+        &mut self,
+        key: SettingKey,
+        provider_idx: usize,
+        provider_id: String,
+        kind: OmpProviderInputKind,
+    ) {
+        self.state.mode = SettingsMode::OmpProviderInput {
+            key,
+            provider_idx,
+            provider_id,
+            kind,
+            editor: LineEditor::default(),
+        };
+    }
     pub fn focus_filter(&mut self) {
         self.state.mode = SettingsMode::FilterFocused;
     }
@@ -690,6 +846,38 @@ impl SettingsModalState {
         self.transition_to_picking_enum(key, choices_idx, original_value, supports_preview);
         self.hover_row = None;
         true
+    }
+
+    /// Transition to `OmpProviders` if the focused row is an `OmpProviders` setting.
+    /// Returns `false` for any other kind so the caller can fall through to the enum/editor entry points.
+    pub fn try_enter_omp_providers(&mut self) -> bool {
+        let Some((key, meta)) = self.focused_setting() else {
+            return false;
+        };
+        if !matches!(meta.kind, SettingKind::OmpProviders) {
+            return false;
+        }
+        self.transition_to_omp_providers(key, 0);
+        self.hover_row = None;
+        true
+    }
+
+    /// The provider rows for the open `OmpProviders` sheet (empty while loading or on error).
+    pub(super) fn omp_providers_list(&self) -> &[OmpProviderInfo] {
+        match &self.omp_providers {
+            OmpProvidersData::Loaded(list) => list,
+            _ => &[],
+        }
+    }
+
+    /// Switch the open `OmpProviders` sheet into the paste-code editor (adapter asked for a code).
+    /// No-op unless the sheet is open; keeps the focused provider row.
+    pub fn enter_omp_provider_code_input(&mut self, provider_id: String) {
+        let SettingsMode::OmpProviders { key, provider_idx } = &self.state.mode else {
+            return;
+        };
+        let (key, provider_idx) = (*key, *provider_idx);
+        self.transition_to_omp_provider_input(key, provider_idx, provider_id, OmpProviderInputKind::Code);
     }
 
     /// Transition to `PickingGroup` if the focused row is a `Group`.
@@ -950,6 +1138,8 @@ pub(super) fn action_for_bool(key: SettingKey, new: bool) -> Option<Action> {
         "show_tips" => Some(Action::SetShowTips(new)),
         "auto_update" => Some(Action::SetAutoUpdate(new)),
         "display_refresh_auto_cadence" => Some(Action::SetDisplayRefreshAutoCadence(new)),
+        "omp_advisor_enabled" => Some(Action::SetOmpAdvisorEnabled(new)),
+        "omp_voice_enabled" => Some(Action::SetOmpVoiceEnabled(new)),
         _ => None,
     }
 }
@@ -1011,6 +1201,7 @@ pub(super) fn action_for_enum_commit(key: SettingKey, choice: &'static str) -> O
         "screen_mode" => Some(Action::SetScreenMode(choice.to_string())),
         "voice_capture_mode" => Some(Action::SetVoiceCaptureMode(choice.to_string())),
         "voice_stt_language" => Some(Action::SetVoiceSttLanguage(choice.to_string())),
+        "omp_stt_model" => Some(Action::SetOmpSttModel(choice.to_string())),
         "render_mermaid" => {
             crate::appearance::RenderMermaid::from_canonical(choice).map(Action::SetRenderMermaid)
         }

@@ -282,6 +282,31 @@ const VOICE_CAPTURE_MODE_CHOICES: &[EnumChoice] = &[
     },
 ];
 
+// OMP STT model choices for the settings modal. Canonicals match the shim's `STT_MODELS` keys in
+// `bridge/stt-shim.mjs` (`GROK_PI_STT_MODEL`); `parakeet` is the shim's own default.
+const OMP_STT_MODEL_CHOICES: &[EnumChoice] = &[
+    EnumChoice {
+        canonical: "parakeet",
+        display: "Parakeet",
+        description: "NVIDIA Parakeet TDT 0.6B (sherpa-onnx) — best accuracy, English-only. Default.",
+    },
+    EnumChoice {
+        canonical: "fast",
+        display: "Fast",
+        description: "Whisper base — lowest latency, multilingual.",
+    },
+    EnumChoice {
+        canonical: "balanced",
+        display: "Balanced",
+        description: "Whisper small — accuracy/latency middle ground, multilingual.",
+    },
+    EnumChoice {
+        canonical: "turbo",
+        display: "Turbo",
+        description: "Whisper large-v3-turbo — best multilingual accuracy, heaviest.",
+    },
+];
+
 // Voice STT language choices for the settings modal. Concrete codes must match `xai_grok_voice::STT_LANGUAGES`,
 // the official Grok STT catalog. `auto` is client-only; the voice crate resolves it to a concrete code before the
 // STT handshake.
@@ -1326,7 +1351,7 @@ pub fn default_settings() -> Vec<SettingMeta> {
         // Off disables only the Ctrl+Space / F8 chord; `/voice` (and Esc / the recording-row `[stop]`) keep working
         SettingMeta {
             key: "voice_keybind_enabled",
-            category: SettingCategory::Editor,
+            category: SettingCategory::Omp,
             owner: SettingOwner::Shell,
             label: "Voice shortcut",
             description: "Enable the Ctrl+Space / F8 shortcut for voice dictation. \
@@ -1356,7 +1381,7 @@ pub fn default_settings() -> Vec<SettingMeta> {
         // It falls back to `toggle` at runtime
         SettingMeta {
             key: "voice_capture_mode",
-            category: SettingCategory::Editor,
+            category: SettingCategory::Omp,
             owner: SettingOwner::Shell,
             label: "Voice capture",
             description: "How the voice chord (Ctrl+Space / F8) behaves: Toggle \
@@ -1389,7 +1414,7 @@ pub fn default_settings() -> Vec<SettingMeta> {
         // The catalog is the official STT languages (see xai_grok_voice::STT_LANGUAGES)
         SettingMeta {
             key: "voice_stt_language",
-            category: SettingCategory::Editor,
+            category: SettingCategory::Omp,
             owner: SettingOwner::Shell,
             label: "Voice language",
             description: "Speech-to-text language for voice dictation (Grok STT). \
@@ -1582,6 +1607,114 @@ pub fn default_settings() -> Vec<SettingMeta> {
                 "omp", "oh-my-pi", "slash", "command", "commands", "disable", "enable", "agent",
             ],
             kind: SettingKind::OmpCommands,
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        // Nav row: opens the provider-connect sheet. The sheet lists every provider the bridge
+        // adapter can authenticate (API key → agent.db, or OAuth via `omp auth-broker login`)
+        // with its live connection status. Nothing persists to UiConfig — credentials live in
+        // the agent's auth store.
+        SettingMeta {
+            key: "omp_providers",
+            category: SettingCategory::Omp,
+            owner: SettingOwner::Pager,
+            label: "Providers",
+            description: "Connect model providers to the Oh My Pi agent: paste an API key or \
+                          run an OAuth login. New credentials take effect on the next grok-pi launch.",
+            keywords: &[
+                "omp", "oh-my-pi", "provider", "providers", "api key", "oauth", "login",
+                "connect", "auth", "anthropic", "openai", "google", "credential",
+            ],
+            kind: SettingKind::OmpProviders,
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        // SHELL-owned, persisted to `[ui].omp_advisor_enabled`. The launcher (`bridge/grok-pi.mjs`)
+        // reads it at `grok-pi` start: `true` passes `--advisor` and overlays `advisor.enabled`
+        // into the OMP config; `GROK_PI_ADVISOR=0` still wins. Restart-required.
+        SettingMeta {
+            key: "omp_advisor_enabled",
+            category: SettingCategory::Omp,
+            owner: SettingOwner::Shell,
+            label: "Advisor",
+            description: "Enable the Oh My Pi advisor (background second-opinion model). \
+                          Takes effect on the next grok-pi launch.",
+            keywords: &["omp", "oh-my-pi", "advisor", "second opinion", "review"],
+            kind: SettingKind::Bool {
+                default: ui_default.omp_advisor_enabled,
+            },
+            restart_required: true,
+            hidden_in_minimal: false,
+        },
+        // SHELL-owned, persisted to `[ui].omp_voice_enabled`. The launcher maps it to
+        // `GROK_PI_VOICE`; `false` disables the STT shim entirely (no dictation keybind or
+        // capture path). Restart-required.
+        SettingMeta {
+            key: "omp_voice_enabled",
+            category: SettingCategory::Omp,
+            owner: SettingOwner::Shell,
+            label: "Voice dictation",
+            description: "Enable voice dictation for Oh My Pi (local STT shim). \
+                          Takes effect on the next grok-pi launch.",
+            keywords: &["omp", "oh-my-pi", "voice", "dictation", "stt", "mic", "speech"],
+            kind: SettingKind::Bool {
+                default: ui_default.omp_voice_enabled,
+            },
+            restart_required: true,
+            hidden_in_minimal: false,
+        },
+        // SHELL-owned, persisted to `[ui].omp_stt_model`. The launcher exports it as
+        // `GROK_PI_STT_MODEL`; the STT shim resolves the name against its model registry.
+        // Restart-required.
+        SettingMeta {
+            key: "omp_stt_model",
+            category: SettingCategory::Omp,
+            owner: SettingOwner::Shell,
+            label: "Voice model",
+            description: "Local speech-to-text model for Oh My Pi dictation. \
+                          Takes effect on the next grok-pi launch.",
+            keywords: &["omp", "oh-my-pi", "voice", "stt", "model", "whisper", "parakeet", "dictation"],
+            kind: SettingKind::Enum {
+                default: "parakeet",
+                choices: OMP_STT_MODEL_CHOICES,
+                supports_preview: false,
+            },
+            restart_required: true,
+            hidden_in_minimal: false,
+        },
+        // Read-only status rows: live values from `PagerLocalSnapshot`, no edit/reset.
+        SettingMeta {
+            key: "omp_agent_version",
+            category: SettingCategory::Omp,
+            owner: SettingOwner::Pager,
+            label: "Agent version",
+            description: "Name and version of the connected Oh My Pi agent \
+                          (from the ACP initialize handshake).",
+            keywords: &["omp", "oh-my-pi", "version", "agent", "info"],
+            kind: SettingKind::Info,
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "omp_agent_command",
+            category: SettingCategory::Omp,
+            owner: SettingOwner::Pager,
+            label: "Agent command",
+            description: "Command used to spawn the connected Oh My Pi agent.",
+            keywords: &["omp", "oh-my-pi", "command", "binary", "path", "agent"],
+            kind: SettingKind::Info,
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
+            key: "omp_vibe_capable",
+            category: SettingCategory::Omp,
+            owner: SettingOwner::Pager,
+            label: "Vibe mode",
+            description: "Whether the connected Oh My Pi build supports vibe mode \
+                          (multi-agent orchestration).",
+            keywords: &["omp", "oh-my-pi", "vibe", "mode", "orchestration", "agents"],
+            kind: SettingKind::Info,
             restart_required: false,
             hidden_in_minimal: false,
         },
