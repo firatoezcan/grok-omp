@@ -126,29 +126,49 @@ impl SpaceHold {
 
     /// First pass over a key event, before normal routing.
     ///
-    /// A bare-space release during an active hold is consumed here — before the
+    /// A space release during an active hold is consumed here — before the
     /// voice-chord intercept can claim it as a Ctrl+Space release — and ends
-    /// the hold. Any other key ends the hold too but is left for normal
-    /// routing, matching oh-my-pi's "stop recording, then let the key through".
+    /// the hold. Modifier-joined space repeats (e.g. Ctrl pressed mid-hold)
+    /// still mean "bar is down": they are swallowed like bare repeats so the
+    /// chord can't restart capture the hold just ended. The other chord key
+    /// (F8) ends the hold and is consumed for the same reason. Any other key
+    /// ends the hold but is left for normal routing, matching oh-my-pi's
+    /// "stop recording, then let the key through".
     pub(crate) fn pre_route(
         &mut self,
         ke: &KeyEvent,
         arrived_at: Instant,
         app: &AppView,
     ) -> SpaceHoldPre {
-        let is_space = ke.code == KeyCode::Char(' ') && ke.modifiers.is_empty();
+        // The session may have ended without a release (Esc, [stop], submit):
+        // reconcile so the tracker can't stay active over a dead session.
+        if self.active && !app.voice_hold_owned() {
+            self.end_hold();
+        }
+        let is_space_key = ke.code == KeyCode::Char(' ');
+        let is_space = is_space_key && ke.modifiers.is_empty();
         if self.active {
             match ke.kind {
-                // Kitty terminals report the real release: end the hold now
-                // instead of waiting out the idle-gap timer.
-                KeyEventKind::Release if is_space => {
+                // Kitty terminals report the real release (with whatever
+                // modifiers are still held): end the hold now instead of
+                // waiting out the idle-gap timer.
+                KeyEventKind::Release if is_space_key => {
                     self.end_hold();
                     return SpaceHoldPre::Consumed;
                 }
                 // Auto-repeat while held: swallow it and keep the release
-                // timer alive.
-                KeyEventKind::Press | KeyEventKind::Repeat if is_space => {
+                // timer alive. A modifier joining mid-hold (Ctrl+Space
+                // repeats) is still the held bar, not a fresh chord press.
+                KeyEventKind::Press | KeyEventKind::Repeat if is_space_key => {
                     self.arm_release(arrived_at);
+                    return SpaceHoldPre::Consumed;
+                }
+                // F8 pressed during a hold ends it without re-triggering a
+                // start through the chord intercept.
+                KeyEventKind::Press | KeyEventKind::Repeat
+                    if ke.code == KeyCode::F(8) && ke.modifiers.is_empty() =>
+                {
+                    self.end_hold();
                     return SpaceHoldPre::Consumed;
                 }
                 KeyEventKind::Release => return SpaceHoldPre::Ignore,
@@ -214,11 +234,20 @@ impl SpaceHold {
     }
 
     /// The gesture is a text-composition shortcut, so it needs the same gates
-    /// as the voice chord plus a prompt the spaces can actually land in.
+    /// as the voice chord plus a prompt the spaces can actually land in. It
+    /// only arms under `voice_capture_mode = "hold"` — a user who chose
+    /// `toggle` must keep a space bar that only ever types spaces — and never
+    /// while a capture session is already live or queued (a hold must not
+    /// hijack a `/voice` or Ctrl+Space session).
     fn gesture_enabled(&self, app: &AppView) -> bool {
         app.voice_mode_enabled
             && xai_grok_voice::AUDIO_SUPPORTED
             && app.current_ui.voice_keybind_enabled.unwrap_or(true)
+            && crate::settings::canonical_voice_capture_mode(
+                app.current_ui.voice_capture_mode.as_deref(),
+            ) == "hold"
+            && !app.voice_listening()
+            && !app.voice_state.pending_cold_start()
             && dispatch::space_hold_prompt_len(app).is_some()
     }
 
@@ -310,13 +339,35 @@ mod tests {
         KeyEvent::new_with_kind(code, KeyModifiers::NONE, kind)
     }
 
+    /// An app whose voice session is hold-owned, so the tracker reconcile in
+    /// `pre_route` doesn't clear a test-seeded active hold.
+    fn app_with_hold_session() -> AppView {
+        let mut app = crate::app::app_view::tests::test_app();
+        app.voice_state = crate::app::app_view::VoiceState::Recording {
+            hold: true,
+            target: crate::app::app_view::VoiceTarget::DashboardDispatch,
+            interim: None,
+        };
+        app
+    }
+
+    /// An app with the voice feature on and the pipeline up, so
+    /// `gesture_enabled` can pass.
+    fn app_with_voice_ready() -> AppView {
+        let mut app = crate::app::app_view::tests::test_app();
+        app.voice_mode_enabled = true;
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        app.voice_cmd_tx = Some(tx);
+        app
+    }
+
     #[test]
     fn space_release_consumed_and_ends_active_hold() {
         // Kitty-protocol terminals report the real release; it must end the
         // hold immediately and be consumed so the voice-chord intercept can't
         // also see it.
         let mut hold = SpaceHold::default();
-        let app = crate::app::app_view::tests::test_app();
+        let app = app_with_hold_session();
         let t0 = Instant::now();
         hold.active = true;
         hold.arm_release(t0);
@@ -330,7 +381,7 @@ mod tests {
     #[test]
     fn held_space_repeat_rearms_release_deadline() {
         let mut hold = SpaceHold::default();
-        let app = crate::app::app_view::tests::test_app();
+        let app = app_with_hold_session();
         let t0 = Instant::now();
         hold.active = true;
         hold.arm_release(t0);
@@ -346,7 +397,7 @@ mod tests {
         // "Stop recording, then let the key through": a non-space key ends the
         // hold yet still routes normally.
         let mut hold = SpaceHold::default();
-        let app = crate::app::app_view::tests::test_app();
+        let app = app_with_hold_session();
         hold.active = true;
         hold.arm_release(Instant::now());
 
@@ -367,6 +418,83 @@ mod tests {
         let app = crate::app::app_view::tests::test_app();
         let pre = hold.pre_route(
             &key(KeyCode::Char(' '), KeyEventKind::Release),
+            Instant::now(),
+            &app,
+        );
+        assert!(matches!(pre, SpaceHoldPre::Ignore));
+    }
+
+    #[test]
+    fn ctrl_space_repeat_mid_hold_is_swallowed_not_restarted() {
+        // Pressing Ctrl while the bar is still down turns the auto-repeat
+        // stream into Ctrl+Space repeats. Those must keep the hold alive, not
+        // end it and re-arm the chord intercept into a restart.
+        let mut hold = SpaceHold::default();
+        let app = app_with_hold_session();
+        let t0 = Instant::now();
+        hold.active = true;
+        hold.arm_release(t0);
+
+        let later = t0 + Duration::from_millis(40);
+        let pre = hold.pre_route(
+            &KeyEvent::new_with_kind(
+                KeyCode::Char(' '),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Repeat,
+            ),
+            later,
+            &app,
+        );
+        assert!(matches!(pre, SpaceHoldPre::Consumed));
+        assert!(hold.active());
+        assert_eq!(hold.release_deadline(), Some(later + SPACE_HOLD_RELEASE));
+    }
+
+    #[test]
+    fn f8_press_ends_hold_and_is_consumed() {
+        // The other voice chord can't bounce a hold into a restart either.
+        let mut hold = SpaceHold::default();
+        let app = app_with_hold_session();
+        hold.active = true;
+        hold.arm_release(Instant::now());
+
+        let pre = hold.pre_route(
+            &key(KeyCode::F(8), KeyEventKind::Press),
+            Instant::now(),
+            &app,
+        );
+        assert!(matches!(pre, SpaceHoldPre::Consumed));
+        assert!(!hold.active());
+    }
+
+    #[test]
+    fn capture_mode_toggle_disarms_the_gesture() {
+        // A user who chose `toggle` keeps a space bar that only types spaces.
+        let mut hold = SpaceHold::default();
+        let mut app = app_with_voice_ready();
+        app.current_ui.voice_capture_mode = Some("toggle".to_owned());
+
+        let pre = hold.pre_route(
+            &key(KeyCode::Char(' '), KeyEventKind::Press),
+            Instant::now(),
+            &app,
+        );
+        assert!(matches!(pre, SpaceHoldPre::Ignore));
+    }
+
+    #[test]
+    fn live_recording_disarms_the_gesture() {
+        // A hold must not hijack a session that is already capturing.
+        let mut hold = SpaceHold::default();
+        let mut app = app_with_voice_ready();
+        app.voice_state = crate::app::app_view::VoiceState::Recording {
+            hold: false,
+            target: crate::app::app_view::VoiceTarget::DashboardDispatch,
+            interim: None,
+        };
+
+        let pre = hold.pre_route(
+            &key(KeyCode::Char(' '), KeyEventKind::Press),
             Instant::now(),
             &app,
         );

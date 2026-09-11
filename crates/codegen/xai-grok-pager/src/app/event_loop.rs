@@ -5203,6 +5203,278 @@ mod tests {
         );
     }
 
+    /// Spacebar-hold push-to-talk, exercised through the real drain path:
+    /// `pre_route` intercept → normal routing → `post_route` cadence confirm →
+    /// `Action::EnableVoiceMode` → space release → `Action::VoiceStop`.
+    /// Arrival times are synthesized with a steady 40ms cadence, the OS
+    /// auto-repeat signature the tracker recognizes.
+    #[tokio::test]
+    async fn space_hold_cadence_starts_and_release_stops_hold_recording() {
+        let mut app = crate::app::app_view::tests::test_app_with_agent();
+        app.apply_auth_meta(&xai_grok_login::AuthMeta {
+            auth_mode: Some("ApiKey".into()),
+            ..Default::default()
+        });
+        assert!(app.voice_mode_enabled);
+        // The prompt pane must own keys for spaces to land as text.
+        app.agents
+            .values_mut()
+            .next()
+            .expect("agent")
+            .set_active_pane(crate::app::agent_view::AgentPane::Prompt, true);
+        let (voice_tx, mut voice_rx) = tokio::sync::mpsc::channel(8);
+        app.voice_cmd_tx = Some(voice_tx);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut tasks = JoinSet::new();
+        let mut csi_filter = super::super::csi_filter::CsiFragmentFilter::new();
+        let mut x10_filter = super::super::x10_filter::X10ReassemblyFilter::new();
+        let mut xt_filter = super::super::xt_filter::XtversionFilter::new();
+        let mut space_hold = super::super::space_hold::SpaceHold::default();
+
+        let base = std::time::Instant::now();
+        let space_at = |ms: u64| {
+            timed(
+                Event::Key(KeyEvent::new_with_kind(
+                    KeyCode::Char(' '),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Press,
+                )),
+                base + Duration::from_millis(ms),
+            )
+        };
+        // All events are "live" (after live_input_started_at) so the intercept runs.
+        let live_since = base - Duration::from_secs(1);
+
+        // A held bar: press + three auto-repeats at a steady 40ms cadence.
+        for ms in [40, 80, 120] {
+            let _ = input_tx.send(space_at(ms));
+        }
+        drop(input_tx);
+
+        let result = drain_and_process(
+            space_at(0),
+            &mut input_rx,
+            &mut app,
+            &mut tasks,
+            &progress_tx,
+            &mut csi_filter,
+            &mut x10_filter,
+            &mut xt_filter,
+            &mut space_hold,
+            live_since,
+        )
+        .await;
+
+        assert!(!result.should_quit);
+        assert!(
+            app.voice_listening(),
+            "mechanical space cadence must start recording"
+        );
+        assert!(
+            app.voice_hold_owned(),
+            "the space-hold session is hold-owned so its release stops it"
+        );
+        assert!(space_hold.active());
+        assert!(
+            space_hold.release_deadline().is_some(),
+            "the release idle-gap timer is armed for the select! loop"
+        );
+        assert!(matches!(
+            voice_rx.try_recv(),
+            Ok(xai_grok_voice::VoiceCommand::PttPress)
+        ));
+        let agent = app.agents.values().next().expect("agent");
+        assert_eq!(
+            agent.prompt.text(),
+            "",
+            "the optimistically typed spaces are tracked back out on confirm"
+        );
+
+        // The bar comes up on a Kitty-protocol terminal: a real Release event.
+        let (input_tx3, mut input_rx3) = tokio::sync::mpsc::unbounded_channel();
+        drop(input_tx3);
+        let result = drain_and_process(
+            timed(
+                Event::Key(KeyEvent::new_with_kind(
+                    KeyCode::Char(' '),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Release,
+                )),
+                base + Duration::from_millis(200),
+            ),
+            &mut input_rx3,
+            &mut app,
+            &mut tasks,
+            &progress_tx,
+            &mut csi_filter,
+            &mut x10_filter,
+            &mut xt_filter,
+            &mut space_hold,
+            live_since,
+        )
+        .await;
+
+        assert!(!result.should_quit);
+        assert!(!space_hold.active());
+        assert!(
+            !app.voice_listening() && !app.voice_hold_owned(),
+            "the release ends the hold-owned recording"
+        );
+        assert!(matches!(
+            voice_rx.try_recv(),
+            Ok(xai_grok_voice::VoiceCommand::PttRelease)
+        ));
+    }
+
+    /// Ordinary typing — letters and deliberate single spaces — flows through
+    /// the intercept into the prompt unchanged and never arms the gesture.
+    #[tokio::test]
+    async fn space_hold_leaves_normal_typing_untouched() {
+        let mut app = crate::app::app_view::tests::test_app_with_agent();
+        app.apply_auth_meta(&xai_grok_login::AuthMeta {
+            auth_mode: Some("ApiKey".into()),
+            ..Default::default()
+        });
+        app.agents
+            .values_mut()
+            .next()
+            .expect("agent")
+            .set_active_pane(crate::app::agent_view::AgentPane::Prompt, true);
+        let (voice_tx, mut voice_rx) = tokio::sync::mpsc::channel(8);
+        app.voice_cmd_tx = Some(voice_tx);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut tasks = JoinSet::new();
+        let mut csi_filter = super::super::csi_filter::CsiFragmentFilter::new();
+        let mut x10_filter = super::super::x10_filter::X10ReassemblyFilter::new();
+        let mut xt_filter = super::super::xt_filter::XtversionFilter::new();
+        let mut space_hold = super::super::space_hold::SpaceHold::default();
+
+        let base = std::time::Instant::now();
+        let live_since = base - Duration::from_secs(1);
+        // "hi x" typed at human speed: 300ms between keystrokes, far outside
+        // the auto-repeat band.
+        for (i, code) in [
+            KeyCode::Char('i'),
+            KeyCode::Char(' '),
+            KeyCode::Char('x'),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let _ = input_tx.send(timed(
+                Event::Key(KeyEvent::new_with_kind(
+                    code,
+                    KeyModifiers::NONE,
+                    KeyEventKind::Press,
+                )),
+                base + Duration::from_millis(300 * (i as u64 + 1)),
+            ));
+        }
+        drop(input_tx);
+
+        let result = drain_and_process(
+            timed(
+                Event::Key(KeyEvent::new_with_kind(
+                    KeyCode::Char('h'),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Press,
+                )),
+                base,
+            ),
+            &mut input_rx,
+            &mut app,
+            &mut tasks,
+            &progress_tx,
+            &mut csi_filter,
+            &mut x10_filter,
+            &mut xt_filter,
+            &mut space_hold,
+            live_since,
+        )
+        .await;
+
+        assert!(!result.should_quit);
+        assert!(!space_hold.active());
+        assert!(!app.voice_listening());
+        assert!(voice_rx.try_recv().is_err(), "no PttPress from typing");
+        let agent = app.agents.values().next().expect("agent");
+        assert_eq!(agent.prompt.text(), "hi x");
+    }
+
+    /// `voice_capture_mode = "toggle"`: the space bar only ever types spaces —
+    /// a mechanical cadence must not arm the gesture.
+    #[tokio::test]
+    async fn space_hold_toggle_mode_types_spaces() {
+        let mut app = crate::app::app_view::tests::test_app_with_agent();
+        app.apply_auth_meta(&xai_grok_login::AuthMeta {
+            auth_mode: Some("ApiKey".into()),
+            ..Default::default()
+        });
+        app.current_ui.voice_capture_mode = Some("toggle".to_owned());
+        app.agents
+            .values_mut()
+            .next()
+            .expect("agent")
+            .set_active_pane(crate::app::agent_view::AgentPane::Prompt, true);
+        let (voice_tx, mut voice_rx) = tokio::sync::mpsc::channel(8);
+        app.voice_cmd_tx = Some(voice_tx);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut tasks = JoinSet::new();
+        let mut csi_filter = super::super::csi_filter::CsiFragmentFilter::new();
+        let mut x10_filter = super::super::x10_filter::X10ReassemblyFilter::new();
+        let mut xt_filter = super::super::xt_filter::XtversionFilter::new();
+        let mut space_hold = super::super::space_hold::SpaceHold::default();
+
+        let base = std::time::Instant::now();
+        let live_since = base - Duration::from_secs(1);
+        for ms in [40, 80, 120] {
+            let _ = input_tx.send(timed(
+                Event::Key(KeyEvent::new_with_kind(
+                    KeyCode::Char(' '),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Press,
+                )),
+                base + Duration::from_millis(ms),
+            ));
+        }
+        drop(input_tx);
+
+        let result = drain_and_process(
+            timed(
+                Event::Key(KeyEvent::new_with_kind(
+                    KeyCode::Char(' '),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Press,
+                )),
+                base,
+            ),
+            &mut input_rx,
+            &mut app,
+            &mut tasks,
+            &progress_tx,
+            &mut csi_filter,
+            &mut x10_filter,
+            &mut xt_filter,
+            &mut space_hold,
+            live_since,
+        )
+        .await;
+
+        assert!(!result.should_quit);
+        assert!(!space_hold.active());
+        assert!(!app.voice_listening());
+        assert!(voice_rx.try_recv().is_err(), "no PttPress in toggle mode");
+        let agent = app.agents.values().next().expect("agent");
+        assert_eq!(
+            agent.prompt.text(),
+            "    ",
+            "all four spaces land as text when the gesture is gated off"
+        );
+    }
+
     #[test]
     fn take_load_restore_code_is_oneshot_on_matching_session_only() {
         use crate::app::actions::Effect;
