@@ -47,7 +47,7 @@
 
 import { appendFileSync, closeSync, cpSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { execFile } from "node:child_process";
 import { Database } from "bun:sqlite";
 
@@ -138,7 +138,7 @@ function fail(msg) {
 }
 
 /** Set by main() before anything logs. */
-const optsRef = { quiet: false };
+const optsRef = { quiet: false, shape: true };
 
 // ---------------------------------------------------------------------------
 // tape
@@ -798,40 +798,139 @@ function sanitizeLabel(s) {
 }
 
 // ---------------------------------------------------------------------------
-// advisor session tailer: OMP 18.1.17 never puts advisor notes on the ACP
-// wire — mapAssistantMessageEnd drops non-assistant messages live, and
-// #extractReplayContent only handles array content while advisor entries
-// persist a string, so session/load replay emits nothing either. The notes do
-// land in the session JSONL as custom_message/customType:"advisor", so we
-// tail that file and synthesize the same user_message_chunk frames OMP's
-// replay would have sent. observeAdvisoryChunk then splits/meta-stamps them
-// exactly like a wire frame.
+// vibe mode (observe-only): OMP's /vibe director drives persistent worker
+// sessions via vibe_spawn/vibe_send/vibe_wait/vibe_kill/vibe_list. Over ACP
+// those arrive as ordinary tool_call frames whose rawOutput.details carry
+// {op, screens, spawned?, killed?, wait?}; the durable roster lives in the
+// parent session JSONL as type:"custom" customType:"vibe-session-lifecycle"
+// entries (spawn/turn-started/turn-settled/tombstone/tombstone-revoked), and
+// settled worker turns self-deliver as custom_message customType:"async-result"
+// follow-ups — neither of which crosses the wire (see specs/vibe-mode.md).
 // ---------------------------------------------------------------------------
 
-class AdvisorTailer {
+const VIBE_TOOL_NAMES = new Set(["vibe_spawn", "vibe_send", "vibe_wait", "vibe_kill", "vibe_list"]);
+const VIBE_DETAIL_OPS = new Set(["spawn", "send", "wait", "kill", "list"]);
+
+/** Identify a vibe tool_call from its title or rawInput shape. */
+function vibeToolOp(update) {
+	const title = typeof update.title === "string" ? update.title : "";
+	if (VIBE_TOOL_NAMES.has(title)) return title.slice(5);
+	const raw = update.rawInput;
+	if (!raw || typeof raw !== "object") return null;
+	if ((raw.cli === "fast" || raw.cli === "good") && typeof raw.prompt === "string") return "spawn";
+	if (typeof raw.session === "string" && typeof raw.message === "string") return "send";
+	if (typeof raw.session === "string" && raw.message === undefined && raw.prompt === undefined) return "kill";
+	if (Array.isArray(raw.sessions) || typeof raw.timeout === "number") return "wait";
+	return null;
+}
+
+/** ACP kind for a worker-side tool call, mirroring OMP's mapToolKind. */
+function vibeChildToolKind(toolName) {
+	switch (toolName) {
+		case "read": return "read";
+		case "write": case "edit": return "edit";
+		case "delete": return "delete";
+		case "move": return "move";
+		case "bash": case "shell": case "exec": case "eval": return "execute";
+		case "grep": case "glob": case "ast_grep": return "search";
+		case "web_search": return "fetch";
+		case "todo": return "think";
+		default: return "other";
+	}
+}
+
+/** Tool-call title for a worker-side call, mirroring OMP's buildToolTitle. */
+function vibeChildToolTitle(toolName, args, intent) {
+	if (typeof intent === "string" && intent.trim()) return intent;
+	const subject =
+		(typeof args?.path === "string" && args.path) ||
+		(typeof args?.command === "string" && args.command) ||
+		(typeof args?.pattern === "string" && args.pattern) ||
+		(typeof args?.query === "string" && args.query);
+	return subject ? `${toolName}: ${subject}` : toolName;
+}
+
+/** Strip the <system-notice>…</system-notice> wrapper from a delivered async result. */
+function stripSystemNotice(text) {
+	const m = /^\s*<system-notice>\s*([\s\S]*?)\s*<\/system-notice>\s*$/.exec(text);
+	return (m ? m[1] : text).trim();
+}
+
+/** Worker id from a vibe turn jobId (`<id>-t<turn>`; agentId is the worker id). */
+function vibeWorkerIdFromJobId(jobId) {
+	const m = /^([A-Za-z0-9_-]+)-t\d+$/.exec(typeof jobId === "string" ? jobId : "");
+	return m?.[1];
+}
+
+/** <response> body of a delivered <vibe-turn> result, when present. */
+function vibeTurnResponseText(text) {
+	const m = /<response[^>]*>([\s\S]*?)<\/response>/.exec(text);
+	return m ? m[1].trim() : undefined;
+}
+
+/** Flatten a persisted message's content into ACP text/image content blocks. */
+function vibeContentBlocks(content) {
+	const blocks = [];
+	const items = Array.isArray(content) ? content : typeof content === "string" ? [{ type: "text", text: content }] : [];
+	for (const item of items) {
+		if (!item || typeof item !== "object") continue;
+		if (item.type === "text" && typeof item.text === "string" && item.text.length > 0) {
+			blocks.push({ type: "text", text: item.text });
+		} else if (item.type === "image" && typeof item.data === "string" && typeof item.mimeType === "string") {
+			blocks.push({ type: "image", data: item.data, mimeType: item.mimeType });
+		}
+	}
+	return blocks;
+}
+
+// ---------------------------------------------------------------------------
+// session-file tailer: several OMP surfaces never reach the ACP wire —
+//   - advisor notes (custom_message/customType:"advisor"): mapAssistantMessageEnd
+//     drops non-assistant messages live and #extractReplayContent skips their
+//     string content on replay, so we synthesize the user_message_chunk frames
+//     OMP's replay would have sent; observeAdvisoryChunk then splits/meta-stamps
+//     them exactly like a wire frame.
+//   - vibe lifecycle (custom/customType:"vibe-session-lifecycle"): the durable
+//     worker roster — spawn/turn-settled/tombstone drive subagent_* synthesis.
+//   - async results (custom_message/customType:"async-result"): settled worker
+//     turns delivered to the director; rendered as interjection user chunks.
+//   - worker transcripts: each vibe worker owns <parent-stem>/<id>.jsonl; we
+//     tail it and synthesize child session/update frames so the pager's
+//     subagent fullscreen view shows the real transcript.
+// ---------------------------------------------------------------------------
+
+class SessionTailer {
 	/**
-	 * @param {(frame: object) => void} emit synthesized to_client frame sender
-	 *   (must run the frame through ExtSurface.observeToClient + forward).
+	 * @param {(frame: object, raw?: boolean) => void} emit to_client sender.
+	 *   raw=false frames run through ExtSurface.observeToClient + forward (the
+	 *   advisor pipeline); raw=true frames are already-final synthesized
+	 *   notifications forwarded verbatim (subagent_* and child-session frames
+	 *   must not re-enter parent-side observation).
+	 * @param {ExtSurface} ext bookkeeping owner for vibe worker records.
 	 */
-	constructor(emit) {
+	constructor(emit, ext) {
 		this.emit = emit;
+		this.ext = ext;
 		this.sessionId = null;
 		this.file = null;
 		this.offset = 0;
 		this.pending = "";
 		this.seen = new Set();
 		this.timer = null;
+		/** workerId → {file, offset, pending, seen, seenToolCalls} tail state. */
+		this.children = new Map();
 	}
 
 	/** Point the tailer at a session; no-op when already attached. */
 	attach(sessionId) {
 		if (!sessionId || this.sessionId === sessionId) return;
-		log(`advisor tailer: attach ${sessionId}`);
+		log(`session tailer: attach ${sessionId}`);
 		this.sessionId = sessionId;
 		this.file = null;
 		this.offset = 0;
 		this.pending = "";
 		this.seen.clear();
+		this.children.clear();
 		if (!this.timer) {
 			this.timer = setInterval(() => this.poll(), 400);
 			this.timer.unref?.();
@@ -843,74 +942,152 @@ class AdvisorTailer {
 		this.timer = null;
 	}
 
-	poll() {
-		if (!this.sessionId) return;
-		if (!this.file) {
-			this.file = findOmpSessionFile(this.sessionId);
-			if (this.file) log(`advisor tailer: file ${this.file}`);
-		}
-		if (!this.file) return;
+	/** Read complete new lines from `state` ({file, offset, pending}); null when the file vanished. */
+	readNewLines(state) {
 		let size;
 		try {
-			size = statSync(this.file).size;
+			size = statSync(state.file).size;
 		} catch {
-			this.file = null;
-			return;
+			return null;
 		}
-		if (size < this.offset) {
+		if (size < state.offset) {
 			// Full rewrite (load-migration/sanitize): rescan; `seen` dedupes.
-			this.offset = 0;
-			this.pending = "";
+			state.offset = 0;
+			state.pending = "";
 		}
-		if (size === this.offset) return;
+		if (size === state.offset) return [];
 		let text;
 		try {
-			const fd = openSync(this.file, "r");
+			const fd = openSync(state.file, "r");
 			try {
-				const len = size - this.offset;
+				const len = size - state.offset;
 				const buf = Buffer.alloc(len);
-				const got = readSync(fd, buf, 0, len, this.offset);
-				this.offset += got;
+				const got = readSync(fd, buf, 0, len, state.offset);
+				state.offset += got;
 				text = buf.subarray(0, got).toString("utf8");
 			} finally {
 				closeSync(fd);
 			}
 		} catch {
-			return;
+			return [];
 		}
-		const chunk = this.pending + text;
+		const chunk = state.pending + text;
 		const nl = chunk.lastIndexOf("\n");
 		if (nl < 0) {
-			this.pending = chunk;
-			return;
+			state.pending = chunk;
+			return [];
 		}
-		this.pending = chunk.slice(nl + 1);
-		for (const line of chunk.slice(0, nl).split("\n")) {
-			if (!line.includes('"advisor"')) continue;
-			let entry;
-			try {
-				entry = JSON.parse(line);
-			} catch {
+		state.pending = chunk.slice(nl + 1);
+		return chunk.slice(0, nl).split("\n");
+	}
+
+	poll() {
+		if (!this.sessionId) return;
+		if (!this.file) {
+			this.file = findOmpSessionFile(this.sessionId);
+			if (this.file) log(`session tailer: file ${this.file}`);
+		}
+		if (this.file) {
+			const lines = this.readNewLines(this);
+			if (lines === null) {
+				this.file = null;
+			} else {
+				for (const line of lines) this.handleParentLine(line);
+			}
+		}
+		for (const [id, child] of this.children) {
+			if (!child.file) {
+				// Worker files live beside the parent under <parent-stem>/<id>.jsonl.
+				child.file = this.file ? join(this.file.slice(0, -".jsonl".length), `${id}.jsonl`) : null;
+				if (child.file && !existsSync(child.file)) child.file = null;
+				if (child.file) log(`session tailer: worker ${id} file ${child.file}`);
+			}
+			if (!child.file) continue;
+			const lines = this.readNewLines(child);
+			if (lines === null) {
+				child.file = null;
 				continue;
 			}
-			if (entry.type !== "custom_message" || entry.customType !== "advisor") continue;
-			if (typeof entry.content !== "string" || !entry.content.includes("<advisory")) continue;
-			const key = entry.id ?? entry.content;
-			if (this.seen.has(key)) continue;
-			this.seen.add(key);
-			this.emit({
-				jsonrpc: "2.0",
-				method: "session/update",
-				params: {
-					sessionId: this.sessionId,
-					update: {
-						sessionUpdate: "user_message_chunk",
-						content: { type: "text", text: entry.content },
-						messageId: crypto.randomUUID(),
-					},
-				},
-			});
+			for (const line of lines) this.handleChildLine(id, child, line);
 		}
+	}
+
+	handleParentLine(line) {
+		if (
+			!line.includes('"advisor"') &&
+			!line.includes('"vibe-session-lifecycle"') &&
+			!line.includes('"async-result"')
+		) {
+			return;
+		}
+		let entry;
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			return;
+		}
+		const key = entry.id ?? line;
+		if (this.seen.has(key)) return;
+
+		if (entry.type === "custom" && entry.customType === "vibe-session-lifecycle") {
+			const data = entry.data;
+			if (!data || typeof data !== "object" || typeof data.id !== "string") return;
+			this.seen.add(key);
+			if (data.action === "spawn") this.watchChild(data.id);
+			for (const frame of this.ext.observeVibeLifecycle(data)) this.emit(frame, true);
+			return;
+		}
+
+		if (entry.type !== "custom_message") return;
+
+		if (entry.customType === "async-result") {
+			const text = typeof entry.content === "string"
+				? entry.content
+				: Array.isArray(entry.content)
+					? entry.content.find((c) => c?.type === "text")?.text
+					: undefined;
+			if (typeof text !== "string" || !text.trim()) return;
+			this.seen.add(key);
+			const frame = this.ext.vibeAsyncResultFrame(text, entry.details);
+			if (frame) this.emit(frame);
+			return;
+		}
+
+		if (entry.customType !== "advisor") return;
+		if (typeof entry.content !== "string" || !entry.content.includes("<advisory")) return;
+		this.seen.add(key);
+		this.emit({
+			jsonrpc: "2.0",
+			method: "session/update",
+			params: {
+				sessionId: this.sessionId,
+				update: {
+					sessionUpdate: "user_message_chunk",
+					content: { type: "text", text: entry.content },
+					messageId: crypto.randomUUID(),
+				},
+			},
+		});
+	}
+
+	/** Begin tailing a vibe worker's child session file (idempotent). */
+	watchChild(id) {
+		if (typeof id !== "string" || !id || this.children.has(id)) return;
+		this.children.set(id, { file: null, offset: 0, pending: "", seen: new Set(), seenToolCalls: new Set() });
+	}
+
+	handleChildLine(workerId, child, line) {
+		if (!line.includes('"type":"message"') && !line.includes('"tool_execution_start"')) return;
+		let entry;
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			return;
+		}
+		const key = entry.id ?? line;
+		if (child.seen.has(key)) return;
+		child.seen.add(key);
+		for (const frame of this.ext.observeVibeChildEntry(workerId, entry, child)) this.emit(frame, true);
 	}
 }
 
@@ -996,6 +1173,10 @@ class ExtSurface {
 		/** toolCallId → terminal status, for subagent/cancel already_finished. */
 		this.finishedSubagents = new Map();
 		this.subagentSeq = 0;
+		/** workerId → vibe worker record (persistent across director turns). */
+		this.vibeWorkers = new Map();
+		/** toolCallId → {op, prompt?, session?} for in-flight vibe_* calls. */
+		this.vibeCalls = new Map();
 		/** selector → OMP model metadata (from `omp models --json`). */
 		this.catalog = null;
 		/** Extra client→agent requests to send right after the current one. */
@@ -1267,6 +1448,21 @@ class ExtSurface {
 
 	observeToolCallStart(update, extra) {
 		const raw = update.rawInput ?? {};
+		const toolCallId = update.toolCallId;
+		// Vibe director calls (vibe_spawn/vibe_send/vibe_wait/vibe_kill/vibe_list)
+		// are ordinary tool_call frames; remember the op so the terminal update —
+		// which carries details.spawned/screens — can synthesize subagent_*.
+		const vibeOp = vibeToolOp(update);
+		if (vibeOp) {
+			if (toolCallId) {
+				this.vibeCalls.set(toolCallId, {
+					op: vibeOp,
+					prompt: typeof raw.prompt === "string" ? raw.prompt : undefined,
+					session: typeof raw.session === "string" ? raw.session : undefined,
+				});
+			}
+			return;
+		}
 		// OMP's task tool isn't in TOOL_SHAPING, so no _meta stamp. Detect it by
 		// an explicit tool id, a bare "task" title, the task_* toolCallId prefix
 		// OMP assigns, or the task-tool input shape (prompt + description).
@@ -1278,7 +1474,6 @@ class ExtSurface {
 			(typeof raw.prompt === "string" &&
 				(raw.agent !== undefined || raw.label !== undefined || raw.task !== undefined || raw.description !== undefined));
 		if (!isTask) return;
-		const toolCallId = update.toolCallId;
 		if (!toolCallId || this.subagents.has(toolCallId)) return;
 		const subagentId = `omp-task-${++this.subagentSeq}`;
 		const childSessionId = `${this.session?.sessionId ?? "session"}:sub:${this.subagentSeq}`;
@@ -1320,10 +1515,19 @@ class ExtSurface {
 
 	observeToolCallEnd(update, extra) {
 		const toolCallId = update.toolCallId;
-		const rec = toolCallId && this.subagents.get(toolCallId);
-		if (!rec) return;
 		const out = update.rawOutput && typeof update.rawOutput === "object" ? update.rawOutput : {};
 		const details = out.details && typeof out.details === "object" ? out.details : {};
+		// Vibe tool updates carry details.{op,screens,spawned?,killed?,wait?} —
+		// the worker roster. Synthesize spawn/progress/finish from them.
+		const vibeOp = VIBE_DETAIL_OPS.has(details.op) && Array.isArray(details.screens)
+			? details.op
+			: (toolCallId && this.vibeCalls.get(toolCallId)?.op);
+		if (vibeOp) {
+			this.observeVibeToolUpdate(update, vibeOp, out, details, extra);
+			return;
+		}
+		const rec = toolCallId && this.subagents.get(toolCallId);
+		if (!rec) return;
 		// OMP's task tool returns as soon as the subagent jobs are *dispatched*;
 		// details.async.state is the aggregate over those jobs ("running" until
 		// every spawn settles — task/index.ts buildAsyncDetails). The tool_call's
@@ -1415,6 +1619,345 @@ class ExtSurface {
 			this.finishSubagent(rec, fallback, {});
 		}
 	}
+
+	// -- vibe worker synthesis (vibe-mode.md) ---------------------------------
+	//
+	// Vibe workers are persistent: they outlive the director's turns and the
+	// vibe_* tool_calls that steer them. Records are keyed by the real worker
+	// id (details.spawned.id / lifecycle event id — also the child JSONL
+	// basename and the history://<id> handle), never by toolCallId.
+
+	/**
+	 * Register a vibe worker if unknown; returns {rec, created}. A finished
+	 * record is left finished — only tombstone-revoked (or a fresh spawn event
+	 * after a stale finished mark) resurrects it.
+	 */
+	ensureVibeWorker(id, info = {}) {
+		let rec = this.vibeWorkers.get(id);
+		if (rec) {
+			if (info.cli && !rec.cli) {
+				rec.cli = info.cli;
+				rec.subagentType = `vibe-${info.cli}`;
+			}
+			if (info.agent && !rec.agent) rec.agent = info.agent;
+			if (info.description && rec.description === `vibe worker ${id}`) rec.description = info.description;
+			return { rec, created: false };
+		}
+		rec = {
+			subagentId: id,
+			childSessionId: id,
+			cli: info.cli,
+			agent: info.agent,
+			subagentType: info.cli ? `vibe-${info.cli}` : "vibe-worker",
+			description: info.description ?? `vibe worker ${id}`,
+			startedAt: typeof info.createdAt === "number" ? info.createdAt : Date.now(),
+			turns: 0,
+			toolCalls: 0,
+			errorCount: 0,
+			toolsUsed: new Set(),
+			finished: null,
+			finishSource: null,
+			lastOutput: undefined,
+		};
+		this.vibeWorkers.set(id, rec);
+		// A stale finished mark (session switch, prior tombstone) must not
+		// shadow a worker the roster says is live.
+		this.finishedSubagents.delete(id);
+		return { rec, created: true };
+	}
+
+	vibeSpawnedFrame(rec) {
+		return this.notif("_x.ai/session/update", {
+			sessionId: this.session?.sessionId,
+			update: {
+				sessionUpdate: "subagent_spawned",
+				subagent_id: rec.subagentId,
+				parent_session_id: this.session?.sessionId,
+				child_session_id: rec.childSessionId,
+				subagent_type: rec.subagentType,
+				description: rec.description,
+				context_normalized: false,
+				...(rec.agent ? { persona: rec.agent } : {}),
+			},
+		});
+	}
+
+	vibeProgressFrame(rec) {
+		return this.notif("_x.ai/session/update", {
+			sessionId: this.session?.sessionId,
+			update: {
+				sessionUpdate: "subagent_progress",
+				subagent_id: rec.subagentId,
+				child_session_id: rec.childSessionId,
+				duration_ms: Date.now() - rec.startedAt,
+				turn_count: rec.turns,
+				tool_call_count: rec.toolCalls,
+				tokens_used: 0,
+				context_window_tokens: 0,
+				context_usage_pct: 0,
+				tools_used: [...rec.toolsUsed].sort(),
+				error_count: rec.errorCount,
+			},
+		});
+	}
+
+	/**
+	 * Emit subagent_finished for a vibe worker. `source` ranks the signal:
+	 * "lifecycle" (persisted tombstone) is authoritative and may correct an
+	 * earlier screen/kill-derived finish; "screen" and "kill" are wire proxies.
+	 */
+	finishVibeWorker(id, status, opts = {}) {
+		const { rec, created } = this.ensureVibeWorker(id, opts.info);
+		const frames = created ? [this.vibeSpawnedFrame(rec)] : [];
+		if (rec.finished && !(opts.source === "lifecycle" && rec.finishSource !== "lifecycle")) {
+			return frames;
+		}
+		rec.finished = status;
+		rec.finishSource = opts.source ?? "wire";
+		this.finishedSubagents.set(id, status);
+		frames.push(this.notif("_x.ai/session/update", {
+			sessionId: this.session?.sessionId,
+			update: {
+				sessionUpdate: "subagent_finished",
+				subagent_id: rec.subagentId,
+				child_session_id: rec.childSessionId,
+				status,
+				error: status === "failed" ? (opts.error ?? "vibe worker failed") : undefined,
+				tool_calls: rec.toolCalls,
+				turns: rec.turns || 1,
+				duration_ms: Date.now() - rec.startedAt,
+				tokens_used: 0,
+				// Settled turns self-deliver an async-result that re-wakes the
+				// director; only a spawn-failed worker produces no delivery.
+				will_wake: opts.willWake ?? true,
+				output: rec.lastOutput,
+			},
+		}));
+		return frames;
+	}
+
+	/**
+	 * One vibe_* tool_call_update: details.screens is the live roster,
+	 * details.spawned/killed carry the terminal spawn/kill outcomes.
+	 */
+	observeVibeToolUpdate(update, op, out, details, extra) {
+		const toolCallId = update.toolCallId;
+		const call = toolCallId ? this.vibeCalls.get(toolCallId) : undefined;
+
+		// vibe_spawn completion: the real worker id arrives in details.spawned.
+		const spawned = details.spawned;
+		if (spawned && typeof spawned.id === "string" && spawned.id) {
+			const { rec, created } = this.ensureVibeWorker(spawned.id, {
+				cli: spawned.cli,
+				description: call?.prompt,
+			});
+			if (created) extra.push(this.vibeSpawnedFrame(rec));
+		}
+
+		// Every vibe tool result carries the roster snapshot.
+		for (const s of Array.isArray(details.screens) ? details.screens : []) {
+			if (!s || typeof s.id !== "string" || !s.id) continue;
+			if (s.state === "dead" && this.vibeWorkers.get(s.id)?.finished) continue;
+			const { rec, created } = this.ensureVibeWorker(s.id, { cli: s.cli });
+			if (created) extra.push(this.vibeSpawnedFrame(rec));
+			if (typeof s.turns === "number") rec.turns = Math.max(rec.turns, s.turns);
+			// trace is the in-flight turn's last ≤6 calls — names only, not a
+			// cumulative count; the child tailer owns the real toolCalls total.
+			for (const t of Array.isArray(s.trace) ? s.trace : []) {
+				const name = typeof t === "string" ? t.split("(", 1)[0].trim() : "";
+				if (name) rec.toolsUsed.add(name);
+			}
+			if (s.state === "dead") {
+				// Wire-visible terminal proxy; the persisted tombstone (tailer)
+				// may still correct the status with the real reason.
+				extra.push(...this.finishVibeWorker(s.id, "cancelled", { source: "screen" }));
+			} else {
+				extra.push(this.vibeProgressFrame(rec));
+			}
+		}
+
+		// vibe_kill completion: details.killed.id is the terminated worker.
+		const killedId = typeof details.killed?.id === "string" ? details.killed.id : undefined;
+		if (killedId) {
+			extra.push(...this.finishVibeWorker(killedId, "cancelled", { source: "kill" }));
+		} else if (op === "kill" && update.status === "completed" && call?.session) {
+			extra.push(...this.finishVibeWorker(call.session, "cancelled", { source: "kill" }));
+		}
+
+		if (toolCallId && (update.status === "completed" || update.status === "failed" || update.status === "cancelled")) {
+			this.vibeCalls.delete(toolCallId);
+		}
+	}
+
+	/**
+	 * One vibe-session-lifecycle entry from the parent JSONL → frames.
+	 * spawn → subagent_spawned (if the wire spawn didn't already); turn events →
+	 * progress (workers persist across turns — never finish); tombstone →
+	 * subagent_finished with the authoritative reason; tombstone-revoked →
+	 * resurrect a worker we finished on a mode-exit tombstone.
+	 */
+	observeVibeLifecycle(data) {
+		const id = data.id;
+		switch (data.action) {
+			case "spawn": {
+				const { rec, created } = this.ensureVibeWorker(id, {
+					cli: data.cli,
+					agent: data.agent,
+					createdAt: data.createdAt,
+				});
+				return created ? [this.vibeSpawnedFrame(rec)] : [];
+			}
+			case "turn-started":
+			case "turn-settled": {
+				const { rec, created } = this.ensureVibeWorker(id);
+				const frames = created ? [this.vibeSpawnedFrame(rec)] : [];
+				if (typeof data.turn === "number") rec.turns = Math.max(rec.turns, data.turn);
+				frames.push(this.vibeProgressFrame(rec));
+				return frames;
+			}
+			case "tombstone": {
+				const status =
+					data.reason === "explicit-kill" || data.reason === "mode-exit" ? "cancelled" : "failed";
+				return this.finishVibeWorker(id, status, {
+					source: "lifecycle",
+					error: status === "failed" ? `vibe worker terminated (${data.reason})` : undefined,
+					willWake: data.reason !== "spawn-failed",
+				});
+			}
+			case "tombstone-revoked": {
+				const rec = this.vibeWorkers.get(id);
+				if (!rec || !rec.finished) return [];
+				rec.finished = null;
+				rec.finishSource = null;
+				this.finishedSubagents.delete(id);
+				return [this.vibeSpawnedFrame(rec)];
+			}
+			default:
+				return [];
+		}
+	}
+
+	/**
+	 * A delivered async-result follow-up (custom_message/customType:
+	 * "async-result") — the settled worker turn's result text, invisible on the
+	 * wire. Rendered as a user_message_chunk flagged `interjection` so the
+	 * pager paints a distinct block instead of merging it into agent text.
+	 * Also feeds the owning worker's lastOutput for subagent_finished.output.
+	 */
+	vibeAsyncResultFrame(text, details) {
+		const jobs = Array.isArray(details?.jobs) ? details.jobs : [];
+		for (const job of jobs) {
+			const workerId = vibeWorkerIdFromJobId(job?.jobId);
+			const rec = workerId && this.vibeWorkers.get(workerId);
+			if (rec) rec.lastOutput = vibeTurnResponseText(text) ?? rec.lastOutput;
+		}
+		return {
+			jsonrpc: "2.0",
+			method: "session/update",
+			params: {
+				sessionId: this.session?.sessionId,
+				update: {
+					sessionUpdate: "user_message_chunk",
+					content: { type: "text", text: stripSystemNotice(text) },
+					messageId: crypto.randomUUID(),
+					_meta: { interjection: true },
+				},
+			},
+		};
+	}
+
+	/**
+	 * One entry from a vibe worker's child session JSONL → child session/update
+	 * frames (standard `session/update` method — the pager routes by sessionId
+	 * into subagent_views; the x.ai ext carrier drops non-xAI child updates).
+	 * `child` is the tailer's per-worker state ({seenToolCalls}).
+	 */
+	observeVibeChildEntry(workerId, entry, child) {
+		const frames = [];
+		const push = (update) =>
+			frames.push({
+				jsonrpc: "2.0",
+				method: "session/update",
+				params: { sessionId: workerId, update },
+			});
+		const rec = this.vibeWorkers.get(workerId);
+
+		const pushToolCall = (toolCallId, toolName, args, intent) => {
+			if (!toolCallId || child.seenToolCalls.has(toolCallId)) return;
+			child.seenToolCalls.add(toolCallId);
+			if (rec) {
+				rec.toolCalls++;
+				if (toolName) rec.toolsUsed.add(toolName);
+			}
+			const update = {
+				sessionUpdate: "tool_call",
+				toolCallId,
+				title: vibeChildToolTitle(toolName, args, intent),
+				kind: vibeChildToolKind(toolName),
+				status: "pending",
+				rawInput: args && typeof args === "object" ? args : {},
+			};
+			if (optsRef.shape) {
+				const meta = shapeToolUpdate(toolName, update);
+				if (meta) update._meta = { "x.ai/tool": meta };
+			}
+			push(update);
+		};
+
+		if (entry.type === "custom" && entry.customType === "tool_execution_start") {
+			// Fallback for a call whose assistant-message item was missed; the
+			// persisted args here are only the command/path summary.
+			const d = entry.data;
+			if (d && typeof d === "object") pushToolCall(d.toolCallId, d.toolName, d.args, d.intent);
+			return frames;
+		}
+
+		if (entry.type !== "message") return frames;
+		const msg = entry.message;
+		if (!msg || typeof msg !== "object") return frames;
+		const messageId = crypto.randomUUID();
+
+		if (msg.role === "user") {
+			for (const block of vibeContentBlocks(msg.content)) {
+				push({ sessionUpdate: "user_message_chunk", content: block, messageId });
+			}
+			return frames;
+		}
+		if (msg.role === "assistant") {
+			const content = Array.isArray(msg.content) ? msg.content : [];
+			for (const item of content) {
+				if (!item || typeof item !== "object") continue;
+				if (item.type === "text" && typeof item.text === "string" && item.text.length > 0) {
+					push({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: item.text }, messageId });
+				} else if (item.type === "thinking" && typeof item.thinking === "string" && item.thinking.length > 0) {
+					push({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: item.thinking }, messageId });
+				} else if ((item.type === "toolCall" || item.type === "tool_use") && typeof item.id === "string") {
+					// Full arguments live on the assistant message's toolCall item.
+					const args = item.arguments ?? item.input;
+					pushToolCall(item.id, item.name, args, item.intent);
+				}
+			}
+			if (frames.length === 0 && typeof msg.errorMessage === "string" && msg.errorMessage) {
+				push({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: msg.errorMessage }, messageId });
+			}
+			return frames;
+		}
+		if (msg.role === "toolResult" && typeof msg.toolCallId === "string") {
+			pushToolCall(msg.toolCallId, msg.toolName, msg.details?.path ? { path: msg.details.path } : {}, undefined);
+			if (msg.isError === true && rec) rec.errorCount++;
+			const texts = vibeContentBlocks(msg.content);
+			push({
+				sessionUpdate: "tool_call_update",
+				toolCallId: msg.toolCallId,
+				status: msg.isError === true ? "failed" : "completed",
+				rawOutput: { content: msg.content, details: msg.details },
+				...(texts.length ? { content: texts.map((t) => ({ type: "content", content: t })) } : {}),
+			});
+			return frames;
+		}
+		return frames;
+	}
+
 
 	/**
 	 * Split a `user_message_chunk` carrying `<advisory>` elements into one chunk
@@ -1825,22 +2368,41 @@ class ExtSurface {
 			case "subagent/list_running":
 				return this.answer({
 					result: {
-						subagents: [...this.subagents.values()].map((r) => ({
-							subagentId: r.subagentId,
-							parentSessionId: this.session?.sessionId ?? "",
-							childSessionId: r.childSessionId,
-							subagentType: r.subagentType,
-							description: r.description,
-							startedAtEpochMs: r.startedAt,
-							durationMs: Date.now() - r.startedAt,
-							turnCount: 0,
-							toolCallCount: r.toolCalls,
-							tokensUsed: 0,
-							contextWindowTokens: this.usage?.size ?? 0,
-							contextUsagePct: this.usage?.size ? Math.min(100, Math.round(((this.usage?.used ?? 0) / this.usage.size) * 100)) : 0,
-							toolsUsed: [],
-							errorCount: 0,
-						})),
+						subagents: [
+							...[...this.subagents.values()].map((r) => ({
+								subagentId: r.subagentId,
+								parentSessionId: this.session?.sessionId ?? "",
+								childSessionId: r.childSessionId,
+								subagentType: r.subagentType,
+								description: r.description,
+								startedAtEpochMs: r.startedAt,
+								durationMs: Date.now() - r.startedAt,
+								turnCount: 0,
+								toolCallCount: r.toolCalls,
+								tokensUsed: 0,
+								contextWindowTokens: this.usage?.size ?? 0,
+								contextUsagePct: this.usage?.size ? Math.min(100, Math.round(((this.usage?.used ?? 0) / this.usage.size) * 100)) : 0,
+								toolsUsed: [],
+								errorCount: 0,
+							})),
+							// Live vibe workers persist across director turns.
+							...[...this.vibeWorkers.values()].filter((r) => !r.finished).map((r) => ({
+								subagentId: r.subagentId,
+								parentSessionId: this.session?.sessionId ?? "",
+								childSessionId: r.childSessionId,
+								subagentType: r.subagentType,
+								description: r.description,
+								startedAtEpochMs: r.startedAt,
+								durationMs: Date.now() - r.startedAt,
+								turnCount: r.turns,
+								toolCallCount: r.toolCalls,
+								tokensUsed: 0,
+								contextWindowTokens: this.usage?.size ?? 0,
+								contextUsagePct: this.usage?.size ? Math.min(100, Math.round(((this.usage?.used ?? 0) / this.usage.size) * 100)) : 0,
+								toolsUsed: [...r.toolsUsed].sort(),
+								errorCount: r.errorCount,
+							})),
+						],
 					},
 				});
 			case "subagent/message":
@@ -2115,6 +2677,11 @@ class ExtSurface {
 			this.finishedSubagents.set(rec.subagentId, "cancelled");
 		}
 		this.subagents.clear();
+		for (const rec of this.vibeWorkers.values()) {
+			if (!rec.finished) this.finishedSubagents.set(rec.subagentId, "cancelled");
+		}
+		this.vibeWorkers.clear();
+		this.vibeCalls.clear();
 		this.turns = 0;
 		this.lastCost = null;
 		this.turnTokens = { input: 0, output: 0, total: 0, cacheRead: 0, cacheWrite: 0 };
@@ -2620,11 +3187,18 @@ async function runLive(opts) {
 		}
 	};
 
-	// Advisor notes never reach the wire (see AdvisorTailer); tail the OMP
-	// session file and synthesize the user_message_chunk frames instead.
-	// Emitted frames run through the same observe/forward pipeline as real
-	// agent frames so advisory splitting and meta-stamping apply identically.
-	const tailer = new AdvisorTailer((frame) => {
+	// Advisor notes, vibe lifecycle, async results, and worker transcripts never
+	// reach the wire (see SessionTailer); tail the OMP session files and
+	// synthesize the missing frames instead. raw=false frames run through the
+	// same observe/forward pipeline as real agent frames so advisory splitting
+	// applies identically; raw=true frames are already-final synthesized
+	// notifications (subagent_*, child-session updates) forwarded verbatim.
+	const tailer = new SessionTailer((frame, raw) => {
+		if (raw) {
+			tape?.record("to_client", frame);
+			forward(frame);
+			return;
+		}
 		const extras = ext.observeToClient(frame);
 		tape?.record("to_client", frame);
 		forward(frame);
@@ -2632,7 +3206,7 @@ async function runLive(opts) {
 			tape?.record("to_client", extra);
 			forward(extra);
 		}
-	});
+	}, ext);
 	// session/load and session/resume responses carry no sessionId; remember
 	// the id from the forwarded request so the response can attach the tailer.
 	const pendingLoadSession = new Map();
@@ -3116,5 +3690,6 @@ function selfcheck(opts, header, entries) {
 
 const opts = parseArgs(Bun.argv.slice(2));
 optsRef.quiet = opts.quiet;
+optsRef.shape = opts.shape;
 if (opts.replay) await runReplay(opts);
 else await runLive(opts);
