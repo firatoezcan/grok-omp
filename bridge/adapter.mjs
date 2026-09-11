@@ -1282,12 +1282,20 @@ class ExtSurface {
 		if (!toolCallId || this.subagents.has(toolCallId)) return;
 		const subagentId = `omp-task-${++this.subagentSeq}`;
 		const childSessionId = `${this.session?.sessionId ?? "session"}:sub:${this.subagentSeq}`;
-		const description = raw.prompt ?? raw.description ?? update.title ?? "subagent";
+		// Batch spawns arrive as {context, tasks:[{agent, task}]} — the first
+		// task entry carries the agent type and per-spawn prompt.
+		const firstTask = Array.isArray(raw.tasks) && raw.tasks.length > 0 ? raw.tasks[0] : undefined;
+		const agentName =
+			(typeof raw.agent === "string" && raw.agent) ||
+			(typeof firstTask?.agent === "string" && firstTask.agent) ||
+			"general-purpose";
+		const description =
+			raw.prompt ?? raw.description ?? (typeof firstTask?.task === "string" ? firstTask.task : undefined) ?? update.title ?? "subagent";
 		this.subagents.set(toolCallId, {
 			subagentId,
-			childSessionId,
 			toolCallId,
-			subagentType: typeof raw.agent === "string" && raw.agent ? raw.agent : "general-purpose",
+			childSessionId,
+			subagentType: agentName,
 			description,
 			startedAt: Date.now(),
 			toolCalls: 0,
@@ -1370,7 +1378,10 @@ class ExtSurface {
 	 * terminal status so `x.ai/subagent/cancel` answers already_finished.
 	 */
 	finishSubagent(rec, status, out) {
+		// Index by both ids: the pager cancels by subagent_id, but a caller may
+		// also address the row by its ACP toolCallId.
 		this.finishedSubagents.set(rec.subagentId, status);
+		if (rec.toolCallId) this.finishedSubagents.set(rec.toolCallId, status);
 		this.subagents.delete(rec.toolCallId);
 		const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
 		this.outToClient.push(this.notif("_x.ai/session/update", {
