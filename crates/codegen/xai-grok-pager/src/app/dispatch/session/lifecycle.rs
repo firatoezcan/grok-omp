@@ -733,6 +733,7 @@ fn configure_agent_composer(app: &mut AppView, agent_id: AgentId) {
     let screen_mode = app.screen_mode;
     let announcements = app.active_announcements.clone();
     let restricted = app.tier_restricted_commands.clone();
+    let disabled_commands = app.omp_disabled_commands().to_vec();
     let plugins_visible = !app.appearance.disable_plugins;
     let Some(agent) = app.agents.get_mut(&agent_id) else {
         return;
@@ -751,6 +752,7 @@ fn configure_agent_composer(app: &mut AppView, agent_id: AgentId) {
         screen_mode,
         &announcements,
         &restricted,
+        &disabled_commands,
     );
     agent
         .prompt
@@ -1195,6 +1197,7 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
         app.deferred_startup.pending_chat
     };
     {
+        let disabled_commands = app.omp_disabled_commands().to_vec();
         let agent = app.agents.get_mut(&agent_id).unwrap();
         agent.prompt.set_compact(app.appearance.prompt.compact);
         agent.prompt.adopt_slash_mru(app.slash_mru.clone());
@@ -1212,6 +1215,7 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
             app.screen_mode,
             &app.active_announcements,
             &app.tier_restricted_commands,
+            &disabled_commands,
         );
         agent.chat_kind = chat_kind;
         agent.conversation_entry = chat_kind;

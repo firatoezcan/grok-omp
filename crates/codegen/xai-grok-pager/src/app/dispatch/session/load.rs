@@ -224,6 +224,7 @@ fn dispatch_load_session_ungated(
     app.agents.insert(agent_id, agent);
     identity_rebind.apply(app);
     let conversation_entry = session_opens_as_chat(app, chat_kind);
+    let disabled_commands = app.omp_disabled_commands().to_vec();
     let agent_mut = app.agents.get_mut(&agent_id).unwrap();
     agent_mut.attached_as_viewer = true;
     agent_mut.begin_replay_window();
@@ -251,6 +252,7 @@ fn dispatch_load_session_ungated(
         app.screen_mode,
         &app.active_announcements,
         &app.tier_restricted_commands,
+        &disabled_commands,
     );
     agent_mut.chat_kind = chat_kind || app.chat_mode;
     agent_mut.conversation_entry = conversation_entry;
@@ -1140,6 +1142,7 @@ pub(in crate::app::dispatch) fn dispatch_load_session_with_restore(
     );
     app.agents.insert(agent_id, agent);
     let conversation_entry = session_opens_as_chat(app, false);
+    let disabled_commands = app.omp_disabled_commands().to_vec();
     {
         let agent = app.agents.get_mut(&agent_id).unwrap();
         agent.attached_as_viewer = true;
@@ -1160,6 +1163,7 @@ pub(in crate::app::dispatch) fn dispatch_load_session_with_restore(
             app.screen_mode,
             &app.active_announcements,
             &app.tier_restricted_commands,
+            &disabled_commands,
         );
         agent.chat_kind = app.chat_mode;
         agent.conversation_entry = conversation_entry;

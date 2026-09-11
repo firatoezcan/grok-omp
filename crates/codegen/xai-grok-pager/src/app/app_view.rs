@@ -657,6 +657,10 @@ pub struct AppView {
     /// gated on this so a foreign agent's answers are trusted as authoritative.
     /// Defaults `true` so tests and in-process spawns keep first-party behavior.
     pub is_grok_shell: bool,
+    /// Whether the connected agent is an Oh My Pi instance (`_meta.ompAgent` on initialize, or
+    /// `agent_info.name == "oh-my-pi"`). Gates the Settings › OMP section and the disabled-command
+    /// enforcement so foreign agents never see or honor the OMP-only list.
+    pub is_omp_agent: bool,
     /// App-level credit balance used to show the usage warning on the welcome screen before any agent session exists.
     pub credit_balance: Option<crate::views::credit_bar::CreditBalance>,
     /// App-level auto top-up rule paired with `credit_balance` for the warning.
@@ -1657,6 +1661,7 @@ impl AppView {
             tier_restricted_commands: Vec::new(),
             leader_mode: false,
             is_grok_shell: true,
+            is_omp_agent: false,
             credit_balance: None,
             auto_topup: None,
             billing_poll_wanted: false,
@@ -1775,6 +1780,15 @@ impl AppView {
     /// Used to gate the Ctrl+Space / F8 voice keybinding, which bypasses the slash registry entirely (see [`crate::app::dispatch::voice`]).
     pub fn is_voice_tier_restricted(&self) -> bool {
         self.tier_restricted_commands.iter().any(|c| c == "voice")
+    }
+    /// The OMP disabled-command list, gated on `is_omp_agent`: non-OMP agents always get an empty
+    /// slice so the setting can never leak onto a foreign agent's registry.
+    pub fn omp_disabled_commands(&self) -> &[String] {
+        if self.is_omp_agent {
+            &self.current_ui.omp_disabled_commands
+        } else {
+            &[]
+        }
     }
     /// Draw-time expiry can flip the live-announcement predicate between pushes.
     /// Resync the slash gate only when it diverges from the stored flags (checked per frame, fan-out runs only on change).

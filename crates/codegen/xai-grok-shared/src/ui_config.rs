@@ -169,6 +169,11 @@ pub struct UiConfig {
     /// `[ui.status_line]`. Disabled by default.
     #[serde(default, skip_serializing_if = "status_line_should_not_be_saved")]
     pub status_line: StatusLineConfig,
+    /// Slash commands the user disabled for the connected Oh My Pi agent (`[ui].omp_disabled_commands`).
+    /// Names are the ACP-advertised command names (no leading `/`). Written by the pager's settings modal
+    /// (Settings › OMP › Slash commands); empty/absent means every advertised command is enabled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub omp_disabled_commands: Vec<String>,
 }
 
 fn status_line_should_not_be_saved(status_line: &StatusLineConfig) -> bool {
@@ -288,6 +293,7 @@ impl Default for UiConfig {
             follow_up_behavior: None,
             display_refresh: DisplayRefreshSettings::default(),
             status_line: StatusLineConfig::default(),
+            omp_disabled_commands: Vec::new(),
         }
     }
 }

@@ -766,6 +766,13 @@ fn format_default_for_prompt(
         }
         SettingValue::String(s) => format!("\"{s}\""),
         SettingValue::Int(i) => i.to_string(),
+        SettingValue::StringList(l) => {
+            if l.is_empty() {
+                "none".to_owned()
+            } else {
+                format!("{} disabled", l.len())
+            }
+        }
     }
 }
 /// A clickable button region from the rendered modal.

@@ -403,6 +403,7 @@ impl AgentView {
                 crate::views::settings_modal::SettingsModalMode::FilterFocused
                     | crate::views::settings_modal::SettingsModalMode::PickingEnum { .. }
                     | crate::views::settings_modal::SettingsModalMode::PickingGroup { .. }
+                    | crate::views::settings_modal::SettingsModalMode::OmpCommands { .. }
                     | crate::views::settings_modal::SettingsModalMode::EditingValue { .. }
             ) {
                 let out = crate::views::settings_modal::handle_settings_key(state, key);

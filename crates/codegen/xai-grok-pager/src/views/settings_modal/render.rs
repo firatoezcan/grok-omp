@@ -88,6 +88,15 @@ pub fn render_settings_modal(
                     MODAL_TITLE
                 }
             }
+            SettingsMode::OmpCommands { key, .. } => {
+                if let Some(meta) = state.registry.find(key) {
+                    breadcrumb_owned =
+                        format!("{MODAL_TITLE} {} {}", crate::glyphs::chevron(), meta.label);
+                    &breadcrumb_owned
+                } else {
+                    MODAL_TITLE
+                }
+            }
             _ => MODAL_TITLE,
         }
     };
@@ -178,6 +187,7 @@ pub fn render_settings_modal(
         SettingsModeKind::PickingEnum
             | SettingsModeKind::PickingGroup
             | SettingsModeKind::EditingString
+            | SettingsModeKind::OmpCommands
             | SettingsModeKind::EditingInt
     );
     match state.state.mode_kind() {
@@ -189,6 +199,11 @@ pub fn render_settings_modal(
         SettingsModeKind::PickingGroup => {
             state.reset_hit_rects();
             let rects = render_picking_group(buf, inner_area, state, &theme);
+            state.picker_choice_rects = rects;
+        }
+        SettingsModeKind::OmpCommands => {
+            state.reset_hit_rects();
+            let rects = render_omp_commands(buf, inner_area, state, &theme);
             state.picker_choice_rects = rects;
         }
         SettingsModeKind::EditingString | SettingsModeKind::EditingInt => {
@@ -615,13 +630,28 @@ pub(super) fn render_rows(
                 let is_selected = row_idx == state.selected;
                 let is_expanded = expanded_snapshot.contains(key);
 
-                // Group rows carry no scalar value; render a chevron row that opens the sub-sheet (skips the value/edited machinery below)
-                if matches!(meta.kind, SettingKind::Group { .. }) {
+                // Group/OmpCommands rows carry no scalar value; render a chevron row that opens the
+                // sub-sheet (skips the value/edited machinery below). OmpCommands shows a "N disabled" summary.
+                if matches!(
+                    meta.kind,
+                    SettingKind::Group { .. } | SettingKind::OmpCommands
+                ) {
                     let is_hovered = hover_row_snapshot == Some(row_idx);
+                    let summary = if matches!(meta.kind, SettingKind::OmpCommands) {
+                        let disabled = state.ui_snapshot.omp_disabled_commands.len();
+                        if disabled > 0 {
+                            Some(format!("{disabled} disabled"))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
                     let value_rect = render_setting_group_row(
                         buf,
                         label_rect,
                         meta,
+                        summary.as_deref(),
                         is_selected,
                         is_hovered,
                         is_expanded,
@@ -784,8 +814,10 @@ fn compute_filtered_row_heights(state: &SettingsModalState, area_width: u16) -> 
                     heights.push(1);
                     continue;
                 };
-                // Group rows carry no value; the height is the chevron row plus the expanded description (cap 8), agreeing with the forward render loop
-                if matches!(meta.kind, SettingKind::Group { .. }) {
+                if matches!(
+                    meta.kind,
+                    SettingKind::Group { .. } | SettingKind::OmpCommands
+                ) {
                     let mut h: u16 = 1;
                     if state.expanded_keys.contains(key) {
                         h = h.saturating_add(wrapped_description_height(meta, None, area_width, 8));
@@ -1354,6 +1386,209 @@ fn render_picking_group(
             buf.set_span(value_x, y, &Span::styled(value_text, value_style), value_w);
         }
         y = y.saturating_add(1);
+    }
+    rects
+}
+
+/// Render the OMP commands sub-sheet: title, description, and one scrollable row per advertised
+/// command (`<marker> /name · description … <on/off>`). The marker reflects the enabled state
+/// (filled = on, hollow = off); the focused row is highlighted. Returns the per-command hit-rects
+/// (parallel to `pager_snapshot.omp_commands`) for mouse routing.
+/// Mirrors `render_picking_group` but sources rows from the live ACP catalog and scrolls.
+fn render_omp_commands(
+    buf: &mut Buffer,
+    area: Rect,
+    state: &SettingsModalState,
+    theme: &Theme,
+) -> Vec<Rect> {
+    let (group_key, cmd_idx) = match &state.state.mode {
+        SettingsMode::OmpCommands { key, cmd_idx } => (*key, *cmd_idx),
+        _ => unreachable!("omp renderer requires OmpCommands state"),
+    };
+    let Some(group_meta) = state.registry.find(group_key) else {
+        return Vec::new();
+    };
+    let commands = state.omp_commands();
+    if area.width == 0 || area.height == 0 {
+        return Vec::new();
+    }
+
+    // Chooser shape: title + gap (2 rows) before the description renders
+    let header_rows = render_sub_pane_header(
+        buf,
+        area,
+        theme,
+        group_meta.label,
+        group_meta.description,
+        2,
+    );
+    if area.height <= header_rows {
+        return Vec::new();
+    }
+    let list_y = area.y + header_rows;
+    let max_rows_h = area.height.saturating_sub(header_rows) as usize;
+    if max_rows_h == 0 {
+        return Vec::new();
+    }
+
+    if commands.is_empty() {
+        let empty_style = Style::default().fg(theme.gray_dim).bg(theme.bg_base);
+        let text = "No commands advertised yet";
+        let w = (text.width() as u16).min(area.width);
+        buf.set_span(area.x, list_y, &Span::styled(text, empty_style), w);
+        return Vec::new();
+    }
+
+    // Fixed 1-line rows: the scroll offset is the smallest top index that keeps `cmd_idx` visible,
+    // reserving one row for the "… N more" indicator when the list overflows.
+    let needs_overflow = commands.len() > max_rows_h;
+    let visible_h = if needs_overflow {
+        max_rows_h.saturating_sub(1).max(1)
+    } else {
+        max_rows_h
+    };
+    let scroll_offset = if cmd_idx >= visible_h {
+        cmd_idx + 1 - visible_h
+    } else {
+        0
+    };
+    let visible_end = (scroll_offset + visible_h).min(commands.len());
+
+    let mut rects: Vec<Rect> = vec![Rect::default(); commands.len()];
+    let mut y = list_y;
+    for (i, cmd) in commands
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(visible_end - scroll_offset)
+    {
+        if y >= area.y + area.height {
+            break;
+        }
+        let is_focused = i == cmd_idx;
+        let is_hovered = !is_focused && state.hover_row == Some(i);
+        let bg = settings_list_row_bg(theme, is_focused, is_hovered);
+        let row_rect = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: 1,
+        };
+        buf.set_style(row_rect, Style::default().bg(bg));
+        // Reset palettes: reverse-video focus/hover cue.
+        if let Some(ov) = settings_row_overlay(theme, is_focused, is_hovered) {
+            buf.set_style(row_rect, ov);
+        }
+        rects[i] = row_rect;
+
+        let on = state.omp_command_enabled(&cmd.name);
+        // The marker doubles as the enabled indicator: filled = enabled, hollow = disabled.
+        let marker = if on {
+            crate::glyphs::filled_dot()
+        } else {
+            "\u{25CB}"
+        };
+        let marker_style = if on {
+            Style::default().fg(theme.accent_user).bg(bg)
+        } else {
+            Style::default().fg(theme.gray).bg(bg)
+        };
+        let name_style = if is_focused {
+            Style::default()
+                .fg(theme.text_primary)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text_primary).bg(bg)
+        };
+        let desc_style = Style::default().fg(theme.gray).bg(bg);
+        let value_text = if on { "on" } else { "off" };
+        let value_style = if on {
+            Style::default().fg(theme.accent_user).bg(bg)
+        } else {
+            Style::default().fg(theme.gray).bg(bg)
+        };
+
+        // " <marker>  /name · description … <value> " (value right-aligned with a pad).
+        buf.set_span(area.x, y, &Span::styled(" ", name_style), 1.min(area.width));
+        if area.width > 1 {
+            buf.set_span(
+                area.x + 1,
+                y,
+                &Span::styled(marker, marker_style),
+                PICKER_MARKER_W.min(area.width - 1),
+            );
+        }
+        let name_x = area.x.saturating_add(PICKER_PREFIX_W);
+        let value_w = value_text.width() as u16;
+        let value_x = (area.x + area.width)
+            .saturating_sub(value_w + 1)
+            .max(name_x);
+        if value_x > name_x {
+            let name_room = (value_x - name_x).saturating_sub(1) as usize;
+            let name_text = format!("/{}", cmd.name);
+            let name_shown: std::borrow::Cow<'_, str> = if name_text.width() <= name_room {
+                std::borrow::Cow::Owned(name_text)
+            } else {
+                std::borrow::Cow::Owned(truncate_str(&name_text, name_room))
+            };
+            let name_w = (name_shown.width() as u16).min(value_x - name_x - 1);
+            buf.set_span(
+                name_x,
+                y,
+                &Span::styled(name_shown.as_ref(), name_style),
+                name_w,
+            );
+
+            // Description after the name, separated by " · ", truncated to the remaining room.
+            let desc = cmd.description.trim();
+            let after_name_x = name_x.saturating_add(name_w);
+            if !desc.is_empty() && after_name_x + PICKER_SEPARATOR_W < value_x {
+                let sep_x = after_name_x;
+                buf.set_span(
+                    sep_x,
+                    y,
+                    &Span::styled(PICKER_SEPARATOR, desc_style),
+                    PICKER_SEPARATOR_W.min(value_x - sep_x),
+                );
+                let desc_x = sep_x + PICKER_SEPARATOR_W;
+                let desc_room = (value_x - desc_x).saturating_sub(1) as usize;
+                if desc_room > 0 {
+                    let desc_text: std::borrow::Cow<'_, str> = if desc.width() <= desc_room {
+                        std::borrow::Cow::Borrowed(desc)
+                    } else {
+                        std::borrow::Cow::Owned(truncate_str(desc, desc_room))
+                    };
+                    let desc_w = (desc_text.width() as u16).min(value_x - desc_x - 1);
+                    buf.set_span(
+                        desc_x,
+                        y,
+                        &Span::styled(desc_text.as_ref(), desc_style),
+                        desc_w,
+                    );
+                }
+            }
+        }
+        if value_x + value_w <= area.x + area.width {
+            buf.set_span(value_x, y, &Span::styled(value_text, value_style), value_w);
+        }
+        y = y.saturating_add(1);
+    }
+
+    // ── Overflow indicator: "… N more" on the row right below the last rendered command ──
+    if needs_overflow && visible_end < commands.len() {
+        let more_count = commands.len() - visible_end;
+        if y < area.y + area.height {
+            let overflow_style = Style::default().fg(theme.gray_dim).bg(theme.bg_base);
+            let raw = format!("\u{2026} {more_count} more");
+            let overflow_w = (raw.width() as u16).min(area.width);
+            buf.set_span(
+                area.x,
+                y,
+                &Span::styled(raw.as_str(), overflow_style),
+                overflow_w,
+            );
+        }
     }
     rects
 }
@@ -2093,6 +2328,13 @@ pub(super) fn value_display(
         }
         SettingValue::Enum(e) => display_for_enum_canonical(&meta.kind, e).to_string(),
         SettingValue::Int(i) => i.to_string(),
+        SettingValue::StringList(l) => {
+            if l.is_empty() {
+                "none".to_string()
+            } else {
+                format!("{} disabled", l.len())
+            }
+        }
     };
     if lock == Some(CodingDataSharingLock::TeamManaged) {
         display.push_str(ROW_ADMIN_MANAGED_SUFFIX);
@@ -2499,13 +2741,15 @@ fn render_setting_row_no_value(
     );
 }
 
-/// Render a `Group` row in the Browse list: a triangle-prefixed label with a trailing chevron (opens the sub-sheet).
-/// Carries no value column.
+/// Render a `Group`/`OmpCommands` row in the Browse list: a triangle-prefixed label with a trailing
+/// chevron (opens the sub-sheet). Carries no value column; `summary` (e.g. "2 disabled") renders
+/// dimmed between the label and the chevron when present.
 /// Returns the chevron hit-rect so a click on it opens the sub-sheet like an Enum row.
 fn render_setting_group_row(
     buf: &mut Buffer,
     area: Rect,
     meta: &SettingMeta,
+    summary: Option<&str>,
     is_selected: bool,
     is_hovered: bool,
     is_expanded: bool,
@@ -2541,6 +2785,15 @@ fn render_setting_group_row(
             &Span::styled(&label_text, label_style),
             label_w,
         );
+    }
+    // Optional summary (e.g. "2 disabled") sits right-aligned just left of the chevron.
+    if let Some(summary) = summary {
+        let summary_style = Style::default().fg(theme.gray).bg(bg);
+        let summary_x = chevron_x.saturating_sub(summary.width() as u16 + 1);
+        if summary_x > area.x.saturating_add(label_w) {
+            let w = (summary.width() as u16).min(chevron_x.saturating_sub(summary_x));
+            buf.set_span(summary_x, area.y, &Span::styled(summary, summary_style), w);
+        }
     }
     if chevron_w > 0 && chevron_x >= area.x.saturating_add(label_w) {
         buf.set_span(
@@ -2753,6 +3006,23 @@ pub(super) fn build_shortcuts(state: &SettingsModalState) -> Vec<Shortcut<'stati
             },
         ],
         SettingsMode::PickingGroup { .. } => vec![
+            Shortcut {
+                label: "\u{2191}/\u{2193}/j/k nav",
+                clickable: false,
+                id: 0,
+            },
+            Shortcut {
+                label: "Space/Enter toggle",
+                clickable: false,
+                id: 0,
+            },
+            Shortcut {
+                label: "Esc back",
+                clickable: false,
+                id: 0,
+            },
+        ],
+        SettingsMode::OmpCommands { .. } => vec![
             Shortcut {
                 label: "\u{2191}/\u{2193}/j/k nav",
                 clickable: false,

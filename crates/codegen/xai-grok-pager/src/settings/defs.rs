@@ -1568,5 +1568,22 @@ pub fn default_settings() -> Vec<SettingMeta> {
             restart_required: false,
             hidden_in_minimal: false,
         },
+        // OMP section: visible only when the connected agent is Oh My Pi (`omp_agent` snapshot gate
+        // in `build_rows`). The row opens a sub-sheet listing every slash command the agent
+        // advertised via `available_commands_update`; toggles persist to `[ui].omp_disabled_commands`.
+        SettingMeta {
+            key: "omp_disabled_commands",
+            category: SettingCategory::Omp,
+            owner: SettingOwner::Shell,
+            label: "Slash commands",
+            description: "Slash commands advertised by the connected Oh My Pi agent. \
+                          Disabled commands are hidden from completion and blocked when typed.",
+            keywords: &[
+                "omp", "oh-my-pi", "slash", "command", "commands", "disable", "enable", "agent",
+            ],
+            kind: SettingKind::OmpCommands,
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
     ]
 }

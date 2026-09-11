@@ -1179,6 +1179,7 @@ pub(crate) async fn run(
     // `leader_mode` only controls whether we additionally poll the leader roster (see the roster-poll arm below)
     app.leader_mode = connection.leader_status_rx.is_some();
     app.is_grok_shell = connection.is_grok_shell;
+    app.is_omp_agent = connection.is_omp_agent;
     app.screen_mode = term_state.screen_mode;
     // `AppView::new` precedes the terminal's resolved screen mode
     // Rebuild the registry at this I/O boundary; the later config-aware rebuild preserves this mode while adding the optional mouse-reporting action
@@ -3902,8 +3903,7 @@ async fn drain_and_process(
                         routed.paste_provenance,
                     );
                     if space_hold.post_route(app) {
-                        let effs =
-                            dispatch::dispatch(Action::EnableVoiceMode, app);
+                        let effs = dispatch::dispatch(Action::EnableVoiceMode, app);
                         if process_effects(effs, tasks, app, progress_tx) {
                             return true;
                         }
@@ -5355,13 +5355,9 @@ mod tests {
         let live_since = base - Duration::from_secs(1);
         // "hi x" typed at human speed: 300ms between keystrokes, far outside
         // the auto-repeat band.
-        for (i, code) in [
-            KeyCode::Char('i'),
-            KeyCode::Char(' '),
-            KeyCode::Char('x'),
-        ]
-        .into_iter()
-        .enumerate()
+        for (i, code) in [KeyCode::Char('i'), KeyCode::Char(' '), KeyCode::Char('x')]
+            .into_iter()
+            .enumerate()
         {
             let _ = input_tx.send(timed(
                 Event::Key(KeyEvent::new_with_kind(

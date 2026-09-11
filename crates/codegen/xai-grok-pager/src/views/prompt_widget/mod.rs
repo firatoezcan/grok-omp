@@ -1293,6 +1293,14 @@ impl PromptWidget {
             .set_restricted_commands(names);
     }
 
+    /// Replace the disabled slash-command list (Settings › OMP; see
+    /// [`crate::slash::registry::CommandRegistry::set_disabled_commands`]).
+    pub(crate) fn set_disabled_commands(&mut self, names: &[String]) {
+        self.slash_controller
+            .registry_mut()
+            .set_disabled_commands(names);
+    }
+
     /// Access the current slash snapshot (for dropdown rendering).
     pub fn slash_snapshot(&self) -> crate::slash::SlashSnapshot {
         self.slash_state.snapshot()

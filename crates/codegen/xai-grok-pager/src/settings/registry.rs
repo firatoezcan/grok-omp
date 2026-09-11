@@ -38,6 +38,9 @@ pub enum SettingCategory {
     Models,
     Session,
     Advanced,
+    /// Oh My Pi agent settings. Rows in this category render only when the connected
+    /// agent is OMP (`PagerLocalSnapshot::omp_agent`); see `build_rows`.
+    Omp,
 }
 
 impl SettingCategory {
@@ -51,6 +54,7 @@ impl SettingCategory {
         Self::Models,
         Self::Session,
         Self::Advanced,
+        Self::Omp,
     ];
 
     /// Section-header label as rendered in the modal.
@@ -64,6 +68,7 @@ impl SettingCategory {
             Self::Models => "Models",
             Self::Session => "Session",
             Self::Advanced => "Advanced",
+            Self::Omp => "OMP",
         }
     }
 }
@@ -171,6 +176,11 @@ pub enum SettingKind {
         source: DynamicEnumSource,
         supports_preview: bool,
     },
+    /// A navigational row that opens a sub-sheet listing every slash command the connected
+    /// Oh My Pi agent advertised (`PagerLocalSnapshot::omp_commands`), each with an
+    /// enabled/disabled toggle. The toggle state persists as `[ui].omp_disabled_commands`
+    /// (`SettingValue::StringList`). Children are runtime data, not registry keys.
+    OmpCommands,
     /// A navigational row that opens a sub-sheet of `children` (other registered settings, by key). Children are hidden
     /// from the top-level list (rendered only inside the sub-sheet).
     Group {
@@ -208,6 +218,8 @@ pub enum SettingValue {
     String(String),
     Enum(&'static str),
     Int(i64),
+    /// Ordered list of strings; used by `omp_disabled_commands`.
+    StringList(Vec<String>),
 }
 
 /// Why `coding_data_sharing` cannot be changed in the settings modal.
@@ -275,6 +287,12 @@ pub struct PagerLocalSnapshot {
     /// Live `voice_config.language` at snapshot time.
     /// Lets the modal show the language actually in effect when `[ui].voice_stt_language` is unset but an explicit `[voice].language` applies.
     pub voice_stt_language: String,
+    /// Whether the connected agent is Oh My Pi (`_meta.ompAgent` on initialize, stamped by the
+    /// bridge adapter, or `agentInfo.name == "oh-my-pi"`). Gates the OMP settings section.
+    pub omp_agent: bool,
+    /// Slash commands the connected OMP agent advertised via `available_commands_update`
+    /// (cloned from `AgentSession::available_commands`; carries name + description).
+    pub omp_commands: Vec<acp::AvailableCommand>,
 }
 
 impl Default for PagerLocalSnapshot {
@@ -298,6 +316,8 @@ impl Default for PagerLocalSnapshot {
             auto_mode_gate: false,
             ask_user_question_timeout_enabled: None,
             voice_stt_language: xai_grok_voice::STT_LANGUAGE_DEFAULT.to_string(),
+            omp_agent: false,
+            omp_commands: Vec::new(),
         }
     }
 }
@@ -678,6 +698,8 @@ pub fn current_value_for(
             }
         })),
 
+        // omp_disabled_commands: the OMP sheet's persisted toggle state (SHELL-owned `[ui]` list).
+        "omp_disabled_commands" => Some(SettingValue::StringList(ui.omp_disabled_commands.clone())),
         _ => None,
     }
 }
@@ -698,6 +720,8 @@ pub fn default_value_for(meta: &SettingMeta) -> SettingValue {
         SettingKind::DynamicEnum { default, .. } => SettingValue::String((*default).to_string()),
         // Group rows carry no scalar value; the render and reset paths special-case them first, so the returned value is never observed
         SettingKind::Group { .. } => SettingValue::Bool(false),
+        // OmpCommands rows persist a `StringList`; the default is "everything enabled".
+        SettingKind::OmpCommands => SettingValue::StringList(Vec::new()),
     }
 }
 
@@ -1159,6 +1183,14 @@ mod tests {
                          models::default_model() — drift here breaks the empty-fold contract",
                     );
                 }
+                // omp_disabled_commands: the UiConfig field IS the persisted list; default is empty.
+                ("omp_disabled_commands", SettingKind::OmpCommands) => {
+                    assert!(
+                        ui.omp_disabled_commands.is_empty(),
+                        "UiConfig::default().omp_disabled_commands must be empty — \
+                         the OMP sheet's default is 'everything enabled'",
+                    );
+                }
 
                 _ => panic!(
                     "settings::defs::default_settings() contains entry `{}` with no \
@@ -1243,6 +1275,7 @@ mod tests {
                     | (SettingKind::Int { .. }, SettingValue::Int(_))
                     // `DynamicEnum` uses `SettingValue::String`.
                     | (SettingKind::DynamicEnum { .. }, SettingValue::String(_))
+                    | (SettingKind::OmpCommands, SettingValue::StringList(_))
             );
             assert!(
                 kind_matches,
@@ -1585,6 +1618,9 @@ mod tests {
                 // `DynamicEnum` widens to `String`.
                 (SettingKind::DynamicEnum { default, .. }, SettingValue::String(s)) => {
                     assert_eq!(s, default);
+                }
+                (SettingKind::OmpCommands, SettingValue::StringList(l)) => {
+                    assert!(l.is_empty(), "OmpCommands default must be the empty list");
                 }
                 _ => panic!("default_value_for kind mismatch for `{}`", meta.key),
             }

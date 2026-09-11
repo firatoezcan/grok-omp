@@ -566,6 +566,56 @@ auto_update = true
         Some("grok-4")
     );
 }
+/// `omp_disabled_commands` is `skip_serializing_if = Vec::is_empty`, so clearing the list must
+/// actively remove the key — otherwise the last non-empty list sticks forever.
+#[test]
+fn omp_disabled_commands_empty_list_removes_stale_key() {
+    let original = r#"
+[ui]
+show_timestamps = true
+omp_disabled_commands = ["security", "compact"]
+"#;
+    let root: TomlValue = toml::from_str(original).unwrap();
+    let mut cfg = load_config_from_toml(&root);
+    assert_eq!(
+        cfg.ui.omp_disabled_commands,
+        vec!["security".to_string(), "compact".to_string()],
+        "precondition: the file's list must load",
+    );
+    // Simulate `set_omp_disabled_commands(vec![])`: the closure clears the field.
+    cfg.ui.omp_disabled_commands = Vec::new();
+    let mut table = root.as_table().unwrap().clone();
+    merge_ui_section(&mut table, &cfg.ui);
+    let ui = table.get("ui").unwrap().as_table().unwrap();
+    assert!(
+        ui.get("omp_disabled_commands").is_none(),
+        "an empty disabled list must remove the key, not leave the stale value",
+    );
+    assert_eq!(
+        ui.get("show_timestamps").and_then(|v| v.as_bool()),
+        Some(true),
+        "unrelated ui keys must survive",
+    );
+}
+
+/// A non-empty list still lands through the normal merge.
+#[test]
+fn omp_disabled_commands_non_empty_list_merges() {
+    let original = "[ui]\nshow_timestamps = true\n";
+    let root: TomlValue = toml::from_str(original).unwrap();
+    let mut cfg = load_config_from_toml(&root);
+    cfg.ui.omp_disabled_commands = vec!["compact".to_string()];
+    let mut table = root.as_table().unwrap().clone();
+    merge_ui_section(&mut table, &cfg.ui);
+    let ui = table.get("ui").unwrap().as_table().unwrap();
+    assert_eq!(
+        ui.get("omp_disabled_commands")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len()),
+        Some(1),
+        "a non-empty list must serialize into [ui]",
+    );
+}
 #[test]
 fn merge_section_revert_to_default_overwrites_old_value() {
     let mut table = TomlMap::new();

@@ -1176,6 +1176,14 @@ pub(crate) async fn persist_setting(
                 .await
                 .map_err(|e| e.to_string())
         }
+        "omp_disabled_commands" => {
+            let SettingValue::StringList(l) = value else {
+                return Err(kind_mismatch("omp_disabled_commands", "StringList", &value));
+            };
+            xai_grok_shell::util::config::set_omp_disabled_commands(l)
+                .await
+                .map_err(|e| e.to_string())
+        }
         other => Err(format!("unknown setting key for persist: `{other}`")),
     }
 }

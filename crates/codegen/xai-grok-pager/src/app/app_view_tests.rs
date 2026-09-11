@@ -298,6 +298,8 @@ pub(crate) fn test_app() -> AppView {
         has_external_auth_provider: false,
         tier_restricted_commands: Vec::new(),
         leader_mode: true,
+        is_grok_shell: true,
+        is_omp_agent: false,
         credit_balance: None,
         auto_topup: None,
         billing_poll_wanted: false,

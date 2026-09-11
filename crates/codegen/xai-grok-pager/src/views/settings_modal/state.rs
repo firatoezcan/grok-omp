@@ -89,6 +89,12 @@ pub enum SettingsModalMode {
         key: SettingKey,
         child_idx: usize,
     },
+    /// OMP commands sub-sheet: one toggle row per advertised command. `cmd_idx` is the focused
+    /// command within `pager_snapshot.omp_commands`. Space/Enter toggles in place; Esc returns to Browse.
+    OmpCommands {
+        key: SettingKey,
+        cmd_idx: usize,
+    },
     /// Inline string/int editor. No live preview; Esc is a pure cancel.
     EditingValue {
         key: SettingKey,
@@ -107,6 +113,7 @@ pub(super) enum SettingsModeKind {
     FilterFocused,
     PickingEnum,
     PickingGroup,
+    OmpCommands,
     EditingString,
     EditingInt,
 }
@@ -115,6 +122,7 @@ impl SettingsState {
     pub(super) fn mode_kind(&self) -> SettingsModeKind {
         match &self.mode {
             SettingsMode::Browse => SettingsModeKind::Browse,
+            SettingsMode::OmpCommands { .. } => SettingsModeKind::OmpCommands,
             SettingsMode::FilterFocused => SettingsModeKind::FilterFocused,
             SettingsMode::PickingEnum { .. } => SettingsModeKind::PickingEnum,
             SettingsMode::PickingGroup { .. } => SettingsModeKind::PickingGroup,
@@ -137,6 +145,10 @@ pub(super) enum SettingsMode {
     PickingGroup {
         key: SettingKey,
         child_idx: usize,
+    },
+    OmpCommands {
+        key: SettingKey,
+        cmd_idx: usize,
     },
     EditingString {
         key: SettingKey,
@@ -216,7 +228,7 @@ impl SettingsModalState {
         ui_snapshot: UiConfig,
         pager_snapshot: PagerLocalSnapshot,
     ) -> Self {
-        let rows = build_rows(&registry);
+        let rows = build_rows(&registry, pager_snapshot.omp_agent);
         // Start on the first selectable (non-header) row.
         let selected = rows
             .iter()
@@ -298,12 +310,13 @@ impl SettingsModalState {
         let subpane_key = match &self.state.mode {
             SettingsMode::PickingEnum { key, .. }
             | SettingsMode::PickingGroup { key, .. }
+            | SettingsMode::OmpCommands { key, .. }
             | SettingsMode::EditingString { key, .. }
             | SettingsMode::EditingInt { key, .. } => Some(*key),
             SettingsMode::Browse | SettingsMode::FilterFocused => None,
         };
 
-        self.rows = build_rows(&self.registry);
+        self.rows = build_rows(&self.registry, self.pager_snapshot.omp_agent);
         self.invalidate_filter();
 
         if let Some(key) = subpane_key {
@@ -353,6 +366,10 @@ impl SettingsModalState {
             SettingsMode::PickingGroup { key, child_idx } => SettingsModalMode::PickingGroup {
                 key,
                 child_idx: *child_idx,
+            },
+            SettingsMode::OmpCommands { key, cmd_idx } => SettingsModalMode::OmpCommands {
+                key,
+                cmd_idx: *cmd_idx,
             },
             SettingsMode::EditingString { key, .. } | SettingsMode::EditingInt { key, .. } => {
                 SettingsModalMode::EditingValue { key }
@@ -526,6 +543,9 @@ impl SettingsModalState {
             supports_preview,
         };
     }
+    pub(super) fn transition_to_omp_commands(&mut self, key: SettingKey, cmd_idx: usize) {
+        self.state.mode = SettingsMode::OmpCommands { key, cmd_idx };
+    }
 
     pub(super) fn transition_to_picking_group(&mut self, key: SettingKey, child_idx: usize) {
         self.state.mode = SettingsMode::PickingGroup { key, child_idx };
@@ -685,6 +705,34 @@ impl SettingsModalState {
         self.hover_row = None;
         true
     }
+    /// Transition to `OmpCommands` if the focused row is an `OmpCommands` setting.
+    /// Returns `false` for any other kind so the caller can fall through to the enum/editor entry points.
+    pub fn try_enter_omp_commands(&mut self) -> bool {
+        let Some((key, meta)) = self.focused_setting() else {
+            return false;
+        };
+        if !matches!(meta.kind, SettingKind::OmpCommands) {
+            return false;
+        }
+        self.transition_to_omp_commands(key, 0);
+        self.hover_row = None;
+        true
+    }
+
+    /// The advertised OMP commands for the open `OmpCommands` sheet (empty outside that mode).
+    pub(super) fn omp_commands(&self) -> &[agent_client_protocol::AvailableCommand] {
+        &self.pager_snapshot.omp_commands
+    }
+
+    /// Whether the named OMP command is currently enabled (not in `omp_disabled_commands`).
+    /// Names compare case-insensitively; the persisted list stores the advertised casing.
+    pub(super) fn omp_command_enabled(&self, name: &str) -> bool {
+        !self
+            .ui_snapshot
+            .omp_disabled_commands
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(name))
+    }
 
     /// Transition to `EditingValue` if the focused row is String or Int.
     pub fn try_enter_editing_value(&mut self) -> bool {
@@ -822,7 +870,7 @@ pub(super) fn setting_row_visible(
     true
 }
 
-fn build_rows(registry: &SettingsRegistry) -> Vec<RowEntry> {
+fn build_rows(registry: &SettingsRegistry, omp_agent: bool) -> Vec<RowEntry> {
     let kitty_releases = crate::app::kitty_releases_reported();
     let minimal = crate::app::minimal_mode_active();
     let voice_mode = crate::app::voice_mode_enabled();
@@ -841,6 +889,10 @@ fn build_rows(registry: &SettingsRegistry) -> Vec<RowEntry> {
     for cat in SettingCategory::ALL {
         let mut emitted_header = false;
         for (meta_index, meta) in registry.all().iter().enumerate() {
+            // The OMP section exists only for an Oh My Pi agent; other agents never see it.
+            if meta.category == SettingCategory::Omp && !omp_agent {
+                continue;
+            }
             if meta.category != *cat {
                 continue;
             }

@@ -552,6 +552,16 @@ pub enum Action {
     SetAutoUpdate(bool),
     /// Commit `[ui.display_refresh].auto_cadence_enabled`. Restart-required: cadence is pinned once at startup.
     SetDisplayRefreshAutoCadence(bool),
+    /// Replace the OMP disabled-commands list (Settings › OMP reset path).
+    /// Persists to `[ui].omp_disabled_commands` via `Effect::PersistSetting` and fans out
+    /// `set_disabled_commands` to every OMP agent's command registry.
+    SetOmpDisabledCommands(Vec<String>),
+    /// Toggle one OMP slash command by name (Settings › OMP row toggle).
+    /// `enabled: false` adds the name to the disabled list; `true` removes it.
+    SetOmpCommandEnabled {
+        name: String,
+        enabled: bool,
+    },
     /// Preview a theme without persisting; updates the live display only.
     /// Used by the picker on Up/Down and Esc (revert).
     PreviewTheme(String),

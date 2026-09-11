@@ -1239,6 +1239,9 @@ class ExtSurface {
 		// initialize result → agent identity.
 		if (frame.result?.protocolVersion !== undefined && frame.result?.agentInfo) {
 			this.agentInfo = frame.result.agentInfo;
+			// Stamp the OMP identity flag so the pager can gate OMP-only surfaces
+			// (Settings › OMP) without sniffing agentInfo.name.
+			frame.result._meta = { ...(frame.result._meta ?? {}), ompAgent: true };
 		}
 
 		// session/new result → session identity + model catalog.

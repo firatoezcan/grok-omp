@@ -390,3 +390,9 @@ pub async fn set_show_tips(value: bool) -> Result<()> {
 pub async fn set_auto_update(value: bool) -> Result<()> {
     update_config(|cfg| cfg.cli.auto_update = Some(value)).await
 }
+
+/// Persist `[ui].omp_disabled_commands` via `update_config`.
+/// The list holds ACP-advertised slash-command names the user disabled for the Oh My Pi agent.
+pub async fn set_omp_disabled_commands(value: Vec<String>) -> Result<()> {
+    update_config(|cfg| cfg.ui.omp_disabled_commands = value).await
+}

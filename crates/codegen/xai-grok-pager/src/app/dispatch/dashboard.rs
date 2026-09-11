@@ -1485,6 +1485,8 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
                 auto_mode_gate: auto_mode_gate_from_app,
                 ask_user_question_timeout_enabled: ask_user_question_timeout_enabled_from_app,
                 voice_stt_language: voice_stt_language_from_app,
+                omp_agent: app.is_omp_agent,
+                omp_commands: Vec::new(),
             },
         };
         command.run(&mut ctx, invocation.args)

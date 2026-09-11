@@ -38,6 +38,7 @@ pub fn handle_settings_key(state: &mut SettingsModalState, key: &KeyEvent) -> Se
         SettingsModeKind::FilterFocused => handle_filter_focused(state, key),
         SettingsModeKind::PickingEnum => handle_picking_enum(state, key),
         SettingsModeKind::PickingGroup => handle_picking_group(state, key),
+        SettingsModeKind::OmpCommands => handle_omp_commands(state, key),
         SettingsModeKind::EditingString | SettingsModeKind::EditingInt => {
             handle_editing_value(state, key)
         }
@@ -67,6 +68,7 @@ pub fn handle_settings_paste(state: &mut SettingsModalState, text: &str) -> Sett
         }
         SettingsModeKind::Browse
         | SettingsModeKind::PickingEnum
+        | SettingsModeKind::OmpCommands
         | SettingsModeKind::PickingGroup
         | SettingsModeKind::EditingInt => SettingsKeyOutcome::Unchanged,
     }
@@ -225,6 +227,76 @@ fn handle_picking_group(state: &mut SettingsModalState, key: &KeyEvent) -> Setti
                 Some(action) => SettingsKeyOutcome::Action(action),
                 None => SettingsKeyOutcome::Unchanged,
             }
+        }
+        KeyCode::Esc => {
+            state.transition_to_browse();
+            SettingsKeyOutcome::Changed
+        }
+        _ => SettingsKeyOutcome::Unchanged,
+    }
+}
+
+/// Key routing for the OMP commands sub-sheet.
+/// Up/Down (and j/k) move between commands; Space/Enter toggles the focused command in place
+/// (the sheet stays open); Esc returns to Browse. PageUp/PageDown jump a viewport at a time.
+/// The dispatcher refreshes the modal snapshot, so the new value paints on the next frame.
+fn handle_omp_commands(state: &mut SettingsModalState, key: &KeyEvent) -> SettingsKeyOutcome {
+    let (group_key, cmd_idx) = match &state.state.mode {
+        SettingsMode::OmpCommands { key, cmd_idx } => (*key, *cmd_idx),
+        _ => unreachable!("omp handler requires OmpCommands state"),
+    };
+    let count = state.omp_commands().len();
+    if count == 0 {
+        // Nothing to toggle; only Esc is meaningful.
+        if matches!(key.code, KeyCode::Esc) {
+            state.transition_to_browse();
+            return SettingsKeyOutcome::Changed;
+        }
+        return SettingsKeyOutcome::Unchanged;
+    }
+
+    match key.code {
+        KeyCode::Down | KeyCode::Char('j') => {
+            if cmd_idx + 1 >= count {
+                return SettingsKeyOutcome::Unchanged;
+            }
+            state.transition_to_omp_commands(group_key, cmd_idx + 1);
+            SettingsKeyOutcome::Changed
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if cmd_idx == 0 {
+                return SettingsKeyOutcome::Unchanged;
+            }
+            state.transition_to_omp_commands(group_key, cmd_idx - 1);
+            SettingsKeyOutcome::Changed
+        }
+        KeyCode::PageDown => {
+            let next = (cmd_idx + 10).min(count - 1);
+            if next == cmd_idx {
+                return SettingsKeyOutcome::Unchanged;
+            }
+            state.transition_to_omp_commands(group_key, next);
+            SettingsKeyOutcome::Changed
+        }
+        KeyCode::PageUp => {
+            let next = cmd_idx.saturating_sub(10);
+            if next == cmd_idx {
+                return SettingsKeyOutcome::Unchanged;
+            }
+            state.transition_to_omp_commands(group_key, next);
+            SettingsKeyOutcome::Changed
+        }
+        // Space/Enter toggle the focused command and stay in the sheet so the user can flip several in a row
+        KeyCode::Char(' ') | KeyCode::Enter => {
+            let Some(cmd) = state.omp_commands().get(cmd_idx) else {
+                return SettingsKeyOutcome::Unchanged;
+            };
+            let name = cmd.name.clone();
+            let enabled = state.omp_command_enabled(&name);
+            SettingsKeyOutcome::Action(Action::SetOmpCommandEnabled {
+                name,
+                enabled: !enabled,
+            })
         }
         KeyCode::Esc => {
             state.transition_to_browse();
@@ -631,6 +703,10 @@ fn handle_browse(state: &mut SettingsModalState, key: &KeyEvent) -> SettingsKeyO
             if state.try_enter_picking_group() {
                 return SettingsKeyOutcome::Changed;
             }
+            // An OMP commands row opens its sub-sheet of command toggles
+            if state.try_enter_omp_commands() {
+                return SettingsKeyOutcome::Changed;
+            }
             // For Bool, Enter behaves like Space: both keys toggle
             if let Some(action) = state.toggle_focused_bool() {
                 return SettingsKeyOutcome::Action(action);
@@ -785,6 +861,9 @@ pub fn handle_settings_mouse(
             SettingsModeKind::PickingEnum => {
                 return handle_picking_enum(state, &synthetic);
             }
+            SettingsModeKind::OmpCommands => {
+                return handle_omp_commands(state, &synthetic);
+            }
             SettingsModeKind::PickingGroup => {
                 return handle_picking_group(state, &synthetic);
             }
@@ -835,6 +914,12 @@ pub fn handle_settings_mouse(
         return upgrade_if_breadcrumb_flipped(outcome, breadcrumb_hover_flipped);
     }
 
+    // OmpCommands: hover tracks the command rects; a click toggles the clicked command in place.
+    // The sheet scrolls, so the wheel moves the focus like Up/Down.
+    if state.state.mode_kind() == SettingsModeKind::OmpCommands {
+        let outcome = handle_omp_mouse(state, kind, column, row);
+        return upgrade_if_breadcrumb_flipped(outcome, breadcrumb_hover_flipped);
+    }
     let on_list = rect_contains(state.list_area, column, row);
 
     // Mouse hover highlight (parity with scrollback).
@@ -1048,6 +1133,69 @@ fn handle_group_mouse(
     match action_for_bool(child_key, !cur) {
         Some(action) => SettingsKeyOutcome::Action(action),
         None => SettingsKeyOutcome::Changed,
+    }
+}
+
+/// Handle a mouse event while the modal is in `OmpCommands` mode.
+/// Click toggles the clicked command; the wheel moves focus (the sheet scrolls).
+fn handle_omp_mouse(
+    state: &mut SettingsModalState,
+    kind: MouseEventKind,
+    column: u16,
+    row: u16,
+) -> SettingsKeyOutcome {
+    if matches!(kind, MouseEventKind::Moved) {
+        let new_hover = state
+            .picker_choice_rects
+            .iter()
+            .position(|r| r.height > 0 && rect_contains(*r, column, row));
+        if new_hover != state.hover_row {
+            state.hover_row = new_hover;
+            return SettingsKeyOutcome::Changed;
+        }
+        return SettingsKeyOutcome::Unchanged;
+    }
+    let (group_key, cmd_idx) = match &state.state.mode {
+        SettingsMode::OmpCommands { key, cmd_idx } => (*key, *cmd_idx),
+        _ => unreachable!("omp mouse handler requires OmpCommands state"),
+    };
+    let count = state.omp_commands().len();
+    match kind {
+        MouseEventKind::ScrollDown => {
+            if count == 0 || cmd_idx + 1 >= count {
+                return SettingsKeyOutcome::Unchanged;
+            }
+            let next = (cmd_idx + 3).min(count - 1);
+            state.transition_to_omp_commands(group_key, next);
+            SettingsKeyOutcome::Changed
+        }
+        MouseEventKind::ScrollUp => {
+            if count == 0 || cmd_idx == 0 {
+                return SettingsKeyOutcome::Unchanged;
+            }
+            state.transition_to_omp_commands(group_key, cmd_idx.saturating_sub(3));
+            SettingsKeyOutcome::Changed
+        }
+        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+            let clicked_idx = state
+                .picker_choice_rects
+                .iter()
+                .position(|r| r.height > 0 && rect_contains(*r, column, row));
+            let Some(idx) = clicked_idx else {
+                return SettingsKeyOutcome::Unchanged;
+            };
+            state.transition_to_omp_commands(group_key, idx);
+            let Some(cmd) = state.omp_commands().get(idx) else {
+                return SettingsKeyOutcome::Changed;
+            };
+            let name = cmd.name.clone();
+            let enabled = state.omp_command_enabled(&name);
+            SettingsKeyOutcome::Action(Action::SetOmpCommandEnabled {
+                name,
+                enabled: !enabled,
+            })
+        }
+        _ => SettingsKeyOutcome::Unchanged,
     }
 }
 

@@ -576,6 +576,29 @@ pub(super) fn dispatch_send_prompt_submission(
         return effects;
     }
 
+    // OMP disabled commands (Settings › OMP): a typed invocation must not execute.
+    // Consume the input and surface a system block instead of leaking the command to the model.
+    // Gated on `is_omp_agent` so the list can never block a foreign agent's commands.
+    if !literal
+        && app.is_omp_agent
+        && trimmed.starts_with('/')
+        && let Some(invocation) = crate::slash::parse_invocation(trimmed)
+        && agent
+            .prompt
+            .slash_controller
+            .registry()
+            .is_disabled(invocation.token)
+    {
+        if consume_input {
+            agent.prompt.set_text("");
+        }
+        let name = invocation.token;
+        agent.scrollback.push_block(RenderBlock::system(format!(
+            "/{name} is disabled in Settings › OMP"
+        )));
+        return effects;
+    }
+
     // Registry based slash command execution
     // If the text starts with `/`, run it through the slash registry.
     // `literal` (chip click) skips this so chip text is never a command.
@@ -617,6 +640,8 @@ pub(super) fn dispatch_send_prompt_submission(
                     auto_mode_gate: auto_mode_gate_from_app,
                     ask_user_question_timeout_enabled: ask_user_question_timeout_enabled_from_app,
                     voice_stt_language: voice_stt_language_from_app,
+                    omp_agent: app.is_omp_agent,
+                    omp_commands: agent.session.available_commands.clone(),
                 },
             };
 

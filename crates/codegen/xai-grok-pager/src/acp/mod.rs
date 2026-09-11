@@ -88,6 +88,8 @@ pub struct AcpConnection {
     pub models: ModelState,
     /// Whether the agent is a grok-shell instance.
     pub is_grok_shell: bool,
+    /// Whether the agent is an Oh My Pi instance (`_meta.ompAgent` or `agent_info.name == "oh-my-pi"`).
+    pub is_omp_agent: bool,
     /// Auth methods advertised by the agent.
     pub auth_methods: Vec<acp::AuthMethod>,
     /// Cancellation token to stop the agent.
@@ -256,6 +258,7 @@ pub(in crate::acp) async fn initialize_connection(
         tx,
         rx,
         models: agent.models,
+        is_omp_agent: agent.is_omp_agent,
         is_grok_shell: agent.is_grok_shell,
         auth_methods: agent.auth_methods,
         cancel,
@@ -458,6 +461,7 @@ pub fn parse_default_auth_method_id(meta: Option<&acp::Meta>) -> Option<acp::Aut
 pub(crate) struct InitializedAgent {
     pub(crate) models: ModelState,
     pub(crate) is_grok_shell: bool,
+    pub(crate) is_omp_agent: bool,
     pub(crate) auth_methods: Vec<acp::AuthMethod>,
     pub(crate) default_auth_method_id: Option<acp::AuthMethodId>,
     pub(crate) available_commands: Vec<acp::AvailableCommand>,
@@ -487,6 +491,18 @@ async fn initialize(tx: &AcpAgentTx, flags: &ConnectFlags) -> Result<Initialized
         .and_then(|m| m.get("grokShell"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // Oh My Pi identifies itself either via the adapter-stamped `_meta.ompAgent` flag or by its
+    // `agent_info.name` (the adapter forwards the agent's own InitializeResponse verbatim).
+    let is_omp_agent = resp
+        .meta
+        .as_ref()
+        .and_then(|m| m.get("ompAgent"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || resp
+            .agent_info
+            .as_ref()
+            .is_some_and(|i| i.name == "oh-my-pi");
     let models: ModelState = resp
         .meta
         .as_ref()
@@ -505,6 +521,7 @@ async fn initialize(tx: &AcpAgentTx, flags: &ConnectFlags) -> Result<Initialized
     let default_auth_method_id = parse_default_auth_method_id(resp.meta.as_ref());
     Ok(InitializedAgent {
         models,
+        is_omp_agent,
         is_grok_shell,
         auth_methods: resp.auth_methods,
         default_auth_method_id,

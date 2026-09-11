@@ -8,13 +8,13 @@ use super::setters::{
     set_default_selected_permission_inner, set_display_refresh_auto_cadence_inner,
     set_follow_up_behavior_inner, set_fork_secondary_model_inner, set_group_tool_verbs_inner,
     set_hunk_tracker_mode_inner, set_invert_scroll_inner, set_keep_text_selection_inner,
-    set_max_thoughts_width_inner, set_multiline_mode, set_page_flip_on_send_inner,
-    set_prompt_suggestions_inner, set_remember_tool_approvals_inner, set_render_mermaid_inner,
-    set_respect_manual_folds_inner, set_screen_mode_inner, set_scroll_lines_inner,
-    set_scroll_mode_inner, set_scroll_speed_inner, set_show_thinking_blocks_inner,
-    set_show_tips_inner, set_simple_mode_inner, set_theme_inner, set_timeline_inner,
-    set_timestamps, set_timestamps_inner, set_vim_mode_inner, set_voice_capture_mode_inner,
-    set_voice_keybind_enabled_inner, set_voice_stt_language_inner,
+    set_max_thoughts_width_inner, set_multiline_mode, set_omp_disabled_commands_inner,
+    set_page_flip_on_send_inner, set_prompt_suggestions_inner, set_remember_tool_approvals_inner,
+    set_render_mermaid_inner, set_respect_manual_folds_inner, set_screen_mode_inner,
+    set_scroll_lines_inner, set_scroll_mode_inner, set_scroll_speed_inner,
+    set_show_thinking_blocks_inner, set_show_tips_inner, set_simple_mode_inner, set_theme_inner,
+    set_timeline_inner, set_timestamps, set_timestamps_inner, set_vim_mode_inner,
+    set_voice_capture_mode_inner, set_voice_keybind_enabled_inner, set_voice_stt_language_inner,
 };
 use crate::app::actions::{Action, Effect};
 use crate::app::app_view::{ActiveView, AppView};
@@ -91,6 +91,8 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                 auto_mode_gate: auto_mode_gate_from_app,
                 ask_user_question_timeout_enabled: ask_user_question_timeout_enabled_from_app,
                 voice_stt_language: voice_stt_language_from_app.clone(),
+                omp_agent: app.is_omp_agent,
+                omp_commands: agent.session.available_commands.clone(),
             };
         }
     }
@@ -231,6 +233,8 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
         auto_mode_gate: auto_mode_gate_from_app,
         ask_user_question_timeout_enabled: ask_user_question_timeout_enabled_from_app,
         voice_stt_language: voice_stt_language_from_app,
+        omp_agent: app.is_omp_agent,
+        omp_commands: agent.session.available_commands.clone(),
     };
     let mut state = Box::new(SettingsModalState::new(
         registry,
@@ -611,6 +615,11 @@ pub(crate) fn build_pager_snapshot(app: &AppView) -> crate::settings::PagerLocal
         auto_mode_gate: app.auto_mode_gate,
         ask_user_question_timeout_enabled: app.ask_user_question_timeout_enabled,
         voice_stt_language: app.voice_config.language.clone(),
+        omp_agent: app.is_omp_agent,
+        omp_commands: app
+            .active_agent()
+            .map(|a| a.session.available_commands.clone())
+            .unwrap_or_default(),
     }
 }
 
@@ -746,6 +755,9 @@ pub(in crate::app::dispatch) fn action_for_reset(
         ("auto_update", SettingValue::Bool(b)) => Some(Action::SetAutoUpdate(*b)),
         ("display_refresh_auto_cadence", SettingValue::Bool(b)) => {
             Some(Action::SetDisplayRefreshAutoCadence(*b))
+        }
+        ("omp_disabled_commands", SettingValue::StringList(l)) => {
+            Some(Action::SetOmpDisabledCommands(l.clone()))
         }
         // hunk_tracker_mode: canonical enum string round-trip.
         ("hunk_tracker_mode", SettingValue::Enum(s)) => {
@@ -980,6 +992,9 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
             } else {
                 set_display_refresh_auto_cadence_inner(app, *b);
             }
+        }
+        ("omp_disabled_commands", SettingValue::StringList(l)) => {
+            set_omp_disabled_commands_inner(app, l.clone())
         }
         ("scroll_lines", SettingValue::Int(i)) => set_scroll_lines_inner(app, *i as u8),
         // vim_mode: direct inner call.

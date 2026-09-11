@@ -166,6 +166,7 @@ pub(in crate::app::dispatch) fn dispatch_fork_resolved(
     let parent_chat_kind = parent.chat_kind || app.chat_mode;
     let parent_conversation_entry = parent.conversation_entry;
     app.agents.insert(new_id, new_agent);
+    let disabled_commands = app.omp_disabled_commands().to_vec();
     {
         let agent = app
             .agents
@@ -187,6 +188,7 @@ pub(in crate::app::dispatch) fn dispatch_fork_resolved(
             app.screen_mode,
             &app.active_announcements,
             &app.tier_restricted_commands,
+            &disabled_commands,
         );
         agent.chat_kind = parent_chat_kind;
         agent.conversation_entry = parent_conversation_entry;

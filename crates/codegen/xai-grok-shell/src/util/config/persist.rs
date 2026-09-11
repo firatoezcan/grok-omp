@@ -38,7 +38,7 @@ async fn save_config_locked(config: &Config) -> Result<()> {
     let table = root.as_table_mut().expect("root must be a table");
     merge_section(table, "cli", &config.cli);
     merge_section(table, "models", &config.models);
-    merge_section(table, "ui", &config.ui);
+    merge_ui_section(table, &config.ui);
     merge_section(table, "harness", &config.harness);
     merge_section(table, "session", &config.session);
     merge_ask_user_question_section(table, &config.ask_user_question);
@@ -242,6 +242,20 @@ fn merge_section<T: serde::Serialize>(
         Ok(_) | Err(_) => {
             table.remove(key);
         }
+    }
+}
+/// Merge `[ui]` plus the one key that can't ride the generic merge: `omp_disabled_commands` is
+/// `skip_serializing_if = Vec::is_empty`, so an empty list never reaches `merge_section` — without
+/// this removal the last non-empty list would stick forever.
+fn merge_ui_section(
+    table: &mut TomlMap<String, TomlValue>,
+    ui: &xai_grok_shared::ui_config::UiConfig,
+) {
+    merge_section(table, "ui", ui);
+    if ui.omp_disabled_commands.is_empty()
+        && let Some(TomlValue::Table(section)) = table.get_mut("ui")
+    {
+        section.remove("omp_disabled_commands");
     }
 }
 /// Update settings with a read-modify-write, preserving unrelated fields.

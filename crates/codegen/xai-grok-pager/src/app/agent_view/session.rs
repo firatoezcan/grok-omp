@@ -1285,6 +1285,12 @@ impl AgentView {
     pub fn set_restricted_commands(&mut self, names: &[String]) {
         self.prompt.set_restricted_commands(names);
     }
+    /// Replace the disabled slash-command list in this agent's registry (Settings › OMP).
+    /// Disabled commands stay resolvable for `is_disabled` but emit no completion triggers and are
+    /// blocked on the send path.
+    pub fn set_disabled_commands(&mut self, names: &[String]) {
+        self.prompt.set_disabled_commands(names);
+    }
     /// Show or hide the `/dashboard` slash command in this agent's registry.
     /// Driven by the dashboard feature flag (`crate::views::dashboard::dashboard_enabled()`) at agent-creation time, independent of leader mode.
     pub fn set_dashboard_visible(&mut self, visible: bool) {
@@ -1309,6 +1315,7 @@ impl AgentView {
         screen_mode: crate::app::ScreenMode,
         announcements: &[xai_grok_announcements::RemoteAnnouncement],
         restricted_commands: &[String],
+        disabled_commands: &[String],
     ) {
         self.set_sharing_enabled(sharing_enabled);
         self.set_billing_surface_visible(billing_surface_visible);
@@ -1320,6 +1327,7 @@ impl AgentView {
             announcements,
         ));
         self.set_restricted_commands(restricted_commands);
+        self.set_disabled_commands(disabled_commands);
     }
     /// ACP `kind` for `x.ai/session/rename`: which list (Chat or Build) this session opened on.
     pub(crate) fn rename_kind(&self) -> xai_grok_shell::session::unified_list::SessionKind {

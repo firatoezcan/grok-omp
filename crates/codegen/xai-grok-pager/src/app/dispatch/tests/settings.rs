@@ -1665,6 +1665,12 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
                 app,
             );
         }
+        "omp_disabled_commands" => {
+            let _ = dispatch(
+                Action::SetOmpDisabledCommands(vec!["compact".to_string()]),
+                app,
+            );
+        }
         other => {
             panic!(
                 "move_setting_away_from_default: no arm for `{other}`. \

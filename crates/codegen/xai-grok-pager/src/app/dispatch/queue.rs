@@ -1135,21 +1135,24 @@ pub(super) fn dispatch_run_edited_queued_command(
         let registry = agent.prompt.slash_controller.registry();
         let command_refused =
             crate::slash::parse_invocation(submission.text.trim()).is_some_and(|invocation| {
-                registry
-                    .get_for_dispatch(invocation.token)
-                    .is_some_and(|command| {
-                        command
-                            .mode_support()
-                            .refusal(invocation.token, screen_mode)
-                            .is_some()
-                            || command
-                                .submission_refusal(
-                                    invocation.args,
-                                    screen_mode.is_minimal(),
-                                    /* voice_owns_prompt */ false,
-                                )
+                // A disabled OMP command refuses like a mode/submission refusal: the send path
+                // would block it, so the edit gate must keep the queued row intact.
+                (app.is_omp_agent && registry.is_disabled(invocation.token))
+                    || registry
+                        .get_for_dispatch(invocation.token)
+                        .is_some_and(|command| {
+                            command
+                                .mode_support()
+                                .refusal(invocation.token, screen_mode)
                                 .is_some()
-                    })
+                                || command
+                                    .submission_refusal(
+                                        invocation.args,
+                                        screen_mode.is_minimal(),
+                                        /* voice_owns_prompt */ false,
+                                    )
+                                    .is_some()
+                        })
             });
         if command_refused {
             EditedCommandGate::RefusedBySendPath

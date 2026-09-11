@@ -121,6 +121,11 @@ pub struct CommandRegistry {
     /// `hidden` so the per-command `set_*_visible` setters can never un-hide a restricted command. The deny list always
     /// wins over every other visibility gate.
     restricted: HashSet<String>,
+    /// Commands the user disabled in Settings › OMP (OMP agents only). Behaves like `menu_hidden` for
+    /// completion (no dropdown row, no ghost/palette trigger) but additionally blocks execution on the
+    /// send path via [`Self::is_disabled`]. Kept separate from `menu_hidden` so the send-path gate can
+    /// distinguish "not offered" from "user turned it off".
+    disabled: HashSet<String>,
     /// Names of tools the connected agent has advertised. Fail-closed. Otherwise the user could submit `/loop` from the
     /// home screen and start a session whose model can't actually run it.
     available_tools: Option<HashSet<String>>,
@@ -156,6 +161,7 @@ impl CommandRegistry {
             triggers: Vec::new(),
             hidden,
             menu_hidden,
+            disabled: HashSet::new(),
             restricted: HashSet::new(),
             available_tools: None,
             saved_workflows: Vec::new(),
@@ -250,6 +256,44 @@ impl CommandRegistry {
     /// Current deny list (normalized). Used to mirror the gate onto child registries (subagent views), same as the `set_*_visible` gates.
     pub fn restricted_commands(&self) -> Vec<String> {
         let mut names: Vec<String> = self.restricted.iter().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// True when `key` (canonical name or alias) resolves to a command the user disabled in
+    /// Settings › OMP. Unlike `menu_hidden`, a disabled command must NOT execute when typed —
+    /// the send path checks this before dispatching.
+    pub fn is_disabled(&self, key: &str) -> bool {
+        if self.disabled.is_empty() {
+            return false;
+        }
+        let key = Self::normalize_deny_name(key);
+        self.key_to_index
+            .get(&key)
+            .and_then(|idx| self.commands.get(*idx))
+            .is_some_and(|cmd| {
+                self.disabled.contains(&cmd.name().to_lowercase())
+                    || cmd
+                        .aliases()
+                        .iter()
+                        .any(|a| self.disabled.contains(&a.to_lowercase()))
+            })
+    }
+
+    /// Replace the disabled-command list (Settings › OMP). Disabled commands keep their key
+    /// entries (so `is_disabled` can name them) but emit no completion triggers.
+    pub fn set_disabled_commands(&mut self, names: &[String]) {
+        self.disabled = names
+            .iter()
+            .map(|n| Self::normalize_deny_name(n))
+            .filter(|n| !n.is_empty())
+            .collect();
+        self.rebuild_triggers();
+    }
+
+    /// Current disabled list (normalized). Mirrors onto child registries like the other gates.
+    pub fn disabled_commands(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.disabled.iter().cloned().collect();
         names.sort();
         names
     }
@@ -507,9 +551,11 @@ impl CommandRegistry {
                 continue;
             }
 
-            // Menu-hidden commands keep their key entries (so `get_for_dispatch()` resolves a typed invocation) but emit no triggers
-            // This is the inverse of the restricted trade-off below
-            let menu_only = self.menu_hidden.contains(canonical);
+            // Menu-hidden and disabled commands keep their key entries (so `get_for_dispatch()` /
+            // `is_disabled()` resolve a typed invocation) but emit no triggers.
+            // This is the inverse of the restricted trade-off below.
+            let menu_only = self.menu_hidden.contains(canonical)
+                || self.disabled.contains(&canonical.to_lowercase());
 
             // Restricted commands (per-user deny list, e.g. tier restrictions) deliberately stay listed.
             // They keep their triggers/key entries so the dropdown, ghost completion, and palette show them like any other command (discoverability)

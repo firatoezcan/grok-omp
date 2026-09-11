@@ -830,6 +830,60 @@ pub(in crate::app::dispatch) fn set_compact_mode(app: &mut AppView, new: bool) -
     }]
 }
 
+/// State-only mutation for `omp_disabled_commands`.
+/// Stores the list in `current_ui` and fans `set_disabled_commands` out to every OMP agent's
+/// command registry so the completion dropdown and the send-path gate update immediately.
+/// Never touches disk; never emits effects.
+pub(super) fn set_omp_disabled_commands_inner(app: &mut AppView, list: Vec<String>) {
+    app.current_ui.omp_disabled_commands = list;
+    let disabled = app.omp_disabled_commands().to_vec();
+    for agent in app.agents.values_mut() {
+        agent.set_disabled_commands(&disabled);
+    }
+}
+
+/// Replace the OMP disabled-commands list. Idempotent: skips when unchanged.
+pub(in crate::app::dispatch) fn set_omp_disabled_commands(
+    app: &mut AppView,
+    list: Vec<String>,
+) -> Vec<Effect> {
+    let prev = app.current_ui.omp_disabled_commands.clone();
+    if prev == list {
+        return vec![];
+    }
+    set_omp_disabled_commands_inner(app, list.clone());
+    refresh_open_settings_modals(app);
+    tracing::info!(target: "settings", key = "omp_disabled_commands", count = list.len(), "setting changed");
+    vec![Effect::PersistSetting {
+        key: "omp_disabled_commands",
+        value: crate::settings::SettingValue::StringList(list),
+        rollback_value: crate::settings::SettingValue::StringList(prev),
+    }]
+}
+
+/// Toggle one OMP slash command by name. `enabled: false` adds it to the disabled list;
+/// `enabled: true` removes it. Toasts the outcome; persists via `Effect::PersistSetting`.
+pub(in crate::app::dispatch) fn set_omp_command_enabled(
+    app: &mut AppView,
+    name: String,
+    enabled: bool,
+) -> Vec<Effect> {
+    let mut list = app.current_ui.omp_disabled_commands.clone();
+    list.retain(|n| !n.eq_ignore_ascii_case(&name));
+    if !enabled {
+        list.push(name.clone());
+    }
+    let effects = set_omp_disabled_commands(app, list);
+    if effects.is_empty() {
+        return effects;
+    }
+    app.show_toast(&format!(
+        "\u{2713} /{name} {}",
+        if enabled { "enabled" } else { "disabled" }
+    ));
+    effects
+}
+
 /// State-only mutation for `show_timestamps`.
 /// Idempotent fast path mirrors `set_compact_mode_inner`.
 pub(super) fn set_timestamps_inner(app: &mut AppView, new: bool) {
