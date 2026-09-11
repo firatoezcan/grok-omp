@@ -29,6 +29,12 @@ Run it from any project directory:
 grok-pi
 ```
 
+Rebuild the bundle with `scripts/build-dist.sh` (`--bun-only` skips the cargo
+pager build). It installs each artifact via temp-file + ad-hoc re-sign + `mv`:
+overwriting a signed Mach-O in place leaves the kernel's code-signature cache
+stale, and the next exec is SIGKILLed before `main()` — `grok-pi` then exits
+137 with no output at all.
+
 Extra arguments pass through to the pager (`grok-pi --help` shows pager flags).
 
 ### The isolated profile
