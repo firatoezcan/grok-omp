@@ -743,6 +743,54 @@ mod tests {
         assert!(registry.get("exit").is_some());
         assert!(registry.get("flush").is_none());
     }
+    #[test]
+    fn enabled_acp_command_produces_trigger() {
+        // Regression: an enabled ACP-advertised command must emit a completion trigger —
+        // without one it can never appear in the slash dropdown (OMP commands missing).
+        let mut registry = CommandRegistry::new(vec![Arc::new(DummyCommand {
+            name: "exit",
+            aliases: &[],
+        })]);
+        registry.set_acp_state(
+            &[agent_client_protocol::AvailableCommand::new(
+                "switch".to_string(),
+                "Switch model for this session only".to_string(),
+            )],
+            None,
+        );
+        let trigger = registry
+            .triggers()
+            .iter()
+            .find(|t| t.canonical == "switch")
+            .expect("enabled ACP command must produce a trigger");
+        assert_eq!(trigger.source, CommandSource::Acp);
+        assert_eq!(trigger.display, "/switch");
+        assert_eq!(trigger.description, "Switch model for this session only");
+        assert!(registry.get("switch").is_some());
+    }
+
+    #[test]
+    fn disabled_acp_command_keeps_key_but_drops_trigger() {
+        // The disabled gate is menu-only for ACP commands: no trigger (no dropdown row)
+        // while the key entry survives so is_disabled() can name it on the send path.
+        let mut registry = CommandRegistry::new(vec![Arc::new(DummyCommand {
+            name: "exit",
+            aliases: &[],
+        })]);
+        registry.set_acp_state(
+            &[agent_client_protocol::AvailableCommand::new(
+                "security".to_string(),
+                "Run a security review".to_string(),
+            )],
+            None,
+        );
+        registry.set_disabled_commands(&["security".to_string()]);
+        assert!(!registry.triggers().iter().any(|t| t.canonical == "security"));
+        assert!(registry.is_disabled("security"));
+        // Re-enabling restores the trigger.
+        registry.set_disabled_commands(&[]);
+        assert!(registry.triggers().iter().any(|t| t.canonical == "security"));
+    }
 
     fn acp_workflow(
         name: &str,

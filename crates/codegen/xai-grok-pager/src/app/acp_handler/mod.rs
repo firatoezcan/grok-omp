@@ -448,11 +448,28 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                     is_active
                 }
                 None => {
-                    tracing::debug!(
-                        session_id = notif.request.session_id.0.as_ref(),
-                        agent_count = app.agents.len(),
-                        "load-race: session/update DROPPED — no agent matches session_id (view not loaded yet?)"
-                    );
+                    // An AvailableCommandsUpdate that loses the bind race (arrived after the agent
+                    // sent session/new|load but before the response bound session_id) must not be
+                    // dropped: it carries the session's whole slash catalog, and losing it leaves
+                    // the agent with builtins only — OMP commands never complete. Stash it per
+                    // session id; tick() applies it once the owning agent binds.
+                    if let acp::SessionUpdate::AvailableCommandsUpdate(update) =
+                        notif.request.update
+                    {
+                        tracing::debug!(
+                            session_id = notif.request.session_id.0.as_ref(),
+                            commands = update.available_commands.len(),
+                            "load-race: available_commands_update stashed — no agent matches session_id yet"
+                        );
+                        app.pending_acp_commands
+                            .insert(notif.request.session_id.to_string(), update);
+                    } else {
+                        tracing::debug!(
+                            session_id = notif.request.session_id.0.as_ref(),
+                            agent_count = app.agents.len(),
+                            "load-race: session/update DROPPED — no agent matches session_id (view not loaded yet?)"
+                        );
+                    }
                     false
                 }
             };

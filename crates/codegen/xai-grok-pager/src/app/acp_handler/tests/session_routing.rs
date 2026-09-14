@@ -216,6 +216,44 @@
     }
 
     #[test]
+    fn commands_update_for_unbound_session_is_stashed_and_applied_on_bind() {
+        // Regression: an AvailableCommandsUpdate that arrives before the session/new response
+        // binds session_id must not be dropped — it carries the session's whole slash catalog.
+        // Stash it and apply once the owning agent binds (tick() drains the stash).
+        let mut app = make_app_with_agent("sess-A");
+
+        let _ = handle(
+            make_commands_update_message("sess-new", &["security", "switch"]),
+            &mut app,
+        );
+        assert!(
+            app.pending_acp_commands.contains_key("sess-new"),
+            "unmatched AvailableCommandsUpdate must be stashed, not dropped"
+        );
+
+        // The session/new response lands: agent binds the id, then tick() applies the stash.
+        insert_agent(&mut app, AgentId(1), None);
+        app.agents
+            .get_mut(&AgentId(1))
+            .unwrap()
+            .bind_session_id(acp::SessionId::new("sess-new"));
+        app.tick();
+
+        let agent = app.agents.get(&AgentId(1)).unwrap();
+        let names: Vec<&str> = agent
+            .session
+            .available_commands
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(names, ["security", "switch"]);
+        assert!(
+            !app.pending_acp_commands.contains_key("sess-new"),
+            "stash must be drained once applied"
+        );
+    }
+
+    #[test]
     fn bg_task_stdout_for_inactive_agent_lands_in_its_bg_tasks() {
         let mut app = make_app_with_agent("sess-A");
         insert_agent(&mut app, AgentId(1), Some("sess-B"));

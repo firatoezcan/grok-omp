@@ -978,6 +978,12 @@ pub struct AppView {
     /// Initially populated from `InitializeResponse.meta.availableCommands` (AlwaysOn builtins only).
     /// Subsequent sessions thus start with the full command catalog immediately.
     pub bootstrap_acp_commands: Vec<agent_client_protocol::AvailableCommand>,
+    /// `AvailableCommandsUpdate`s that lost the bind race: they arrived after the agent sent
+    /// `session/new`/`session/load` but before the response bound `session_id`, so routing found
+    /// no owner. Stashed per session id and applied in `tick()` once the owning agent binds —
+    /// without this the session's slash catalog stays empty forever (OMP commands never complete).
+    pub pending_acp_commands:
+        std::collections::HashMap<String, agent_client_protocol::AvailableCommandsUpdate>,
     /// Auth methods from the ACP connection (preserved for re-login after logout).
     pub auth_methods: Vec<acp::AuthMethod>,
     /// Authentication state for the welcome screen login flow.
@@ -1608,6 +1614,7 @@ impl AppView {
             resume_local_miss: None,
             agent_override: None,
             bootstrap_acp_commands,
+            pending_acp_commands: std::collections::HashMap::new(),
             auth_methods: Vec::new(),
             auth_state: AuthState::Done,
             trust_state: TrustState::Done,
@@ -5450,6 +5457,35 @@ impl AppView {
         }
         let mut bootstrap_commands_update: Option<Vec<agent_client_protocol::AvailableCommand>> =
             None;
+        // Apply `AvailableCommandsUpdate`s that arrived before their session bound (stashed by the
+        // notification router when no agent owned the session id yet). Routing through
+        // `handle_update` keeps the tracker drain (`take_pending_acp_commands`/`_tools`) identical
+        // to the live path, so the generation bump below drives `sync_acp_commands` this same tick.
+        if !self.pending_acp_commands.is_empty() {
+            for agent in self.agents.values_mut() {
+                let Some(sid) = agent.session.session_id.as_ref().map(|s| s.to_string()) else {
+                    continue;
+                };
+                if let Some(update) = self.pending_acp_commands.remove(&sid) {
+                    agent.session.handle_update(
+                        acp::SessionUpdate::AvailableCommandsUpdate(update),
+                        &crate::acp::meta::NotificationMeta::default(),
+                        &mut agent.scrollback,
+                    );
+                    if let Some(commands) = agent.session.tracker.take_pending_acp_commands() {
+                        agent.session.replace_available_commands(
+                            commands,
+                            crate::app::command_catalog::CommandCatalogSource::SessionUpdate,
+                        );
+                        crate::app::acp_handler::refresh_workflow_run_capabilities(agent);
+                    }
+                    if let Some(tools) = agent.session.tracker.take_pending_acp_tools() {
+                        agent.session.available_tools = Some(tools.into_iter().collect());
+                    }
+                    needs_redraw = true;
+                }
+            }
+        }
         for agent in self.agents.values_mut() {
             needs_redraw |= agent.edit_hl_tick();
             for child in agent.subagent_views.values_mut() {

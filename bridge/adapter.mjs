@@ -1356,6 +1356,8 @@ class ExtSurface {
 		this.mcpServers = [];
 		/** Last available_commands_update payload. */
 		this.commands = [];
+		/** Resolvers parked by commands/list while the first ACU is in flight. */
+		this.commandsWaiters = [];
 		/** Last usage_update payload ({size, used}). */
 		this.usage = null;
 		/** initialize result (agent name/version). */
@@ -1530,6 +1532,11 @@ class ExtSurface {
 			switch (update.sessionUpdate) {
 				case "available_commands_update":
 					this.commands = update.availableCommands ?? [];
+					// Release commands/list waiters parked while the first ACU was in flight.
+					for (const w of this.commandsWaiters.splice(0)) {
+						clearTimeout(w.timer);
+						w.resolve({ commands: this.commands });
+					}
 					break;
 				case "usage_update":
 					this.usage = { size: update.size, used: update.used };
@@ -2384,8 +2391,27 @@ class ExtSurface {
 				if (this.lastCost != null) usage.costUsdTicks = Math.round(this.lastCost * 1e10);
 				return this.answer({ usage });
 			}
-			case "commands/list":
+			case "commands/list": {
+				// The pager fires this right after session/new, racing OMP's bootstrap
+				// available_commands_update (which lands ~50ms later). Answering [] here
+				// is worse than useless: the pager discards empty results, so a session
+				// whose ACU was dropped (bind race) could never heal. Wait briefly for
+				// the first ACU when a session exists but no catalog has arrived yet.
+				if (this.commands.length === 0 && this.session) {
+					return {
+						action: "answerAsync",
+						promise: new Promise((resolve) => {
+							const waiter = { resolve, timer: null };
+							waiter.timer = setTimeout(() => {
+								this.commandsWaiters = this.commandsWaiters.filter((w) => w !== waiter);
+								resolve({ commands: this.commands });
+							}, 2000);
+							this.commandsWaiters.push(waiter);
+						}),
+					};
+				}
 				return this.answer({ commands: this.commands });
+			}
 			case "prompt_history":
 				return this.answer({ prompts: readOmpPromptHistory(p) });
 			case "bundle/status":
