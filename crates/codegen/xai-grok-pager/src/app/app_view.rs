@@ -5490,6 +5490,25 @@ impl AppView {
                 }
             }
         }
+        // The hidden home session's catalog lands via `available_commands_update` while the user
+        // still sits on Welcome (or the dashboard): the Agent arm below never runs for it, so
+        // mirror its sync here — welcome_prompt and dashboard.dispatch pick the catalog up through
+        // `bootstrap_commands_update` at the end of this tick. Syncing the home agent's own prompt
+        // eagerly keeps `acp_synced_generation` truthful, so `reveal_home_session` stays a no-op.
+        if let Some(home_id) = self.home_session_agent
+            && self.active_view != ActiveView::Agent(home_id)
+            && let Some(home) = self.agents.get_mut(&home_id)
+            && home.acp_synced_generation != home.session.available_commands_generation
+        {
+            home.prompt.sync_acp_commands(
+                &home.session.available_commands,
+                home.session.available_tools.as_ref(),
+                &home.session.models,
+            );
+            home.acp_synced_generation = home.session.available_commands_generation;
+            bootstrap_commands_update = Some(home.session.available_commands.clone());
+            needs_redraw = true;
+        }
         for agent in self.agents.values_mut() {
             needs_redraw |= agent.edit_hl_tick();
             for child in agent.subagent_views.values_mut() {

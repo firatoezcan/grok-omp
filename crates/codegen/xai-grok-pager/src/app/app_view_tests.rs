@@ -1751,6 +1751,42 @@ fn welcome_prompt_drops_disabled_acp_commands() {
     );
 }
 #[test]
+fn welcome_prompt_syncs_home_agent_catalog_in_tick() {
+    // OMP never sets initialize-meta availableCommands; the catalog arrives later as an
+    // `available_commands_update` on the hidden home session while the user still sits on
+    // Welcome. tick() must mirror the Agent-arm sync so the welcome composer offers it.
+    let mut app = test_app_with_agent();
+    let id = super::super::agent::AgentId(0);
+    // Re-hide the agent as the unused home session: welcome stays the active view.
+    app.active_view = ActiveView::Welcome;
+    app.home_session_agent = Some(id);
+    app.agents
+        .get_mut(&id)
+        .unwrap()
+        .session
+        .replace_available_commands(
+            vec![acp::AvailableCommand::new(
+                "security".to_string(),
+                "Security scan".to_string(),
+            )],
+            crate::app::command_catalog::CommandCatalogSource::SessionUpdate,
+        );
+    app.tick();
+    assert!(
+        app.welcome_prompt
+            .slash_controller
+            .registry()
+            .get("security")
+            .is_some(),
+        "home-agent ACU catalog must reach the welcome composer via tick()"
+    );
+    assert_eq!(
+        app.bootstrap_acp_commands.len(),
+        1,
+        "bootstrap catalog must track the home agent's commands"
+    );
+}
+#[test]
 fn apply_auth_meta_lifts_restrictions_for_paid_tiers_and_teams() {
     let mut app = test_app();
     advertise_media_tools(&mut app);
