@@ -1699,6 +1699,58 @@ fn apply_auth_meta_restricts_usage_for_x_basic_tier() {
     assert_tier_restricted_commands_absent(&app);
 }
 #[test]
+fn welcome_prompt_seeds_bootstrap_acp_commands() {
+    // Cold launch sits on the welcome screen before any session view exists; the composer must
+    // already offer the ACP catalog handed to `AppView::new` (same source `dashboard.dispatch` uses).
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let app = AppView::new(
+        tx,
+        ModelState::default(),
+        vec![acp::AvailableCommand::new(
+            "security".to_string(),
+            "Security scan".to_string(),
+        )],
+        crate::render::draw::EscapeWriter::disconnected(),
+    );
+    assert!(matches!(app.active_view, ActiveView::Welcome));
+    assert!(
+        app.welcome_prompt
+            .slash_controller
+            .registry()
+            .get("security")
+            .is_some(),
+        "bootstrap ACP command must resolve on the welcome composer"
+    );
+}
+#[test]
+fn welcome_prompt_drops_disabled_acp_commands() {
+    // Settings › OMP disabled list: a disabled OMP command must not complete on the welcome
+    // composer either — the startup wiring applies `omp_disabled_commands` after `current_ui` loads.
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = AppView::new(
+        tx,
+        ModelState::default(),
+        vec![acp::AvailableCommand::new(
+            "security".to_string(),
+            "Security scan".to_string(),
+        )],
+        crate::render::draw::EscapeWriter::disconnected(),
+    );
+    app.is_omp_agent = true;
+    app.current_ui.omp_disabled_commands = vec!["security".to_string()];
+    let disabled = app.omp_disabled_commands().to_vec();
+    app.welcome_prompt.set_disabled_commands(&disabled);
+    let reg = app.welcome_prompt.slash_controller.registry();
+    assert!(
+        reg.is_disabled("security"),
+        "disabled ACP command must stay resolvable for is_disabled"
+    );
+    assert!(
+        !reg.triggers().iter().any(|t| t.display == "/security"),
+        "disabled ACP command must emit no completion trigger"
+    );
+}
+#[test]
 fn apply_auth_meta_lifts_restrictions_for_paid_tiers_and_teams() {
     let mut app = test_app();
     advertise_media_tools(&mut app);

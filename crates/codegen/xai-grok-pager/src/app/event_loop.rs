@@ -1768,6 +1768,11 @@ pub(crate) async fn run(
     super::dispatch::downgrade_displayed_auto_if_gated(&mut app);
     // Seed `/auto` feature-gate visibility from the resolved gate (so `/auto` is offered on the welcome prompt when available)
     app.sync_permission_mode_slash_gate();
+    // Settings › OMP disabled list: the welcome composer offers ACP commands too (seeded in
+    // `AppView::new`), so the same names must drop out of its completion — mirrors
+    // `configure_dashboard_state` for the dashboard dispatch input.
+    let disabled_commands = app.omp_disabled_commands().to_vec();
+    app.welcome_prompt.set_disabled_commands(&disabled_commands);
     // Settings UI language (`[ui].voice_stt_language`) overrides `[voice].language` when set
     // Store the preference (including client-only `auto`); the voice crate resolves the wire code at STT connect
     // Must run after `load_initial_ui_config()` hydrates `current_ui` from disk.

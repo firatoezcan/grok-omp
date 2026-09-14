@@ -1464,6 +1464,10 @@ impl AppView {
         let mut welcome_prompt = PromptWidget::new();
         welcome_prompt.adopt_slash_mru(slash_mru.clone());
         welcome_prompt.adopt_command_tags(command_tags.clone());
+        // Seed the welcome composer with the bootstrap ACP catalog so `/` completes OMP commands
+        // before any session view exists — the same catalog `dashboard.dispatch` gets at open time.
+        // Tool gating disabled (None): no agent toolset is bound yet.
+        welcome_prompt.sync_acp_commands(&bootstrap_acp_commands, None, &models);
         Self {
             pending_startup: None,
             active_view: ActiveView::Welcome,
