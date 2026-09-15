@@ -45,7 +45,7 @@
  * The pager reaches this through `--agent-command "bun bridge/adapter.mjs"`.
  */
 
-import { appendFileSync, closeSync, cpSync, existsSync, ftruncateSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { appendFileSync, closeSync, cpSync, existsSync, ftruncateSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { execFile } from "node:child_process";
@@ -1869,13 +1869,14 @@ function writeCommandCache(commands) {
 	} catch {}
 }
 
-/** Isolated OMP agent dir (same resolution as `ompAgentDbPath`, without the filename). */
+/**
+ * The agent dir the OMP CHILD actually uses: PI_CODING_AGENT_DIR when the
+ * launcher sets it, else OMP's own default ~/.omp/agent. Must mirror the
+ * child's resolution — NOT the adapter's GROK_HOME fallback — or cleanup of
+ * the prefetch session file would look in the wrong tree and leave ghosts.
+ */
 function ompAgentDir() {
-	const dir = process.env.PI_CODING_AGENT_DIR;
-	if (dir) return dir;
-	const grokHome = process.env.GROK_HOME;
-	if (grokHome) return join(grokHome, "omp", "agent");
-	return null;
+	return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".omp", "agent");
 }
 
 /**
@@ -1894,8 +1895,12 @@ function deleteSessionFile(sessionId) {
 			try {
 				if (!statSync(dirPath).isDirectory()) continue;
 				for (const file of readdirSync(dirPath)) {
+					// Exact session-id match: `<ts>_<sid>.jsonl` for the file and
+					// `<ts>_<sid>/` for its companion dir (advisor tail etc.).
 					if (file.endsWith(`_${sessionId}.jsonl`)) {
 						unlinkSync(join(dirPath, file));
+					} else if (file.endsWith(`_${sessionId}`)) {
+						rmSync(join(dirPath, file), { recursive: true, force: true });
 					}
 				}
 			} catch {}
