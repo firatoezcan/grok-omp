@@ -285,10 +285,22 @@ lands (~50 ms after `session/new`). The first real update replaces the cache
 wholesale, so stale entries self-heal.
 
 When both sides define the same name, **the pager's builtin wins** and the OMP
-command is hidden from the menu (marked *shadowed* below). OMP commands that
-exist only in OMP's own TUI (no text-mode handler) are never advertised —
-typing them sends literal text to the model. The one exception is `/vibe`,
-which the adapter intercepts and translates into a mode switch.
+command is hidden from the menu (marked *shadowed* below) — with one
+exception: a small set of xAI-shell builtins that are dead behind an external
+agent (`/btw`, `/clear`, `/login`, `/logout`) **defers** to the
+agent-advertised command of the same name. A typed invocation resolves to
+OMP's handler and passes through to `session/prompt`; an alias claim shadows
+only the alias key (`/clear` goes to OMP, canonical `/new` stays builtin).
+OMP commands that exist only in OMP's own TUI (no text-mode handler) are
+never advertised — typing them sends literal text to the model. The one
+exception is `/vibe`, which the adapter intercepts and translates into a mode
+switch.
+
+Interactive OMP commands work headless: the adapter advertises the ACP
+`elicitation` capability (form + URL), so OMP's prompts — provider pickers,
+save-location questions, multi-selects — render as the pager's question cards
+instead of being auto-approved, and URL-mode cards dismiss on
+`elicitation/complete`.
 
 ### Pager builtins
 
@@ -299,16 +311,16 @@ which the adapter intercepts and translates into a mode switch.
 | `/dashboard` (aliases `agents-dashboard`, `sessions`) | Agent Dashboard: live roster of sessions | Roster synthesized by the adapter |
 | `/workflows` | Browse installed workflows | Empty — OMP workflows aren't surfaced over ACP |
 | `/plugins` (alias `plugin`) | Extensions modal, plugins tab | Lists OMP plugins; enable/disable works; install/uninstall report "unsupported" |
-| `/btw <question>` | Ask a side question without interrupting | **Errors** — OMP has no side-question channel over ACP |
+| `/btw <question>` | Ask a side question without interrupting | **Defers to OMP** — runs OMP's ephemeral side-question turn |
 | `/voice` | Toggle dictation | See [Voice dictation](#voice-dictation) |
-| `/new` (alias `clear`) | Start a new session | |
+| `/new` (alias `clear`) | Start a new session | The `clear` alias is claimed by OMP's `/clear` (context reset in place); `/new` still starts a fresh session |
 | `/effort <level>` | Set reasoning effort on the current model | |
 | `/model` (alias `m`) | Switch model (and optionally effort) | See [Models & effort](#models--effort) |
 | `/context` | Context-window usage breakdown | Real used/total from OMP's usage updates |
 | `/compact [instructions]` | Compact conversation history | Runs OMP's real `/compact` as a queued turn |
 | `/fork` | Branch the session into a peer agent | |
 | `/resume` | Session picker | |
-| `/loop [interval] <prompt>` | Re-run a prompt on an interval | **Not offered** — requires the scheduler tool, which OMP doesn't advertise |
+| `/loop [interval] <prompt>` | Re-run a prompt on an interval | Menu-hidden (the pager builtin needs `scheduler_create`, which OMP doesn't advertise), but a typed `/loop` passes through to OMP's loop mode — see the OMP table |
 | `/plan [description]` | Enter plan mode | Real OMP mode; approval card bridged from OMP's elicitation |
 | `/view-plan` (aliases `show-plan`, `plan-view`) | View the current plan | |
 | `/vibe [on\|off\|prompt]` | Toggle vibe mode | See [Vibe mode](#vibe-mode) |
@@ -356,8 +368,8 @@ which the adapter intercepts and translates into a mode switch.
 | `/privacy` | Coding-data retention settings | xAI-account surface; no effect under OMP |
 | `/doctor` (aliases `terminal-setup`, `terminal-check`, `terminal-info`) | Check the session and show fixes | |
 | `/import-claude` | Import Claude settings | |
-| `/login` | Log in | Shows an auth error — no xAI login exists behind OMP |
-| `/logout` | Log out | **Errors** — nothing to log out of at the ACP layer |
+| `/login` | Log in | **Defers to OMP** — renders OMP's provider-select card |
+| `/logout` | Log out | **Defers to OMP** — renders OMP's "Log out of which provider?" card |
 | `/home` (alias `welcome`) | Return to the welcome screen | |
 | `/delete` | Delete this session | **Errors** — no delete over ACP |
 | `/help` | Browse commands and shortcuts | |
@@ -382,12 +394,18 @@ shadowed — the pager's version runs instead.
 | `/force: <tool> [prompt]` | Force the next turn to use a specific tool | |
 | `/ssh <subcommand>` | Manage SSH hosts (add, list, remove) | |
 | `/fresh` | Reset provider stream state without changing the transcript | |
+| `/clear` | Clear the conversation context in place, keeping the session | **Claims** the pager's `clear` alias (`/new` stays builtin) |
+| `/drop` | Delete the current session and start a new one | |
 | `/compact` | Compact the conversation | **Shadowed** — pager's `/compact` forwards to this |
 | `/shake [elide\|images\|thinking]` | Drop heavy content from context | |
 | `/handoff [focus]` | Summarize into a handoff document and compact in place | |
 | `/pin [session id]` | Pin/unpin a session atop the resume list | |
 | `/retry` | Retry the last failed agent turn | |
 | `/memory <subcommand>` | Inspect and operate memory maintenance | |
+| `/btw <question>` | Ask an ephemeral side question using the session context | **Claims** the pager's `/btw` (the xAI builtin errored) |
+| `/tan <work>` | Run a full background agent on tangential work | |
+| `/omfg <complaint>` | Forge a TTSR rule from a complaint to stop a recurring behavior | Save-location/overwrite prompts render as elicitation cards |
+| `/cleanse [request] [--all]` | Detect and fix project diagnostics with weighted parallel subagents | Target/request prompts render as elicitation cards |
 | `/rename [title]` | Rename the session (omit to generate) | **Shadowed** — pager's `/rename` errors |
 | `/move [<path>]` | Move the session to a different directory | |
 | `/wt [<branch>]` (alias `worktree`) | Move this session into a new worktree, changes included | |
@@ -403,6 +421,9 @@ shadowed — the pager's version runs instead.
 | `/extended-context [on\|off\|status]` | Toggle extended context windows | |
 | `/computer [on\|off\|status]` | Toggle the native computer-use eval prelude | |
 | `/prewalk` | Switch to a fast/cheap model at the next action | |
+| `/goal [set\|show\|pause\|resume\|drop\|budget]` | Persistent autonomous objective for this session | Continuation turns are scheduled by OMP after each settled turn |
+| `/guided-goal [rough objective]` | Have the agent interview you in chat, then set up goal mode | |
+| `/loop [count\|duration] [--while\|--until '<cmd>'] [prompt]` | Loop mode: re-submit the next prompt after every yield | Not in the menu (name collides with the tool-gated pager builtin) — type it; Esc cancels the current iteration, `/loop` again disables |
 | `/todo <subcommand>` | Manage the agent's todo list | |
 | `/session [info\|delete\|pin]` | Show or configure the current session | |
 | `/jobs` | Show async background jobs | |
@@ -412,15 +433,18 @@ shadowed — the pager's version runs instead.
 | `/tools` | Show tools currently visible to the agent | |
 | `/context` | Estimated context-usage breakdown | **Shadowed** — pager's `/context` shows the real window |
 | `/mcp <subcommand>` | Manage MCP servers (add, list, remove, test) | |
+| `/login [provider]` | Log in with an OAuth provider | **Claims** the pager's `/login`; bare `/login` renders the provider-select card |
+| `/logout [provider]` | Log out of an OAuth provider | **Claims** the pager's `/logout`; bare `/logout` renders a picker over stored credentials |
 
 Not advertised (OMP-TUI-only, no text-mode handler): `/collab`, `/join`,
-`/leave`, `/copy`, `/open`, `/live`, `/pause`, `/quit`, `/new`, `/clear`,
-`/drop`, `/resume`, `/btw`, `/tan`, `/omfg`, `/cleanse`, `/debug`, `/exit`,
-`/restart`, `/settings`, `/setup`, `/plan`, `/plan-review`, `/vibe`, `/goal`,
-`/guided-goal`, `/loop`, `/queue`, `/hotkeys`, `/extensions`, `/agents`,
-`/git`, `/hub`, `/branch`, `/fork`, `/tree`, `/login`, `/logout`. Typing one of
-these sends it to the model as literal text — except `/vibe`, which the adapter
-intercepts (see [Vibe mode](#vibe-mode)), and names the pager itself handles.
+`/leave`, `/copy`, `/open`, `/live`, `/pause`, `/quit`, `/new`, `/resume`,
+`/debug`, `/exit`, `/restart`, `/settings`, `/setup`, `/plan`,
+`/plan-review`, `/vibe`, `/queue`, `/hotkeys`, `/extensions`, `/agents`,
+`/git`, `/hub`, `/branch`, `/fork`, `/tree`. Typing one of these sends it to
+the model as literal text — except `/vibe`, which the adapter intercepts (see
+[Vibe mode](#vibe-mode)), and names the pager itself handles (`/settings`,
+`/new`, `/resume`, `/queue`, `/plan`, `/fork`, `/quit`, `/copy`, `/debug`
+all remain working pager builtins).
 
 ---
 
