@@ -2120,6 +2120,20 @@ fn pager_registry_default_matches_agent_view_new_initializer() {
                          truth.",
                 );
             }
+            // omp_providers: nav row — the sheet reads live auth state from the agent,
+            // so there is no persisted value and no `AgentView::new` initializer to pin.
+            ("omp_providers", SettingKind::OmpProviders) => {}
+            // Info rows are read-only; `AppView::new` starts with no OMP status values
+            // (they fill in when the ACP initialize handshake lands).
+            ("omp_agent_version" | "omp_agent_command" | "omp_vibe_capable", SettingKind::Info) => {
+                assert!(
+                    app.omp_agent_info.is_none()
+                        && app.omp_agent_command.is_none()
+                        && app.omp_vibe_capable.is_none(),
+                    "AppView::new must start with no OMP status values — an Info row's \
+                     'default' is just 'no live value yet'",
+                );
+            }
             _ => {
                 panic!(
                     "PAGER setting `{}` has no arm in \
