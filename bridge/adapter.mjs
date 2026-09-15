@@ -886,10 +886,10 @@ function vibeContentBlocks(content) {
 // ---------------------------------------------------------------------------
 // session-file tailer: several OMP surfaces never reach the ACP wire —
 //   - advisor notes (custom_message/customType:"advisor"): mapAssistantMessageEnd
-//     drops non-assistant messages live and #extractReplayContent skips their
-//     string content on replay, so we synthesize the user_message_chunk frames
-//     OMP's replay would have sent; observeAdvisoryChunk then splits/meta-stamps
-//     them exactly like a wire frame.
+//     drops non-assistant messages live and replay skips their string content,
+//     so we synthesize the user_message_chunk frames; observeAdvisoryChunk then
+//     splits/meta-stamps them exactly like a wire frame. On session/load the
+//     ReplayMatcher interleaves them at their original positions (see below).
 //   - vibe lifecycle (custom/customType:"vibe-session-lifecycle"): the durable
 //     worker roster — spawn/turn-settled/tombstone drive subagent_* synthesis.
 //   - async results (custom_message/customType:"async-result"): settled worker
@@ -922,7 +922,7 @@ class SessionTailer {
 	}
 
 	/** Point the tailer at a session; no-op when already attached. */
-	attach(sessionId) {
+	attach(sessionId, plan) {
 		if (!sessionId || this.sessionId === sessionId) return;
 		log(`session tailer: attach ${sessionId}`);
 		this.sessionId = sessionId;
@@ -931,6 +931,25 @@ class SessionTailer {
 		this.pending = "";
 		this.seen.clear();
 		this.children.clear();
+		this.skipCatchUp = false;
+		if (plan) {
+			// The replay plan already emitted (or will emit) every historical
+			// synthesized unit at its original position — the tailer must not
+			// re-emit them as a bottom-of-transcript catch-up burst. Seed `seen`
+			// so a full-rewrite rescan stays quiet too.
+			for (const key of plan.seenKeys) this.seen.add(key);
+			if (plan.sessionId === sessionId) {
+				// load/resume: the plan's file IS this session's file — start
+				// tailing where the plan stopped reading.
+				this.file = plan.file;
+				this.offset = plan.fileSize;
+				log(`session tailer: file ${this.file} (post-replay offset ${this.offset})`);
+			} else {
+				// fork: the plan read the SOURCE file; the new session's file is
+				// found by poll() and skipped to EOF on discovery.
+				this.skipCatchUp = true;
+			}
+		}
 		if (!this.timer) {
 			this.timer = setInterval(() => this.poll(), 400);
 			this.timer.unref?.();
@@ -985,7 +1004,18 @@ class SessionTailer {
 		if (!this.sessionId) return;
 		if (!this.file) {
 			this.file = findOmpSessionFile(this.sessionId);
-			if (this.file) log(`session tailer: file ${this.file}`);
+			if (this.file) {
+				log(`session tailer: file ${this.file}`);
+				if (this.skipCatchUp) {
+					// Forked session: the file starts as a copy of the source's
+					// history — already covered by the plan's seenKeys. Skip to EOF
+					// so only genuinely new entries tail.
+					this.skipCatchUp = false;
+					try {
+						this.offset = statSync(this.file).size;
+					} catch {}
+				}
+			}
 		}
 		if (this.file) {
 			const lines = this.readNewLines(this);
@@ -1088,6 +1118,560 @@ class SessionTailer {
 		if (child.seen.has(key)) return;
 		child.seen.add(key);
 		for (const frame of this.ext.observeVibeChildEntry(workerId, entry, child)) this.emit(frame, true);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// replay interleave: on session/load|resume|fork OMP replays history as
+// session/update notifications, but the entries the tailer synthesizes
+// (advisor notes, async results, vibe lifecycle) never produce replay frames.
+// The tailer only learns the file after the replay already streamed, so its
+// catch-up burst lands at the bottom of the transcript instead of at the
+// turns the entries belong to. To restore positions the adapter predicts
+// OMP's replay stream from the session file — mirroring
+// `SessionManager.buildSessionContext()` + `#replaySessionHistory`'s
+// message→update mapping — and queues each synthesized unit until the first
+// replay frame of the entry that originally followed it arrives, emitting the
+// queued units just before that frame. Anything still queued flushes right
+// before the load response, which is where the tailer burst used to land.
+// ---------------------------------------------------------------------------
+
+/** `ee()` — plain-object check used by the rollover branch. */
+function ee(v) {
+	return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/** `xa()` in OMP's replay: thinking whose text is only dots/ellipsis/whitespace replays as nothing. */
+function replayTrimThinking(text) {
+	if (!text) return "";
+	const t = String(text).trim();
+	for (let i = 0; i < t.length; i++) {
+		const c = t.charCodeAt(i);
+		if (c !== 46 && c !== 8230 && c !== 32 && c !== 9 && c !== 10 && c !== 13) return t;
+	}
+	return "";
+}
+
+/** `qds()` in OMP's replay: toolCall arguments arrive as an object or a JSON string. */
+function replayToolArgs(args) {
+	if (typeof args !== "string") return args ?? {};
+	try {
+		return JSON.parse(args);
+	} catch {
+		return args;
+	}
+}
+
+/**
+ * `Dds()` in OMP's replay: hub list/inbox/send/wait calls are internal and
+ * replay as no frames. The read/write→hub path indirection (`ryo`) is not
+ * reproduced — it needs OMP's device registry; a missed filter only shifts a
+ * synthesized unit one boundary late.
+ */
+function replayFiltersTool(toolName, args) {
+	if (toolName !== "hub") return false;
+	if (typeof args !== "object" || args === null) return false;
+	switch (args.op) {
+		case "list":
+		case "inbox":
+			return true;
+		case "send":
+			return typeof args.to === "string";
+		case "wait":
+			return typeof args.from === "string" && args.ids === undefined;
+		default:
+			return false;
+	}
+}
+
+/** `#We()` in OMP's replay: message content → ACP content blocks (text/image only). */
+function replayContentBlocks(content) {
+	const blocks = [];
+	if (!Array.isArray(content)) return blocks;
+	for (const b of content) {
+		if (typeof b !== "object" || b === null || !("type" in b)) continue;
+		if (b.type === "text" && typeof b.text === "string" && b.text.length > 0) {
+			blocks.push({ type: "text", text: b.text });
+		} else if (b.type === "image" && typeof b.data === "string" && typeof b.mimeType === "string") {
+			blocks.push({ type: "image", data: b.data, mimeType: b.mimeType });
+		}
+	}
+	return blocks;
+}
+
+/** `sg()`: silent aborts suppress the errorMessage fallback chunk. */
+function replaySilentAbort(msg) {
+	return msg?.errorMessage === "__omp.silent_abort__";
+}
+
+/** `Z0()`: an errored assistant message with no visible content is dropped from replay. */
+function replayEmptyErrorAssistant(msg) {
+	if (msg?.stopReason !== "error") return false;
+	const content = Array.isArray(msg.content) ? msg.content : [];
+	return !content.some((b) => {
+		switch (b?.type) {
+			case "text":
+				return typeof b.text === "string" && b.text.trim().length > 0;
+			case "thinking":
+				return (
+					(typeof b.thinking === "string" && b.thinking.trim().length > 0) ||
+					(typeof b.thinkingSignature === "string" && b.thinkingSignature.trim().length > 0)
+				);
+			case "redactedThinking":
+				return typeof b.data === "string" && b.data.trim().length > 0;
+			case "toolCall":
+				return true;
+			case "fallback":
+				return false;
+			default:
+				return true;
+		}
+	});
+}
+
+/** `Dwl()`: entries replayed ahead of an experimental context-rollover compaction. */
+function replayRolloverEntry(entry) {
+	if (entry?.type === "message") {
+		if (entry.message?.role === "user") return true;
+		if (entry.message?.role === "custom") {
+			const m = entry.message;
+			return (
+				(m.customType === "skill-prompt" || m.customType === "collab-prompt") &&
+				m.attribution === "user"
+			);
+		}
+		return false;
+	}
+	if (entry?.type === "custom_message") {
+		if (typeof entry.content !== "string" && !Array.isArray(entry.content)) return false;
+		return (
+			(entry.customType === "skill-prompt" || entry.customType === "collab-prompt") &&
+			entry.attribution === "user"
+		);
+	}
+	return false;
+}
+
+/**
+ * Predict the replay stream for one session file. Returns
+ * `{file, fileSize, sessionId, units, seenKeys}` where `units` is the ordered
+ * mix of replayed-message units (`kind:"msg"`, `sig` = first predicted frame)
+ * and synthesized units (`kind:"advisor"|"async"|"vibe"`) at their original
+ * positions. `seenKeys` covers every parsed entry so the tailer never
+ * re-emits history the plan already placed.
+ */
+function buildReplayPlan(sessionId) {
+	const file = findOmpSessionFile(sessionId);
+	if (!file) return null;
+	let raw;
+	try {
+		raw = readFileSync(file, "utf8");
+	} catch {
+		return null;
+	}
+	let fileSize = raw.length;
+	try {
+		fileSize = statSync(file).size;
+	} catch {}
+
+	const entries = [];
+	const byId = new Map();
+	const seenKeys = new Set();
+	for (const line of raw.split("\n")) {
+		if (!line.trim()) continue;
+		let entry;
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (typeof entry !== "object" || entry === null) continue;
+		entries.push(entry);
+		seenKeys.add(entry.id ?? line);
+		if (typeof entry.id === "string") byId.set(entry.id, entry);
+	}
+	if (entries.length === 0) return { file, fileSize, sessionId, units: [], seenKeys };
+
+	// The replayed branch is the parentId chain ending at the last entry —
+	// linear files replay whole, edited/branched sessions replay the live path.
+	let leaf = null;
+	for (let i = entries.length - 1; i >= 0; i--) {
+		if (typeof entries[i].id === "string") {
+			leaf = entries[i];
+			break;
+		}
+	}
+	let chain;
+	if (!leaf) {
+		chain = entries;
+	} else {
+		chain = [];
+		const seen = new Set();
+		for (let e = leaf; e && !seen.has(e.id); e = byId.get(e.parentId)) {
+			seen.add(e.id);
+			chain.push(e);
+		}
+		chain.reverse();
+		if (chain.length === 0) chain = entries;
+	}
+
+	// -- window: buildSessionContext() non-transcript path -------------------
+	const lastReset = chain.reduce((acc, e, i) => (e.type === "reset_boundary" ? i : acc), -1);
+	let compactionIdx = -1;
+	for (let i = chain.length - 1; i >= 0; i--) {
+		if (chain[i].type === "compaction") {
+			compactionIdx = i;
+			break;
+		}
+	}
+
+	const units = [];
+	const pushMsg = (msg, entry) =>
+		units.push({ kind: "msg", role: msg.role, customType: msg.customType, msg, entry, inR: true });
+	const pushEntry = (e) => {
+		if (e.type === "message") {
+			const m = e.message;
+			if (!m || typeof m !== "object") return;
+			if (m.role === "assistant" && (m.retryRecovery || replayEmptyErrorAssistant(m))) return;
+			pushMsg(m, e);
+			return;
+		}
+		if (e.type === "custom_message") {
+			if (e.customType === "prewalk-plan" || e.customType === "vibe-mode-context") return;
+			if (typeof e.content !== "string" && !Array.isArray(e.content)) return;
+			if (
+				e.customType === "advisor" &&
+				typeof e.content === "string" &&
+				e.content.includes("<advisory")
+			) {
+				units.push({ kind: "advisor", role: "custom", customType: "advisor", entry: e, inR: true });
+				return;
+			}
+			if (e.customType === "async-result") {
+				const text =
+					typeof e.content === "string"
+						? e.content
+						: Array.isArray(e.content)
+							? e.content.find((c) => c?.type === "text")?.text
+							: undefined;
+				if (typeof text === "string" && text.trim()) {
+					units.push({
+						kind: "async",
+						role: "custom",
+						customType: "async-result",
+						entry: e,
+						text,
+						inR: true,
+					});
+				}
+				return;
+			}
+			// Every other custom_message lands in the replayed message list as
+			// role:"custom" (string content produces no frames; array content
+			// replays as user_message_chunk).
+			pushMsg(
+				{
+					role: "custom",
+					customType:
+						typeof e.customType === "string" && e.customType ? e.customType : "custom-message",
+					content: e.content,
+					attribution: e.attribution === "user" ? "user" : "agent",
+				},
+				e,
+			);
+			return;
+		}
+		if (e.type === "branch_summary" && e.summary) {
+			pushMsg({ role: "branchSummary", summary: e.summary, fromId: e.fromId }, e);
+			return;
+		}
+		if (e.type === "custom" && e.customType === "vibe-session-lifecycle") {
+			const data = e.data;
+			if (data && typeof data === "object" && typeof data.id === "string") {
+				units.push({ kind: "vibe", entry: e, data, inR: false });
+			}
+		}
+	};
+
+	if (lastReset >= 0 && lastReset > compactionIdx) {
+		for (let i = lastReset + 1; i < chain.length; i++) pushEntry(chain[i]);
+	} else if (compactionIdx >= 0) {
+		const d = chain[compactionIdx];
+		// The compaction summary replays as a compactionSummary message — which
+		// carries no `content`, so it emits no frames; kept for strip adjacency.
+		pushMsg({ role: "compactionSummary", summary: d.summary }, d);
+		const remote = d.preserveData?.openaiRemoteCompaction;
+		const hasRemote =
+			remote &&
+			typeof remote === "object" &&
+			typeof remote.provider === "string" &&
+			remote.provider.length > 0 &&
+			Array.isArray(remote.replacementHistory);
+		if (ee(d.details) && d.details.kind === "experimental-context-rollover") {
+			const keptIdx = chain.findIndex((e) => e.id === d.firstKeptEntryId);
+			for (let i = compactionIdx - 1; i > lastReset; i--) {
+				if (!replayRolloverEntry(chain[i])) continue;
+				if (i < keptIdx) pushEntry(chain[i]);
+				break;
+			}
+		}
+		if (!hasRemote) {
+			let started = false;
+			for (let i = 0; i < compactionIdx; i++) {
+				if (chain[i].id === d.firstKeptEntryId) started = true;
+				if (started) pushEntry(chain[i]);
+			}
+		} else if (d.providerReplayThroughEntryId) {
+			const through = chain.findIndex((e) => e.id === d.providerReplayThroughEntryId);
+			if (through >= 0 && through < compactionIdx) {
+				for (let i = through + 1; i < compactionIdx; i++) pushEntry(chain[i]);
+			}
+		}
+		for (let i = compactionIdx + 1; i < chain.length; i++) pushEntry(chain[i]);
+	} else {
+		for (const e of chain) pushEntry(e);
+	}
+
+	// -- dangling tool calls: drop toolCall blocks with no toolResult, then
+	// assistants left with no content at all --------------------------------
+	const resultIds = new Set();
+	for (const u of units) {
+		if (u.kind === "msg" && u.role === "toolResult" && typeof u.msg.toolCallId === "string") {
+			resultIds.add(u.msg.toolCallId);
+		}
+	}
+	for (const u of units) {
+		if (u.kind !== "msg" || u.role !== "assistant" || !Array.isArray(u.msg.content)) continue;
+		const dangling = u.msg.content.filter((b) => b?.type === "toolCall" && !resultIds.has(b.id)).length;
+		if (dangling === 0) continue;
+		const kept = u.msg.content
+			.filter((b) => !(b?.type === "toolCall" && !resultIds.has(b.id)) && b?.type !== "redactedThinking")
+			.map((b) =>
+				b?.type === "thinking" && b.thinkingSignature ? { ...b, thinkingSignature: undefined } : b,
+			);
+		if (kept.length === 0) u.dropped = true;
+		else u.msg = { ...u.msg, content: kept };
+	}
+	const stripped = units.filter((u) => !u.dropped);
+
+	// -- aborted/errored assistants: drop the message and its tool results ---
+	for (let i = stripped.length - 1; i >= 0; i--) {
+		const u = stripped[i];
+		if (u.kind !== "msg" || u.role !== "assistant") continue;
+		if (u.msg.stopReason !== "aborted" && u.msg.stopReason !== "error") continue;
+		const next = stripped[i + 1];
+		if (next?.inR && next.role === "custom" && next.customType === "interrupted-thinking") continue;
+		const callIds = new Set();
+		for (const b of Array.isArray(u.msg.content) ? u.msg.content : []) {
+			if (b?.type === "toolCall") callIds.add(b.id);
+		}
+		stripped.splice(i, 1);
+		if (callIds.size > 0) {
+			for (let j = stripped.length - 1; j >= i; j--) {
+				const v = stripped[j];
+				if (v?.kind === "msg" && v.role === "toolResult" && callIds.has(v.msg.toolCallId)) {
+					stripped.splice(j, 1);
+				}
+			}
+		}
+	}
+
+	// -- first-frame signatures, in replay order -----------------------------
+	const seenToolIds = new Set();
+	const toolArgs = new Map();
+	for (const u of stripped) {
+		u.sig = null;
+		if (u.kind !== "msg") continue;
+		const m = u.msg;
+		if (u.role === "assistant") {
+			const content = Array.isArray(m.content) ? m.content : [];
+			for (const b of content) {
+				if (typeof b !== "object" || b === null || !("type" in b)) continue;
+				if (b.type === "text" && typeof b.text === "string" && b.text.length > 0) {
+					u.sig = { u: "agent_message_chunk", text: b.text };
+					break;
+				}
+				if (b.type === "image" && typeof b.data === "string" && typeof b.mimeType === "string") {
+					u.sig = { u: "agent_message_chunk", image: true };
+					break;
+				}
+				if (b.type === "thinking" && typeof b.thinking === "string") {
+					const t = replayTrimThinking(b.thinking);
+					if (t.length === 0) continue;
+					u.sig = { u: "agent_thought_chunk", text: t };
+					break;
+				}
+				if (
+					(b.type === "toolCall" || b.type === "tool_use") &&
+					typeof b.id === "string" &&
+					typeof b.name === "string"
+				) {
+					const args = b.type === "tool_use" ? b.input : replayToolArgs(b.arguments);
+					seenToolIds.add(b.id);
+					toolArgs.set(b.id, args);
+					if (!replayFiltersTool(b.name, args)) {
+						u.sig = { u: "tool_call", id: b.id };
+						break;
+					}
+				}
+			}
+			if (!u.sig && m.errorMessage && !replaySilentAbort(m)) {
+				u.sig = { u: "agent_message_chunk", text: m.errorMessage };
+			}
+			continue;
+		}
+		if (u.role === "toolResult" && typeof m.toolCallId === "string" && typeof m.toolName === "string") {
+			const args = toolArgs.get(m.toolCallId);
+			if (!replayFiltersTool(m.toolName, args)) {
+				u.sig = seenToolIds.has(m.toolCallId)
+					? { u: "tool_call_update", id: m.toolCallId }
+					: { u: "tool_call", id: m.toolCallId };
+				seenToolIds.add(m.toolCallId);
+			}
+			continue;
+		}
+		// user / developer / custom / hookMessage / bashExecution /
+		// pythonExecution / compactionSummary → user_message_chunk per block.
+		const blocks = replayContentBlocks(m.content);
+		if (blocks.length > 0) {
+			u.sig =
+				blocks[0].type === "text"
+					? { u: "user_message_chunk", text: blocks[0].text }
+					: { u: "user_message_chunk", image: true };
+		}
+	}
+
+	return { file, fileSize, sessionId, units: stripped, seenKeys };
+}
+
+/**
+ * Walks a ReplayPlan alongside the agent→client stream during one
+ * load/resume/fork window. `observe(frame)` returns the synthesized units to
+ * emit BEFORE `frame` is forwarded (empty array for pass-through frames).
+ * Units flush when the first replay frame of a later entry matches; anything
+ * left flushes when the load response arrives.
+ */
+class ReplayMatcher {
+	constructor(plan, requestId, sessionId) {
+		this.plan = plan;
+		this.requestId = requestId;
+		/** Replay session id — known for load/resume, adopted from the wire for fork. */
+		this.sessionId = sessionId;
+		this.cursor = 0;
+		this.lastChunkMessageId = undefined;
+		this.seenToolIds = new Set();
+		this.pendingToolResultId = null;
+		this.done = false;
+	}
+
+	/** @returns {object[]} synthesized units to emit before `frame`. */
+	observe(frame) {
+		if (this.done || !frame || typeof frame !== "object") return [];
+		if (frame.id !== undefined && (frame.result !== undefined || frame.error !== undefined)) {
+			this.done = true;
+			if (frame.id !== this.requestId) return [];
+			if (frame.error !== undefined) return [];
+			return this.flushRest();
+		}
+		if (frame.method !== "session/update") return [];
+		const update = frame.params?.update;
+		if (!update || typeof update !== "object") return [];
+		const kind = update.sessionUpdate;
+		if (
+			kind !== "agent_message_chunk" &&
+			kind !== "agent_thought_chunk" &&
+			kind !== "user_message_chunk" &&
+			kind !== "tool_call" &&
+			kind !== "tool_call_update"
+		) {
+			return [];
+		}
+		const sid = frame.params?.sessionId;
+		if (this.sessionId && sid !== this.sessionId) return [];
+
+		if (kind === "tool_call" || kind === "tool_call_update") {
+			const id = update.toolCallId;
+			if (kind === "tool_call_update" && id === this.pendingToolResultId) {
+				this.pendingToolResultId = null;
+				return [];
+			}
+			if (this.seenToolIds.has(id)) return [];
+			const idx = this.match({ u: kind, id });
+			if (idx < 0) {
+				this.seenToolIds.add(id);
+				return [];
+			}
+			if (!this.sessionId && typeof sid === "string") this.sessionId = sid;
+			this.seenToolIds.add(id);
+			const unit = this.plan.units[idx];
+			if (unit?.kind === "msg" && unit.role === "toolResult" && kind === "tool_call") {
+				this.pendingToolResultId = id;
+			}
+			return this.advanceTo(idx);
+		}
+
+		// chunk frames: same messageId = continuation of the current message.
+		const messageId = update.messageId;
+		if (messageId !== undefined && messageId === this.lastChunkMessageId) return [];
+		const content = update.content;
+		const sig =
+			content?.type === "text" && typeof content.text === "string"
+				? { u: kind, text: content.text }
+				: content?.type === "image"
+					? { u: kind, image: true }
+					: null;
+		if (sig) {
+			const idx = this.match(sig);
+			if (idx >= 0) {
+				if (!this.sessionId && typeof sid === "string") this.sessionId = sid;
+				this.lastChunkMessageId = messageId;
+				return this.advanceTo(idx);
+			}
+		}
+		if (messageId !== undefined) this.lastChunkMessageId = messageId;
+		return [];
+	}
+
+	/** First unit at/after the cursor whose predicted first frame is `sig`. */
+	match(sig) {
+		const units = this.plan.units;
+		for (let i = this.cursor; i < units.length; i++) {
+			const s = units[i].sig;
+			if (!s || s.u !== sig.u) continue;
+			if (sig.id !== undefined) {
+				if (s.id === sig.id) return i;
+				continue;
+			}
+			if (sig.image) {
+				if (s.image) return i;
+				continue;
+			}
+			if (s.text === sig.text) return i;
+		}
+		return -1;
+	}
+
+	/** Emit synthesized units before the matched unit, then move past it. */
+	advanceTo(idx) {
+		const out = [];
+		const units = this.plan.units;
+		while (this.cursor < idx) {
+			const u = units[this.cursor++];
+			if (u.kind !== "msg") out.push(u);
+		}
+		this.cursor = idx + 1;
+		return out;
+	}
+
+	/** Everything still queued — emitted just before the load response. */
+	flushRest() {
+		const out = [];
+		const units = this.plan.units;
+		while (this.cursor < units.length) {
+			const u = units[this.cursor++];
+			if (u.kind !== "msg") out.push(u);
+		}
+		return out;
 	}
 }
 
@@ -3886,6 +4470,57 @@ async function runLive(opts) {
 	// session/load and session/resume responses carry no sessionId; remember
 	// the id from the forwarded request so the response can attach the tailer.
 	const pendingLoadSession = new Map();
+	// session/load|resume|fork in flight: request id → ReplayMatcher. The
+	// matcher interleaves synthesized units (advisor notes, async results, vibe
+	// lifecycle) into OMP's replay stream at their original positions; the plan
+	// also seeds the tailer so history isn't re-emitted as a bottom burst.
+	const pendingReplays = new Map();
+	let activeReplay = null;
+	/** Emit one synthesized replay unit through the same path the tailer uses. */
+	const emitSynthUnit = (unit, sessionId) => {
+		if (unit.kind === "advisor") {
+			const frame = {
+				jsonrpc: "2.0",
+				method: "session/update",
+				params: {
+					sessionId,
+					update: {
+						sessionUpdate: "user_message_chunk",
+						content: { type: "text", text: unit.entry.content },
+						messageId: crypto.randomUUID(),
+					},
+				},
+			};
+			const extras = ext.observeToClient(frame);
+			tape?.record("to_client", frame);
+			forward(frame);
+			for (const extra of extras) {
+				tape?.record("to_client", extra);
+				forward(extra);
+			}
+			return;
+		}
+		if (unit.kind === "async") {
+			const frame = ext.vibeAsyncResultFrame(unit.text, unit.entry.details);
+			if (!frame) return;
+			if (sessionId) frame.params.sessionId = sessionId;
+			const extras = ext.observeToClient(frame);
+			tape?.record("to_client", frame);
+			forward(frame);
+			for (const extra of extras) {
+				tape?.record("to_client", extra);
+				forward(extra);
+			}
+			return;
+		}
+		if (unit.kind === "vibe") {
+			if (unit.data.action === "spawn") tailer.watchChild(unit.data.id);
+			for (const frame of ext.observeVibeLifecycle(unit.data)) {
+				tape?.record("to_client", frame);
+				forward(frame);
+			}
+		}
+	};
 
 	// Both directions run concurrently; each pump owns one direction, so
 	// cross-direction interleaving is preserved without a lock.
@@ -3984,6 +4619,33 @@ async function runLive(opts) {
 			if (decision.rewriteParams) frame.params = decision.rewriteParams;
 			ext.trackForwarded(frame.id, decision.translate);
 		}
+		// Arm the replay interleaver before the request goes out: OMP answers
+		// load/resume/fork by streaming the session history, and the plan must
+		// exist before the first replay frame can arrive.
+		if (
+			frame.id !== undefined &&
+			(frame.method === "session/load" ||
+				frame.method === "session/resume" ||
+				frame.method === "session/fork")
+		) {
+			const sourceId = frame.params?.sessionId;
+			const plan = typeof sourceId === "string" ? buildReplayPlan(sourceId) : null;
+			if (plan) {
+				// load/resume replay under the requested id; fork replays under the
+				// NEW session id, adopted from the first replay frame.
+				const matcher = new ReplayMatcher(
+					plan,
+					frame.id,
+					frame.method === "session/fork" ? undefined : sourceId,
+				);
+				pendingReplays.set(frame.id, matcher);
+				activeReplay = matcher;
+				log(
+					`replay plan: ${plan.units.length} unit(s), ` +
+						`${plan.units.filter((u) => u.kind !== "msg").length} synthesized, file ${plan.file}`,
+				);
+			}
+		}
 		tape?.record("to_agent", frame);
 		emit(frame);
 		drainExt();
@@ -4000,6 +4662,15 @@ async function runLive(opts) {
 			process.stdout.write(`${line}\n`);
 			return;
 		}
+		// Replay interleave: emit any synthesized units that belong before this
+		// frame (advisor notes land at their original positions, not the bottom).
+		if (activeReplay) {
+			for (const unit of activeReplay.observe(frame)) {
+				emitSynthUnit(unit, activeReplay.sessionId ?? activeReplay.plan.sessionId);
+			}
+			if (activeReplay.done) activeReplay = null;
+		}
+
 		// Adapter-internal request responses (virtual-queue dispatches, _omp/*
 		// probes) are consumed here — they must never reach the pager.
 		if (ext.handleAgentResponse(frame)) {
@@ -4023,12 +4694,16 @@ async function runLive(opts) {
 
 		// Attach the advisor tailer once a session is known: session/new and
 		// session/fork carry result.sessionId; load/resume resolve via the
-		// request id recorded above.
+		// request id recorded above. The replay plan seeds the tailer so
+		// historical entries aren't re-emitted after the interleaved replay.
 		if (frame.id !== undefined && frame.result !== undefined) {
 			const sid = frame.result.sessionId ?? pendingLoadSession.get(frame.id);
-			if (typeof sid === "string") tailer.attach(sid);
+			if (typeof sid === "string") tailer.attach(sid, pendingReplays.get(frame.id)?.plan);
 		}
-		if (frame.id !== undefined) pendingLoadSession.delete(frame.id);
+		if (frame.id !== undefined) {
+			pendingLoadSession.delete(frame.id);
+			pendingReplays.delete(frame.id);
+		}
 		if (opts.shape) {
 			const change = shapeToClient(frame);
 			if (change) log(`shaped ${change}`);
