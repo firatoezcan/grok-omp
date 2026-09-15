@@ -956,9 +956,17 @@ pub(super) fn handle_btw_response(
                 agent.btw_focused = true;
             }
             Err(error) => {
-                // Error stays until Esc; nothing to scroll, keep prompt focus.
-                agent.btw_state = Some(BtwOverlayState::Error { question, error });
+                // Errors persist to scrollback immediately (expanded so the message is
+                // visible) instead of parking an overlay that lingers over later output.
+                agent.btw_state = None;
                 agent.btw_focused = false;
+                let entry = crate::scrollback::entry::ScrollbackEntry::new(
+                    crate::scrollback::block::RenderBlock::Btw(
+                        crate::scrollback::blocks::BtwBlock::new(question, error),
+                    ),
+                )
+                .with_display_mode(crate::scrollback::types::DisplayMode::Expanded);
+                agent.scrollback.push(entry);
             }
         }
     }

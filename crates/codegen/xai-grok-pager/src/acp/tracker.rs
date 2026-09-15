@@ -344,6 +344,11 @@ pub struct AcpUpdateTracker {
     /// Entry currently receiving AgentMessageChunk deltas.
     /// None between turns or before first message chunk.
     current_agent_msg: Option<EntryId>,
+    /// `messageId` of the message currently streaming into `current_agent_msg`.
+    /// ACP stamps one id per message; a changed id means a new message started
+    /// (e.g. OMP `/loop` lifecycle text between iterations) and must open a
+    /// fresh entry instead of concatenating onto the previous one.
+    current_agent_msg_id: Option<String>,
     /// Entry currently receiving AgentThoughtChunk deltas.
     /// None when agent isn't thinking.
     current_thinking: Option<EntryId>,
@@ -952,6 +957,7 @@ impl AcpUpdateTracker {
                     self.finish_thinking(scrollback);
                 }
                 if let Some(agent_id) = self.current_agent_msg.take() {
+                    self.current_agent_msg_id = None;
                     scrollback.finish_running(agent_id);
                 }
                 if !meta.is_replay
@@ -1007,6 +1013,7 @@ impl AcpUpdateTracker {
         self.finish_thinking(scrollback);
         scrollback.note_pin_reserve_turn_finished();
         if let Some(agent_id) = self.current_agent_msg.take() {
+            self.current_agent_msg_id = None;
             scrollback.finish_running(agent_id);
         }
         for (_, pending) in self.pending_tools.drain() {
@@ -1101,12 +1108,27 @@ impl AcpUpdateTracker {
             );
             return false;
         }
+        // ACP stamps one `messageId` per message; a changed id means a new
+        // message started mid-turn (e.g. OMP `/loop` lifecycle text between
+        // iterations). Finish the current entry so the new message renders as
+        // its own block instead of concatenating inline.
+        if self.current_agent_msg.is_some()
+            && chunk.message_id.is_some()
+            && chunk.message_id != self.current_agent_msg_id
+        {
+            if let Some(agent_id) = self.current_agent_msg.take() {
+                scrollback.finish_running(agent_id);
+            }
+        }
         let is_new = self.current_agent_msg.is_none();
         let id = *self.current_agent_msg.get_or_insert_with(|| {
             let entry_id = scrollback.start_streaming_agent();
             scrollback.set_last_running(true);
             entry_id
         });
+        if is_new {
+            self.current_agent_msg_id = chunk.message_id.clone();
+        }
         if is_new
             && let Some(ts_ms) = meta.agent_timestamp_ms
             && let Some(entry) = scrollback.get_by_id_mut(id)
@@ -1167,6 +1189,7 @@ impl AcpUpdateTracker {
     ) -> bool {
         self.finish_thinking(scrollback);
         self.current_agent_msg = None;
+        self.current_agent_msg_id = None;
         if is_todo_tool(&tc)
             || is_bg_plumbing_tool(&tc)
             || is_task_tool(&tc)
@@ -1449,6 +1472,7 @@ impl AcpUpdateTracker {
             }
             self.finish_thinking(scrollback);
             if let Some(agent_id) = self.current_agent_msg.take() {
+                self.current_agent_msg_id = None;
                 scrollback.finish_running(agent_id);
             }
             for (_, pending) in self.pending_tools.drain() {
@@ -1478,6 +1502,7 @@ impl AcpUpdateTracker {
         }
         self.finish_thinking(scrollback);
         if let Some(agent_id) = self.current_agent_msg.take() {
+            self.current_agent_msg_id = None;
             scrollback.finish_running(agent_id);
         }
         for (_, pending) in self.pending_tools.drain() {

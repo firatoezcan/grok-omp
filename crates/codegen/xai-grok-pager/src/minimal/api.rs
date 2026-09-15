@@ -405,9 +405,17 @@ pub fn finish_minimal_btw(
             v.btw_focused = true;
         }
         Err(error) => {
-            v.btw_state =
-                Some(crate::views::btw_overlay::BtwOverlayState::Error { question, error });
+            // Errors persist to scrollback immediately (expanded so the message is
+            // visible) instead of parking an overlay that lingers over later output.
+            v.btw_state = None;
             v.btw_focused = false;
+            let entry = crate::scrollback::entry::ScrollbackEntry::new(
+                crate::scrollback::block::RenderBlock::Btw(
+                    crate::scrollback::blocks::BtwBlock::new(question, error),
+                ),
+            )
+            .with_display_mode(crate::scrollback::types::DisplayMode::Expanded);
+            v.scrollback.push(entry);
         }
     }
     true

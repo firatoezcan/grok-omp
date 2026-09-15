@@ -235,8 +235,41 @@ Everything we add or change. Nothing else may differ from upstream.
 Note: an alternative "separate crate" design was evaluated and rejected — it needs a pager `Cargo.toml` dependency line *and* cannot reach `AgentEndpoint`/`initialize_connection` (both `pub(in crate::acp)`), forcing ~110 lines of duplicated bridge code.
 
 `scripts/check-drift.sh` asserts that every path differing from `upstream/main` is either one of the
-files #1–#7, an owned path (`bridge/`, `tapes/`, `scripts/`, `SPEC.md`), or the new `acp/external.rs`,
-and that the hook files stay inside their line budget. It currently reports `+18/-1` against a budget of 40.
+files #1–#7, a table-B patch file, an owned path (`bridge/`, `tapes/`, `scripts/`, `SPEC.md`,
+`config/`, `.github/`), or an owned new file, and that the hook files stay inside their line budget.
+It currently reports `+61/-1` against a budget of 80.
+
+### 6.B Patch surface — upstream files modified for the OMP feature bridge
+
+The original "one file + ~12 hook lines" plan held only for the transport seam. The OMP feature
+work (advisor blocks, subagent lifecycle, virtual queue, sessions, extensions, usage/cost,
+plan-mode, worktrees, `/vibe`, Settings › OMP, hold-to-talk, command shadowing) modifies the
+upstream files below in place. They are name-allowlisted in `check-drift.sh` (`PATCH_FILES`) with
+no line budget — they carry real feature diffs, not surgical hooks. New entries belong here, not
+in the hook table.
+
+| Area | Files |
+|---|---|
+| ACP wire | `xai-grok-pager/src/acp/meta.rs`, `xai-grok-pager/src/acp/tracker.rs` |
+| Session/update handling | `xai-grok-pager/src/app/acp_handler/{mod,queue,session_notification}.rs`, `…/acp_handler/tests/session_routing.rs` |
+| Actions & dispatch | `xai-grok-pager/src/app/actions.rs`, `…/dispatch/{dashboard,interject,mod,modes,notes,prompt,queue,router,task_result,voice}.rs`, `…/dispatch/session/{fork,lifecycle,load}.rs`, `…/dispatch/settings/{setters,ui}.rs`, `…/dispatch/tests/{mod,router,settings}.rs` |
+| Agent view | `xai-grok-pager/src/app/agent_view/{mod,plan,queue,render,session}.rs`, `…/app_view.rs`, `…/app_view_tests.rs`, `…/event_loop.rs`, `…/modals.rs`, `…/status_blocks.rs` |
+| Effects | `xai-grok-pager/src/app/effects/{helpers,mod,session_list}.rs` |
+| Minimal API | `xai-grok-pager/src/minimal/api.rs` |
+| Scrollback | `xai-grok-pager/src/scrollback/block.rs`, `…/scrollback/blocks/mod.rs` |
+| Settings UI | `xai-grok-pager/src/settings/{defs,mod,registry}.rs`, `…/views/settings_modal/{input,mod,render,state,tests}.rs` |
+| Slash commands | `xai-grok-pager/src/slash/{mod,registry}.rs`, `…/slash/commands/mod.rs` |
+| Views | `xai-grok-pager/src/views/{dashboard/peek,modal,prompt_widget/mod}.rs` |
+| Tests | `xai-grok-pager/tests/{registered_features_are_documented,settings_e2e}.rs` |
+| Shell/tools/shared | `xai-grok-shared/src/ui_config.rs`, `xai-grok-shell/src/session/acp_session_impl/session_mode.rs`, `…/acp_session_tests/tool_layer_images_bridge_tests.rs`, `…/session/slash_commands.rs`, `…/util/config/{persist,persist_tests,settings_writes}.rs`, `xai-grok-tools/src/types/session_mode.rs` |
+| Repo docs | `.gitignore`, `README.md` |
+
+### 6.C Owned new files inside upstream directories
+
+Paths upstream will never create; they cannot conflict on a merge (`OWNED_FILES`):
+`xai-grok-pager/src/acp/external.rs`, `xai-grok-pager/src/app/space_hold.rs`,
+`xai-grok-pager/src/scrollback/blocks/advisor.rs`, `xai-grok-pager/src/slash/commands/vibe.rs`,
+`xai-grok-telemetry/src/startup.rs`, `docs/GROK-PI.md`.
 
 ---
 
