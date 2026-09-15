@@ -71,6 +71,10 @@ struct MenuKey {
     group: MenuGroup,
     /// `false` first, so a curated tag pulls its row to the top of the band.
     untagged: bool,
+    /// `false` first, so agent-advertised (ACP) commands lead the command band
+    /// instead of sitting under ~70 builtins — the same non-builtin-first
+    /// tiebreak the query path applies at equal match score.
+    builtin: bool,
     /// Zero for skills, which are ranked by name instead.
     recency: std::cmp::Reverse<u64>,
     /// Empty for commands, which are ranked by recency then registry order.
@@ -82,6 +86,7 @@ impl MenuKey {
         group: MenuGroup,
         row: &SuggestionRow,
         canonical: &str,
+        source: CommandSource,
         mru: &mut mru::SlashMru,
     ) -> Self {
         let (recency, name) = match group {
@@ -93,6 +98,7 @@ impl MenuKey {
         Self {
             group,
             untagged: row.tag.is_none(),
+            builtin: source == CommandSource::Builtin,
             recency: std::cmp::Reverse(recency),
             name,
         }
@@ -994,6 +1000,7 @@ impl SlashController {
             // Retain canonicals so tags are set in a second pass, keeping the `takes_args_now` command callback outside any tag-map borrow
             let mut canonicals: Vec<&str> = Vec::new();
             let mut groups: Vec<MenuGroup> = Vec::new();
+            let mut sources: Vec<CommandSource> = Vec::new();
             for (i, trigger) in triggers.iter().enumerate() {
                 if !visible_indices.contains(&i) {
                     continue;
@@ -1011,6 +1018,7 @@ impl SlashController {
                     ));
                     canonicals.push(trigger.canonical.as_str());
                     groups.push(MenuGroup::of(&trigger.provenance));
+                    sources.push(trigger.source);
                 }
             }
             // Tag from the data map in one scoped borrow; key off canonical (never the alias/display)
@@ -1027,8 +1035,9 @@ impl SlashController {
                 rows.into_iter()
                     .zip(canonicals)
                     .zip(groups)
-                    .map(|((row, canonical), group)| {
-                        (MenuKey::new(group, &row, canonical, &mut mru), row)
+                    .zip(sources)
+                    .map(|(((row, canonical), group), source)| {
+                        (MenuKey::new(group, &row, canonical, source, &mut mru), row)
                     })
                     .collect()
             };
@@ -2957,6 +2966,66 @@ mod tests {
             .map(|r| r.display.clone())
             .collect();
         assert_eq!(order, vec!["/alpha", "/zulu"]);
+    }
+
+    /// Agent-advertised (ACP) commands lead the command band on a bare `/`:
+    /// they are the agent's actual commands and must not sit under the
+    /// builtins. Mirrors the query path's non-builtin-first tiebreak.
+    #[test]
+    fn empty_query_leads_with_acp_commands_before_builtins() {
+        let mut ctrl = tie_controller(&["alpha", "bravo"], &[]);
+        ctrl.registry_mut().set_acp_commands(&[
+            agent_client_protocol::AvailableCommand::new(
+                "acp-one".to_string(),
+                String::new(),
+            ),
+            agent_client_protocol::AvailableCommand::new(
+                "acp-two".to_string(),
+                String::new(),
+            ),
+        ]);
+        let state = SlashState::default();
+        let models = ModelState::default();
+
+        ctrl.refresh(&state, "/", 1, &models);
+
+        let order: Vec<String> = state
+            .snapshot()
+            .matches
+            .iter()
+            .map(|r| r.display.clone())
+            .collect();
+        assert_eq!(order, vec!["/acp-one", "/acp-two", "/alpha", "/bravo"]);
+    }
+
+    /// Recency still wins inside each band: a recently used builtin outranks
+    /// other builtins, a recently used ACP command outranks other ACP commands.
+    #[test]
+    fn empty_query_recency_orders_within_source_bands() {
+        let mut ctrl = tie_controller(&["alpha", "bravo"], &[("bravo", 1_700_000_999)]);
+        ctrl.registry_mut().set_acp_commands(&[
+            agent_client_protocol::AvailableCommand::new(
+                "acp-one".to_string(),
+                String::new(),
+            ),
+            agent_client_protocol::AvailableCommand::new(
+                "acp-two".to_string(),
+                String::new(),
+            ),
+        ]);
+        ctrl.record_command_use("", "acp-two");
+        let state = SlashState::default();
+        let models = ModelState::default();
+
+        ctrl.refresh(&state, "/", 1, &models);
+
+        let order: Vec<String> = state
+            .snapshot()
+            .matches
+            .iter()
+            .map(|r| r.display.clone())
+            .collect();
+        assert_eq!(order, vec!["/acp-two", "/acp-one", "/bravo", "/alpha"]);
     }
 
     /// Within the command group the menu leads with what you actually use.
