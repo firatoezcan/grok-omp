@@ -1248,6 +1248,43 @@ const OMP_OAUTH_PROVIDERS = [
 	{ id: "openrouter", name: "OpenRouter (OAuth)" },
 ];
 
+/**
+ * On-disk cache of the last `available_commands_update` catalog. OMP only
+ * advertises commands per-session (~50ms after session/new), so a cold pager
+ * start has no catalog until the home session's ACU lands — the very first
+ * `/` keystroke completes builtins only. The pager seeds its bootstrap
+ * catalog from `initialize` `_meta.availableCommands`; feeding it the cached
+ * catalog closes that window. Stale entries self-heal: the first real ACU
+ * replaces the catalog wholesale.
+ */
+function commandCachePath() {
+	const dir = process.env.PI_CODING_AGENT_DIR;
+	if (dir) return join(dir, "acp-commands.json");
+	const grokHome = process.env.GROK_HOME;
+	if (grokHome) return join(grokHome, "omp", "agent", "acp-commands.json");
+	return null;
+}
+
+function readCommandCache() {
+	const path = commandCachePath();
+	if (!path) return [];
+	try {
+		const parsed = JSON.parse(readFileSync(path, "utf8"));
+		return Array.isArray(parsed?.commands) ? parsed.commands : [];
+	} catch {
+		return [];
+	}
+}
+
+function writeCommandCache(commands) {
+	const path = commandCachePath();
+	if (!path || !Array.isArray(commands) || commands.length === 0) return;
+	try {
+		mkdirSync(dirname(path), { recursive: true });
+		writeFileSync(path, JSON.stringify({ commands }));
+	} catch {}
+}
+
 /** The `omp` binary the adapter spawns (argv[0] of the agent command). */
 function ompBinary(agentArgv) {
 	return agentArgv?.[0] ?? "omp";
@@ -1441,8 +1478,10 @@ class ExtSurface {
 		this.session = null; // {sessionId, modes}
 		/** mcpServers array the pager sent in session/new params. */
 		this.mcpServers = [];
-		/** Last available_commands_update payload. */
-		this.commands = [];
+		/** Last available_commands_update payload, seeded from the on-disk
+		 *  cache so `commands/list` and the initialize stamp have a catalog
+		 *  before the first ACU lands. */
+		this.commands = readCommandCache();
 		/** Resolvers parked by commands/list while the first ACU is in flight. */
 		this.commandsWaiters = [];
 		/** Last usage_update payload ({size, used}). */
@@ -1536,8 +1575,15 @@ class ExtSurface {
 		if (frame.result?.protocolVersion !== undefined && frame.result?.agentInfo) {
 			this.agentInfo = frame.result.agentInfo;
 			// Stamp the OMP identity flag so the pager can gate OMP-only surfaces
-			// (Settings › OMP) without sniffing agentInfo.name.
+			// (Settings › OMP) without sniffing agentInfo.name. Also inject the
+			// cached command catalog as `_meta.availableCommands` — the pager
+			// seeds its bootstrap slash catalog from it, so `/` completes OMP
+			// commands from the first keystroke instead of waiting for the
+			// first session's ACU. The real ACU replaces it wholesale.
 			frame.result._meta = { ...(frame.result._meta ?? {}), ompAgent: true, ompAgentCommand: this.agentCommand };
+			if (frame.result._meta.availableCommands === undefined && this.commands.length) {
+				frame.result._meta.availableCommands = this.commands;
+			}
 		}
 
 		// Any session response carrying modes tells us whether this OMP build is
@@ -1619,6 +1665,7 @@ class ExtSurface {
 			switch (update.sessionUpdate) {
 				case "available_commands_update":
 					this.commands = update.availableCommands ?? [];
+					writeCommandCache(this.commands);
 					// Release commands/list waiters parked while the first ACU was in flight.
 					for (const w of this.commandsWaiters.splice(0)) {
 						clearTimeout(w.timer);
