@@ -94,6 +94,7 @@ PATCH_FILES=(
   crates/codegen/xai-grok-shell/src/util/config/persist.rs
   crates/codegen/xai-grok-shell/src/util/config/persist_tests.rs
   crates/codegen/xai-grok-shell/src/util/config/settings_writes.rs
+  crates/codegen/xai-grok-telemetry/src/startup.rs
   crates/codegen/xai-grok-tools/src/types/session_mode.rs
 )
 
@@ -105,7 +106,6 @@ OWNED_FILES=(
   crates/codegen/xai-grok-pager/src/app/space_hold.rs
   crates/codegen/xai-grok-pager/src/scrollback/blocks/advisor.rs
   crates/codegen/xai-grok-pager/src/slash/commands/vibe.rs
-  crates/codegen/xai-grok-telemetry/src/startup.rs
   docs/GROK-PI.md
 )
 

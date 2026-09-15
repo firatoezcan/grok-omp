@@ -261,7 +261,7 @@ in the hook table.
 | Slash commands | `xai-grok-pager/src/slash/{mod,registry}.rs`, `…/slash/commands/mod.rs` |
 | Views | `xai-grok-pager/src/views/{dashboard/peek,modal,prompt_widget/mod}.rs` |
 | Tests | `xai-grok-pager/tests/{registered_features_are_documented,settings_e2e}.rs` |
-| Shell/tools/shared | `xai-grok-shared/src/ui_config.rs`, `xai-grok-shell/src/session/acp_session_impl/session_mode.rs`, `…/acp_session_tests/tool_layer_images_bridge_tests.rs`, `…/session/slash_commands.rs`, `…/util/config/{persist,persist_tests,settings_writes}.rs`, `xai-grok-tools/src/types/session_mode.rs` |
+| Shell/tools/shared | `xai-grok-shared/src/ui_config.rs`, `xai-grok-shell/src/session/acp_session_impl/session_mode.rs`, `…/acp_session_tests/tool_layer_images_bridge_tests.rs`, `…/session/slash_commands.rs`, `…/util/config/{persist,persist_tests,settings_writes}.rs`, `xai-grok-telemetry/src/startup.rs`, `xai-grok-tools/src/types/session_mode.rs` |
 | Repo docs | `.gitignore`, `README.md` |
 
 ### 6.C Owned new files inside upstream directories
@@ -269,7 +269,12 @@ in the hook table.
 Paths upstream will never create; they cannot conflict on a merge (`OWNED_FILES`):
 `xai-grok-pager/src/acp/external.rs`, `xai-grok-pager/src/app/space_hold.rs`,
 `xai-grok-pager/src/scrollback/blocks/advisor.rs`, `xai-grok-pager/src/slash/commands/vibe.rs`,
-`xai-grok-telemetry/src/startup.rs`, `docs/GROK-PI.md`.
+`docs/GROK-PI.md`.
+
+Note: upstream deleted `xai-grok-telemetry/src/startup.rs` after our merge base (the
+`AgentKind` enum moved to `xai-grok-telemetry/src/spans/startup.rs`), so it is a **patch**
+file, not an owned path — the next sync will surface a modify/delete conflict; we keep our
+copy and re-apply `AgentKind::External` wherever the enum lands.
 
 ---
 
