@@ -44,6 +44,7 @@ one isolated home:
 
 ```
 ~/.local/share/grok-pi/           $GROK_HOME — pager config, sessions, certs
+~/.local/share/grok-pi/logs/      unified.jsonl — pager + adapter log events
 ~/.local/share/grok-pi/omp/       OMP config dir  ($PI_CONFIG_DIR)
 ~/.local/share/grok-pi/omp/agent/ OMP agent dir   ($PI_CODING_AGENT_DIR)
 ```
@@ -55,10 +56,16 @@ On first launch the launcher seeds this profile from your real OMP install:
   the isolated DB has no credentials yet; afterwards the two diverge.
 - `config.yml` (model roles, providers, advisor settings) is copied once, so
   the isolated profile starts with your real default model.
-- `config.toml` is re-copied from `dist/config.toml` on every launch — that
-  file disables remote settings fetch, telemetry, feedback uploads, the
-  auto-updater, the leader process, and the crash handler, and pins auth to
-  API-key mode so no sign-in screen ever appears.
+- `config.toml` is merged from `dist/config.toml` on every launch — seeded
+  keys win per key, but your own keys (e.g. the `[ui]` settings written by
+  the Settings modal) survive. The seeded file disables remote settings
+  fetch, telemetry, feedback uploads, the auto-updater, the leader process,
+  and the crash handler, and pins auth to API-key mode so no sign-in screen
+  ever appears.
+
+The pager's buffered log events (`_x.ai/log` notifications) are ingested by
+the adapter into `$GROK_HOME/logs/unified.jsonl` — same path and line format
+as the native shell, trimmed at 5 MiB.
 
 To reset the profile, delete `~/.local/share/grok-pi` and relaunch.
 
@@ -69,8 +76,26 @@ resolves inside the isolated profile. Credentials live in the isolated
 `agent.db`; model roles and provider options live in the isolated `config.yml`.
 Both start as copies of your real `~/.omp/agent/` files and then diverge.
 
-To add a provider after first launch, run OMP's own auth against the isolated
-profile:
+The easiest way to connect a provider is inside the TUI: **Settings › OMP ›
+Providers** (`/settings`, or F2 / Ctrl+,) opens a sheet listing every provider
+the adapter can authenticate — 67 entries covering API-key, OAuth, and
+both-kind providers — with live connected state read from the isolated
+`agent.db` plus the process environment:
+
+- **API key** — Enter on an `api_key` (or `both`) provider opens a masked key
+  editor. Committing writes the credential into the isolated `agent.db`
+  (`auth_credentials`, `source=login`) and bumps `auth_change_revision`.
+- **OAuth** — Enter on an `oauth` provider (or `o` on a `both` one) spawns
+  `omp auth-broker login <id>` inside the adapter. The auth URL is shown and
+  auto-opened once; device-code flows display the code to type into the
+  browser, and paste-code flows switch the sheet to a code editor when the
+  login asks for one. `x` or Esc cancels an in-flight login; `r` refetches
+  the list.
+
+New credentials take effect on the **next `grok-pi` launch** — the running
+agent doesn't hot-reload them.
+
+The CLI equivalent still works against the isolated profile:
 
 ```sh
 PI_CODING_AGENT_DIR=~/.local/share/grok-pi/omp/agent omp auth-broker login <provider>
@@ -79,10 +104,11 @@ PI_CODING_AGENT_DIR=~/.local/share/grok-pi/omp/agent omp auth-broker import <fil
 
 (`omp auth-broker list` shows the provider ids.) Provider env keys
 (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, …) exported before `grok-pi` also work —
-the launcher passes its environment through to the agent. To re-pull
-credentials from your real profile, delete `omp/agent/agent.db` under
-`$GROK_HOME` and relaunch — the launcher re-seeds only when the isolated DB
-has no credentials.
+the launcher passes its environment through to the agent, and the Providers
+sheet reports them as env-sourced connections. To re-pull credentials from
+your real profile, delete `omp/agent/agent.db` under `$GROK_HOME` and
+relaunch — the launcher re-seeds only when the isolated DB has no
+credentials.
 
 ### Which OMP runs
 
@@ -105,7 +131,9 @@ OMP's advisor (a second model reviewing each turn) is **on by default**. The
 launcher writes a `PI_CONFIG_FILES` overlay that forces `advisor.enabled` and
 pins `modelRoles.advisor` to your real profile's advisor model, and appends
 `--advisor` to the agent command it resolved itself. Advisor notes render as
-distinct blocks in the scrollback. Disable it with `GROK_PI_ADVISOR=0`.
+distinct blocks in the scrollback. Disable it with `GROK_PI_ADVISOR=0` or the
+**Settings › OMP › Advisor** toggle (persists to `[ui].omp_advisor_enabled`,
+takes effect on the next launch; the env var wins over the setting).
 
 ---
 
@@ -142,19 +170,26 @@ untouched.
 
 Dictation is fully local: the pager captures microphone audio, streams it to a
 localhost TLS WebSocket run by `grok-pi-stt`, and the shim forwards it to OMP's
-STT worker (`omp __omp_worker_stt` — Parakeet TDT v3 via sherpa-onnx by
-default, or Whisper via transformers.js). Transcribed text lands in the prompt
-box; no audio ever reaches the agent or the network.
+STT worker (`omp __omp_worker_stt` — Parakeet TDT via sherpa-onnx by default,
+or Whisper via transformers.js). Transcribed text lands in the prompt box; no
+audio ever reaches the agent or the network.
 
-**Prerequisite:** the STT model must be downloaded into the isolated profile:
+**No setup step.** The STT model downloads lazily on first use — the worker
+fetches it inside `stream_start` (the same path `omp setup speech` exercises)
+and the shim reports download progress as interim partials, so the prompt box
+shows live progress instead of a dead mic. Voice is on whenever the shim can
+launch; `GROK_PI_VOICE=0` disables it entirely (also **Settings › OMP › Voice
+dictation**).
 
-```sh
-PI_CODING_AGENT_DIR=~/.local/share/grok-pi/omp/agent omp setup speech
-```
+Pick the model in **Settings › OMP › Voice model** (`[ui].omp_stt_model`,
+exported to the shim as `GROK_PI_STT_MODEL`, restart-required):
 
-If no model is cached, voice stays off and the launcher prints the install
-line above. `GROK_PI_VOICE=1` forces the shim on anyway (the pager then shows
-"run omp setup speech" on use); `GROK_PI_VOICE=0` disables voice entirely.
+| Key | Model |
+|---|---|
+| `parakeet` (default) | NVIDIA Parakeet TDT 0.6B (sherpa-onnx) — best accuracy, English-only |
+| `fast` | Whisper base — lowest latency, multilingual |
+| `balanced` | Whisper small — accuracy/latency middle ground, multilingual |
+| `turbo` | Whisper large-v3-turbo — best multilingual accuracy, heaviest |
 
 ### Ways to dictate
 
@@ -169,7 +204,8 @@ The chord's behavior follows `ui.voice_capture_mode`: `toggle` (press to start,
 press again to stop) or `hold` (hold to record, release to stop — needs a
 Kitty-protocol terminal, falls back to toggle elsewhere). `ui.voice_keybind_enabled`
 disables the chord while keeping `/voice`; `ui.voice_stt_language` /
-`voice.language` set the STT language.
+`voice.language` set the STT language. All three live under **Settings › OMP**
+as Voice capture / Voice shortcut / Voice language and apply live.
 
 Under the hood the launcher seeds `[voice] api_base = "https://127.0.0.1:<port>"`
 into the isolated `config.toml`, exports the shim's CA via
@@ -240,6 +276,13 @@ sources:
 - **OMP** — advertised by the agent over ACP (`available_commands_update`) and
   executed by OMP when sent as a prompt. OMP also advertises skill commands,
   extension commands, and project file commands the same way.
+
+OMP commands complete from the first keystroke: the adapter caches the last
+advertised catalog to `omp/agent/acp-commands.json` and injects it into the
+`initialize` result's `_meta.availableCommands`, so the pager's bootstrap
+catalog is populated before the first session's `available_commands_update`
+lands (~50 ms after `session/new`). The first real update replaces the cache
+wholesale, so stale entries self-heal.
 
 When both sides define the same name, **the pager's builtin wins** and the OMP
 command is hidden from the menu (marked *shadowed* below). OMP commands that
@@ -454,14 +497,12 @@ bar simply stays hidden.
 ## Settings
 
 `/settings` (F2 / Ctrl+,) opens the settings modal — Appearance, Mouse, Editor,
-Agent, Privacy, Models, Session, and Advanced categories, all persisted to the
-isolated `$GROK_HOME/config.toml`. Keys worth knowing under grok-pi:
+Agent, Privacy, Models, Session, Advanced, and (when the agent is OMP) an OMP
+category, all persisted to the isolated `$GROK_HOME/config.toml`. Keys worth
+knowing under grok-pi:
 
 | Key | Effect |
 |---|---|
-| `ui.voice_capture_mode` | `hold` or `toggle` for the Ctrl+Space/F8 chord |
-| `ui.voice_keybind_enabled` | Enable the voice chord (`/voice` always works) |
-| `ui.voice_stt_language` | STT language code or `auto` |
 | `voice.api_base` | STT endpoint — managed by the launcher, points at the local shim |
 | `voice.language`, `voice.sample_rate` | STT language and capture rate (16 kHz default) |
 | `features.voice_mode` | Voice feature flag (also `GROK_VOICE_MODE`) |
@@ -473,13 +514,21 @@ isolated `$GROK_HOME/config.toml`. Keys worth knowing under grok-pi:
 The settings modal has a dedicated **OMP** category, separate from the Grok
 settings — it renders only when the connected agent is OMP (detected from
 `agentInfo.name == "oh-my-pi"` or the adapter's `_meta.ompAgent` stamp on
-initialize). Its **Slash commands** row opens a sub-sheet listing every command
-the agent advertised via `available_commands_update` — builtins plus skill,
-extension, and file commands — each with its description and an
-enabled/disabled toggle. All commands default to enabled; toggling one off
-hides it from the `/` menu and blocks it from being sent to the agent. The
-disabled set persists as `[ui].omp_disabled_commands` in the isolated
-`$GROK_HOME/config.toml`.
+initialize). Its rows:
+
+| Row | What it controls | Persists to |
+|---|---|---|
+| **Slash commands** | Sub-sheet listing every command the agent advertised via `available_commands_update` — builtins plus skill, extension, and file commands — each with its description and an enabled/disabled toggle. All commands default to enabled; toggling one off hides it from the `/` menu and blocks it from being sent to the agent. | `[ui].omp_disabled_commands` |
+| **Providers** | Sub-sheet for connecting model providers — masked API-key editor or OAuth login, with live connected state. See [Connecting providers & models](#connecting-providers--models). | Nothing in `config.toml` — credentials land in the isolated `agent.db` |
+| **Advisor** | On/off for the OMP advisor (second model reviewing each turn). Restart-required; `GROK_PI_ADVISOR` overrides it. | `[ui].omp_advisor_enabled` |
+| **Voice dictation** | On/off for the local STT shim — off means no dictation keybind or capture path at all. Restart-required; `GROK_PI_VOICE` overrides it. | `[ui].omp_voice_enabled` |
+| **Voice model** | STT model picker: `parakeet` (default), `fast`, `balanced`, `turbo`. Restart-required; `GROK_PI_STT_MODEL` overrides it. | `[ui].omp_stt_model` |
+| **Voice shortcut** | Enable the Ctrl+Space / F8 chord (`/voice` always works). Applies live. | `[ui].voice_keybind_enabled` |
+| **Voice capture** | `toggle` or `hold` for the voice chord; `hold` needs a Kitty-protocol terminal and is hidden where key-release reporting is unavailable. Applies live. | `[ui].voice_capture_mode` |
+| **Voice language** | STT language code or `auto` (system locale). Applies live to the next capture. | `[ui].voice_stt_language` |
+| **Agent version** | Read-only: name + version of the connected OMP agent, from the ACP initialize handshake. | — |
+| **Agent command** | Read-only: the command the adapter spawned (`_meta.ompAgentCommand`). | — |
+| **Vibe mode** | Read-only: whether the connected OMP build advertises the `vibe` session mode. | — |
 
 ---
 
@@ -508,11 +557,11 @@ spinners — this is what the repo's own termctrl end-to-end checks wait on.
 | `OMP_ACP_CMD` | Full ACP command line for the agent, used verbatim (highest precedence) |
 | `GROK_PI_OMP_CMD` | `omp` binary or command line; `acp` appended when absent |
 | `GROK_PI_PAGER` / `GROK_PI_AGENT` / `GROK_PI_STT_SHIM` | Override the sibling binary paths |
-| `GROK_PI_ADVISOR` | `0` disables the advisor (default on) |
-| `GROK_PI_VOICE` | `1` force voice on, `0` disable; unset = auto (on when an STT model is cached) |
-| `GROK_PI_STT_MODEL` | STT model key (`parakeet` default; `fast`/`balanced`/`turbo` for Whisper) |
+| `GROK_PI_ADVISOR` | `0` disables the advisor (default on); overrides `[ui].omp_advisor_enabled` |
+| `GROK_PI_VOICE` | `0`/`false` disables voice; unset = on whenever the STT shim can launch (the model downloads on first use); overrides `[ui].omp_voice_enabled` |
+| `GROK_PI_STT_MODEL` | STT model key (`parakeet` default; `fast`/`balanced`/`turbo` for Whisper); overrides `[ui].omp_stt_model` |
 | `GROK_PI_STT_OMP_CMD` | Worker command prefix override for the shim |
-| `GROK_PI_STT_PORT` / `GROK_PI_STT_DIR` / `GROK_PI_STT_LANGUAGE` / `GROK_PI_STT_REQUIRE_CACHED` | Shim port, cert/state dir, fallback language, require-cached-model |
+| `GROK_PI_STT_PORT` / `GROK_PI_STT_DIR` / `GROK_PI_STT_LANGUAGE` | Shim port, cert/state dir, fallback language |
 | `PI_CONFIG_DIR` / `PI_CODING_AGENT_DIR` | Set by the launcher to the isolated OMP home |
 | `PI_CONFIG_FILES` | Launcher appends the advisor overlay here |
 | `XAI_API_KEY` | Seeded to `local-voice` when unset (the pager requires a bearer for STT; the shim ignores it) |
