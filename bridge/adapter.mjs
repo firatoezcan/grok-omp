@@ -45,7 +45,7 @@
  * The pager reaches this through `--agent-command "bun bridge/adapter.mjs"`.
  */
 
-import { appendFileSync, closeSync, cpSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, cpSync, existsSync, ftruncateSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { execFile } from "node:child_process";
@@ -1342,6 +1342,93 @@ function storeOmpApiKey(provider, key) {
 	} finally {
 		db.close();
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Unified log relay (x.ai/log)
+// ---------------------------------------------------------------------------
+//
+// The pager buffers unified-log entries and flushes them to the agent as
+// `_x.ai/log` notifications ({src, entries[]}); natively the shell ingests
+// them into `$GROK_HOME/logs/unified.jsonl` (xai-grok-telemetry
+// `unified_log::ingest_client_entries`). OMP has no such handler and drops the
+// notification, so the adapter appends to the same file itself — same path,
+// same line format — and consumes the notification instead of forwarding it.
+
+const UNIFIED_LOG_MAX_SIZE = 5 * 1024 * 1024;
+// `src: "shell"` is rejected like the shell's ingest (spoofing); unknown
+// sources fail the params parse there and drop the batch here.
+const UNIFIED_LOG_SOURCES = new Set(["grok-pager", "grok-desktop"]);
+const UNIFIED_LOG_LEVELS = new Set(["error", "warn", "info", "debug"]);
+
+/** `$GROK_HOME/logs/unified.jsonl`, resolving GROK_HOME the way xai-dirs does. */
+function unifiedLogPath() {
+	const grokHome = process.env.GROK_HOME || join(homedir(), ".grok");
+	return join(grokHome, "logs", "unified.jsonl");
+}
+
+/**
+ * Keep the unified log under the 5 MiB cap the shell writer enforces: keep the
+ * tail half, cut at a line boundary, rewrite in place — other processes hold
+ * append descriptors on this inode, so no temp-file rename.
+ */
+function trimUnifiedLog(path) {
+	let fd;
+	try {
+		fd = openSync(path, "r+");
+	} catch {
+		return;
+	}
+	try {
+		const data = readFileSync(fd);
+		const nl = data.indexOf(0x0a, Math.floor(data.length / 2));
+		if (nl < 0) return;
+		const tail = data.subarray(nl + 1);
+		writeSync(fd, tail, 0, tail.length, 0);
+		ftruncateSync(fd, tail.length);
+	} catch {
+	} finally {
+		try {
+			closeSync(fd);
+		} catch {}
+	}
+}
+
+/**
+ * Ingest one `_x.ai/log` batch the way the shell's `ingest_client_entries`
+ * does: `src` must be a known client source, every entry must carry the
+ * ClientLogEntry fields, and a malformed batch is dropped whole — serde fails
+ * the params parse the same way. Surviving entries are re-serialized in
+ * LogEntry field order so the lines are byte-compatible with native writers.
+ */
+function ingestUnifiedLog(params) {
+	if (!params || typeof params !== "object") return;
+	const src = params.src;
+	if (!UNIFIED_LOG_SOURCES.has(src)) return;
+	const entries = params.entries;
+	if (!Array.isArray(entries) || entries.length === 0) return;
+	const lines = [];
+	for (const e of entries) {
+		if (!e || typeof e !== "object") return;
+		if (typeof e.ts !== "string" || typeof e.msg !== "string" || !UNIFIED_LOG_LEVELS.has(e.lvl)) return;
+		if (e.pid != null && (!Number.isInteger(e.pid) || e.pid < 0 || e.pid > 0xffffffff)) return;
+		if (e.ver != null && typeof e.ver !== "string") return;
+		if (e.sid != null && typeof e.sid !== "string") return;
+		const entry = { ts: e.ts, src };
+		if (e.pid != null) entry.pid = e.pid;
+		if (e.ver != null) entry.ver = e.ver;
+		entry.lvl = e.lvl;
+		if (e.sid != null) entry.sid = e.sid;
+		entry.msg = e.msg;
+		if (e.ctx != null) entry.ctx = e.ctx;
+		lines.push(JSON.stringify(entry));
+	}
+	const path = unifiedLogPath();
+	try {
+		mkdirSync(dirname(path), { recursive: true });
+		if (existsSync(path) && statSync(path).size >= UNIFIED_LOG_MAX_SIZE) trimUnifiedLog(path);
+		appendFileSync(path, `${lines.join("\n")}\n`);
+	} catch {}
 }
 
 /**
@@ -2957,6 +3044,12 @@ class ExtSurface {
 			case "queue/hold_edit":
 			case "queue/release_edit":
 				// Advisory edit locks; the virtual queue has no in-place editor.
+				return true;
+			case "log":
+				// The pager relays unified_log entries to the agent for ingest;
+				// OMP drops the notification. Write them to the local
+				// unified.jsonl ourselves (same path/format as the native shell).
+				ingestUnifiedLog(p);
 				return true;
 			default:
 				return false;
