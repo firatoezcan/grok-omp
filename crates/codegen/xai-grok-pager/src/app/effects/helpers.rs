@@ -643,15 +643,24 @@ pub(super) fn count_chat_history_stats(history_path: &Path) -> (usize, usize) {
     }
     (turn_count, tool_call_count)
 }
-pub(super) async fn send_logout(tx: &AcpAgentTx) {
+/// `x.ai/auth/logout`. The result matters: a failed logout must surface as `LogoutFailed` so the
+/// pager keeps the session instead of exiting to a login screen the agent may not be able to serve
+/// (external agents like OMP have no xAI auth flow behind this method).
+pub(super) async fn send_logout(tx: &AcpAgentTx) -> TaskResult {
     let req = acp::ExtRequest::new(
         "x.ai/auth/logout",
         serde_json::value::to_raw_value(&serde_json::json!({}))
             .expect("serialize auth/logout params")
             .into(),
     );
-    if let Err(e) = acp_send(req, tx).await {
-        tracing::warn!(error = %e, "logout failed");
+    match acp_send(req, tx).await {
+        Ok(_) => TaskResult::LogoutComplete,
+        Err(e) => {
+            tracing::warn!(error = %e, "logout failed");
+            TaskResult::LogoutFailed {
+                error: e.to_string(),
+            }
+        }
     }
 }
 /// Best-effort `x.ai/auth/cancel`: stops the shell's device/loopback wait so a later login is single-flight.

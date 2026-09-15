@@ -2092,9 +2092,25 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             app.login_method_id = None;
             ensure_login_method(app);
             app.auth_clipboard_delivery = None;
+            if app.login_method_id.is_none() {
+                // The agent offers no interactive login method (e.g. OMP's non-interactive
+                // 'agent' auth): the welcome screen would dead-end on "No login method
+                // available", so stay in the session and say so.
+                app.show_toast(
+                    "Logged out. This agent provides no interactive login method; the session stays open.",
+                );
+                return vec![];
+            }
             let effects = dispatch_exit_session(app);
             app.welcome_prompt_focused = false;
             effects
+        }
+        TaskResult::LogoutFailed { error } => {
+            // The agent refused or could not serve `x.ai/auth/logout` (external agents like OMP
+            // have no xAI auth flow). Exiting would strand the user on a login screen the agent
+            // cannot serve, so surface the error and keep the session.
+            app.show_toast(&format!("Logout failed: {error}"));
+            vec![]
         }
         TaskResult::DeepSearchResults {
             host,

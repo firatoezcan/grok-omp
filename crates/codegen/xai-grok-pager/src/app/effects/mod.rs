@@ -149,11 +149,7 @@ pub(crate) fn execute(
         }
         Effect::Logout => {
             let tx = acp_tx.clone();
-            tasks
-                .spawn(async move {
-                    send_logout(&tx).await;
-                    TaskResult::LogoutComplete
-                });
+            tasks.spawn(async move { send_logout(&tx).await });
         }
         Effect::CancelAuth { request_seq } => {
             let tx = acp_tx.clone();
@@ -188,7 +184,8 @@ pub(crate) fn execute(
             let tx = acp_tx.clone();
             let abort_handle = tasks
                 .spawn(async move {
-                    send_logout(&tx).await;
+                    // Best-effort: a failed logout must not block the follow-up authenticate.
+                    let _ = send_logout(&tx).await;
                     send_authenticate(&tx, request_seq, method_id, use_oauth, false)
                         .await
                 });

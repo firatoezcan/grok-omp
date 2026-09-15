@@ -3020,6 +3020,10 @@ pub enum TaskResult {
     },
     /// Shell acknowledged logout (auth cleared).
     LogoutComplete,
+    /// `x.ai/auth/logout` failed (e.g. an external agent with no xAI auth flow).
+    /// The session must stay put: exiting to the welcome screen would dead-end on a login
+    /// surface the agent cannot serve.
+    LogoutFailed { error: String },
     /// Best-effort `x.ai/auth/cancel` finished (no UI update; state already left Authenticating).
     AuthCancelComplete,
     /// Shell responded to `x.ai/auth/check_subscription`.

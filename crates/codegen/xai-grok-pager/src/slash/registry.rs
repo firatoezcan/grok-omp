@@ -28,6 +28,16 @@ pub(crate) const BLOCKED_ACP_NAMES: &[&str] = &[
     "reload-plugins",
 ];
 
+/// Builtin trigger keys (canonical names AND aliases) an agent-advertised command may take over.
+/// These builtins are xAI-shell-specific and non-functional behind an external agent:
+/// `login`/`logout` drive the `x.ai/auth/*` flow no external agent serves, `btw` fires the
+/// `x.ai/btw` ext method, and `clear` is a `/new` alias that drops the whole session where the
+/// agent's own `clear` (e.g. OMP's context-reset-in-place) is what the user asked for.
+/// Everything else stays shadowed-by-design: working builtins like `model`, `compact`, `usage`,
+/// `context`, `export`, `share` keep their names even when the agent advertises them.
+/// Skills are excluded: a skill named `login` still ships qualified (`acme:login`) so it cannot hijack auth.
+const AGENT_DEFERRABLE_BUILTINS: &[&str] = &["btw", "clear", "login", "logout"];
+
 /// Source of a command in the registry. Used for precedence and replacement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandSource {
@@ -134,6 +144,12 @@ pub struct CommandRegistry {
     saved_workflows: Vec<WorkflowChoice>,
     /// Names the last sync dropped: a sorted `reserved` run, then a sorted `duplicate` run.
     skipped_acp_names: Vec<String>,
+    /// Builtin trigger keys (canonical names or aliases) currently claimed by an agent-advertised
+    /// command ([`AGENT_DEFERRABLE_BUILTINS`]). A claimed key emits no builtin trigger and no
+    /// `key_to_index` entry, so a typed `/login` or `/clear` resolves to the agent's command
+    /// instead of the xAI builtin. Recomputed on every ACP catalog sync; clears when the agent
+    /// stops advertising the name.
+    shadowed_builtin_keys: HashSet<String>,
 }
 
 impl CommandRegistry {
@@ -161,6 +177,7 @@ impl CommandRegistry {
             triggers: Vec::new(),
             hidden,
             menu_hidden,
+            shadowed_builtin_keys: HashSet::new(),
             disabled: HashSet::new(),
             restricted: HashSet::new(),
             available_tools: None,
@@ -505,11 +522,30 @@ impl CommandRegistry {
         let mut claimed: HashSet<String> = HashSet::new();
         let mut reserved: Vec<String> = Vec::new();
         let mut duplicate: Vec<String> = Vec::new();
+        self.shadowed_builtin_keys.clear();
         for acp_cmd in commands {
             let name = acp_cmd.name.to_lowercase();
             if is_reserved(&name) {
-                if is_skill_or_workflow(acp_cmd) {
-                    reserved.push(name);
+                // An agent-advertised plain command (not a skill, not malformed skill meta) may take
+                // over a deferrable builtin key: the builtin is xAI-shell-specific and dead behind an
+                // external agent, so its `login`/`logout`/`btw`/`clear` must reach the agent instead.
+                // The key may be a builtin alias (`clear` aliases `/new`): the builtin stays
+                // registered but the claimed key is shadowed in `rebuild_triggers`.
+                let overrides_builtin = builtin_keys.contains(&name)
+                    && AGENT_DEFERRABLE_BUILTINS.contains(&name.as_str())
+                    && matches!(
+                        SkillMeta::parse(acp_cmd.meta.as_ref()),
+                        SkillMeta::Absent | SkillMeta::Foreign
+                    )
+                    && claimed.insert(name.clone());
+                if overrides_builtin {
+                    self.shadowed_builtin_keys.insert(name);
+                    self.commands.push(Arc::new(AcpSlashCommand::from(acp_cmd)));
+                    self.sources.push(CommandSource::Acp);
+                } else {
+                    if is_skill_or_workflow(acp_cmd) {
+                        reserved.push(name);
+                    }
                 }
                 continue;
             }
@@ -542,6 +578,7 @@ impl CommandRegistry {
             }
             reserved.extend(duplicate);
             self.skipped_acp_names = reserved;
+
         }
     }
 
@@ -566,6 +603,13 @@ impl CommandRegistry {
                 continue;
             }
 
+            // A builtin key claimed by an agent-advertised command (AGENT_DEFERRABLE_BUILTINS) emits
+            // no trigger and no key entry: typed `/login` must reach the agent, not the xAI builtin.
+            // Alias claims (`clear` on `/new`) skip only that alias — the canonical `/new` stays.
+            if source == CommandSource::Builtin && self.shadowed_builtin_keys.contains(canonical) {
+                continue;
+            }
+
             // Menu-hidden and disabled commands keep their key entries (so `get_for_dispatch()` /
             // `is_disabled()` resolve a typed invocation) but emit no triggers.
             // This is the inverse of the restricted trade-off below.
@@ -587,9 +631,15 @@ impl CommandRegistry {
                 self.triggers.extend(trigger.bare_suffix_sibling());
                 self.triggers.push(trigger);
             }
-
             // Insert alias keys.
             for alias in command.aliases() {
+                // An agent command may claim a builtin alias (`clear` on `/new`): that key resolves
+                // to the agent's command, so the builtin emits neither the key entry nor a trigger.
+                if source == CommandSource::Builtin
+                    && self.shadowed_builtin_keys.contains(*alias)
+                {
+                    continue;
+                }
                 if source == CommandSource::Builtin && self.key_to_index.contains_key(*alias) {
                     panic!(
                         "slash command alias '{}' is already registered (builtin collision)",
@@ -1156,21 +1206,147 @@ mod tests {
         assert_eq!(registry.get("acme:login").unwrap().description(), "first");
         assert_eq!(registry.skipped_acp_names, ["acme:login"]);
     }
+    #[test]
+    fn colliding_malformed_command_is_dropped() {
+        let malformed = acp_skill("login", serde_json::json!({"scope": "local"}));
+        let mut registry = CommandRegistry::new(vec![login_builtin()]);
+        registry.set_acp_commands(&[malformed]);
+        assert_eq!(registry.command_count(), 1, "only the builtin remains");
+        assert!(registry.is_builtin("login"));
+        assert!(registry.skipped_acp_names.is_empty());
+    }
 
     #[test]
-    fn colliding_non_skill_or_malformed_command_is_dropped() {
-        let non_skill = agent_client_protocol::AvailableCommand::new(
+    fn agent_login_command_shadows_builtin() {
+        let mut registry = CommandRegistry::new(vec![login_builtin()]);
+        registry.set_acp_commands(&[agent_client_protocol::AvailableCommand::new(
             "login".to_string(),
-            "shell login".to_string(),
+            "agent login".to_string(),
+        )]);
+
+        // The agent command owns the name: typed `/login` resolves to it, the builtin emits nothing.
+        assert_eq!(registry.command_count(), 2);
+        assert!(!registry.is_builtin("login"));
+        let cmd = registry.get("login").expect("agent login resolves");
+        assert_eq!(cmd.description(), "agent login");
+        assert_eq!(cmd.provenance(), CommandProvenance::Shell);
+        assert!(
+            registry
+                .triggers()
+                .iter()
+                .filter(|t| t.canonical == "login")
+                .count()
+                == 1,
+            "exactly one login trigger (the agent's)"
         );
-        let malformed = acp_skill("login", serde_json::json!({"scope": "local"}));
-        for cmd in [non_skill, malformed] {
-            let mut registry = CommandRegistry::new(vec![login_builtin()]);
-            registry.set_acp_commands(&[cmd]);
-            assert_eq!(registry.command_count(), 1, "only the builtin remains");
-            assert!(registry.is_builtin("login"));
-            assert!(registry.skipped_acp_names.is_empty());
-        }
+
+        // When the agent stops advertising it, the builtin takes the name back.
+        registry.set_acp_commands(&[]);
+        assert_eq!(registry.command_count(), 1);
+        assert!(registry.is_builtin("login"));
+    }
+
+    #[test]
+    fn agent_logout_command_shadows_builtin() {
+        let logout_builtin: Arc<dyn SlashCommand> = Arc::new(DummyCommand {
+            name: "logout",
+            aliases: &[],
+        });
+        let mut registry = CommandRegistry::new(vec![logout_builtin]);
+        registry.set_acp_commands(&[agent_client_protocol::AvailableCommand::new(
+            "logout".to_string(),
+            "agent logout".to_string(),
+        )]);
+
+        assert!(!registry.is_builtin("logout"));
+        assert_eq!(
+            registry.get_for_dispatch("logout").unwrap().description(),
+            "agent logout"
+        );
+    }
+
+    #[test]
+    fn agent_btw_command_shadows_builtin() {
+        let btw_builtin: Arc<dyn SlashCommand> = Arc::new(DummyCommand {
+            name: "btw",
+            aliases: &[],
+        });
+        let mut registry = CommandRegistry::new(vec![btw_builtin]);
+        registry.set_acp_commands(&[agent_client_protocol::AvailableCommand::new(
+            "btw".to_string(),
+            "agent btw".to_string(),
+        )]);
+
+        assert!(!registry.is_builtin("btw"));
+        assert_eq!(
+            registry.get_for_dispatch("btw").unwrap().description(),
+            "agent btw"
+        );
+    }
+
+    #[test]
+    fn agent_clear_command_shadows_builtin_alias_only() {
+        // `clear` is an alias of the `/new` builtin: the agent's `clear` claims the alias key while
+        // canonical `/new` keeps resolving to the builtin.
+        let new_builtin: Arc<dyn SlashCommand> = Arc::new(DummyCommand {
+            name: "new",
+            aliases: &["clear"],
+        });
+        let mut registry = CommandRegistry::new(vec![new_builtin]);
+        registry.set_acp_commands(&[agent_client_protocol::AvailableCommand::new(
+            "clear".to_string(),
+            "agent clear".to_string(),
+        )]);
+
+        assert_eq!(registry.command_count(), 2);
+        assert!(registry.is_builtin("new"), "canonical /new stays builtin");
+        assert!(!registry.is_builtin("clear"), "alias key now belongs to the agent");
+        assert_eq!(
+            registry.get_for_dispatch("clear").unwrap().description(),
+            "agent clear"
+        );
+        // The builtin emits no `clear` trigger; the agent's is the only one.
+        assert_eq!(
+            registry
+                .triggers()
+                .iter()
+                .filter(|t| t.display == "/clear")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn agent_command_does_not_shadow_other_builtins() {
+        let model_builtin: Arc<dyn SlashCommand> = Arc::new(DummyCommand {
+            name: "model",
+            aliases: &[],
+        });
+        let mut registry = CommandRegistry::new(vec![model_builtin]);
+        registry.set_acp_commands(&[agent_client_protocol::AvailableCommand::new(
+            "model".to_string(),
+            "agent model".to_string(),
+        )]);
+
+        // Only the deferrable set (btw/clear/login/logout) yields; every other builtin keeps its name.
+        assert_eq!(registry.command_count(), 1);
+        assert!(registry.is_builtin("model"));
+    }
+
+    #[test]
+    fn skill_named_login_does_not_shadow_builtin() {
+        let mut registry = CommandRegistry::new(vec![login_builtin()]);
+        registry.set_acp_commands(&[acp_skill(
+            "login",
+            serde_json::json!({
+                "scope": "plugin",
+                "path": "/x/SKILL.md",
+                "pluginName": "acme",
+            }),
+        )]);
+        assert_eq!(registry.command_count(), 1);
+        assert!(registry.is_builtin("login"));
+        assert_eq!(registry.skipped_acp_names, ["login"]);
     }
 
     #[test]
