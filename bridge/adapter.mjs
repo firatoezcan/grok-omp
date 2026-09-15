@@ -45,7 +45,7 @@
  * The pager reaches this through `--agent-command "bun bridge/adapter.mjs"`.
  */
 
-import { appendFileSync, closeSync, cpSync, existsSync, ftruncateSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, writeFileSync, writeSync } from "node:fs";
+import { appendFileSync, closeSync, cpSync, existsSync, ftruncateSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { execFile } from "node:child_process";
@@ -1869,6 +1869,40 @@ function writeCommandCache(commands) {
 	} catch {}
 }
 
+/** Isolated OMP agent dir (same resolution as `ompAgentDbPath`, without the filename). */
+function ompAgentDir() {
+	const dir = process.env.PI_CODING_AGENT_DIR;
+	if (dir) return dir;
+	const grokHome = process.env.GROK_HOME;
+	if (grokHome) return join(grokHome, "omp", "agent");
+	return null;
+}
+
+/**
+ * Best-effort delete of a session's persisted JSONL after session/close.
+ * OMP names files `<ts>_<sessionId>.jsonl` under `<agentDir>/sessions/<cwd-dir>/`;
+ * the suffix match avoids re-deriving the cwd encoding. Used only for the
+ * startup catalog-prefetch session, which must not litter session history.
+ */
+function deleteSessionFile(sessionId) {
+	const root = ompAgentDir();
+	if (!root || !sessionId) return;
+	try {
+		const sessionsRoot = join(root, "sessions");
+		for (const dir of readdirSync(sessionsRoot)) {
+			const dirPath = join(sessionsRoot, dir);
+			try {
+				if (!statSync(dirPath).isDirectory()) continue;
+				for (const file of readdirSync(dirPath)) {
+					if (file.endsWith(`_${sessionId}.jsonl`)) {
+						unlinkSync(join(dirPath, file));
+					}
+				}
+			} catch {}
+		}
+	} catch {}
+}
+
 /** The `omp` binary the adapter spawns (argv[0] of the agent command). */
 function ompBinary(agentArgv) {
 	return agentArgv?.[0] ?? "omp";
@@ -2068,6 +2102,19 @@ class ExtSurface {
 		this.commands = readCommandCache();
 		/** Resolvers parked by commands/list while the first ACU is in flight. */
 		this.commandsWaiters = [];
+		/** Catalog prefetch state for a cold cache: the adapter holds the
+		 *  initialize response, opens a throwaway session to harvest its
+		 *  bootstrap ACU, closes it, then answers initialize with the catalog.
+		 *  { sid, timer, resolve, done } or null. */
+		this.prefetch = null;
+		/** Held initialize response frame while prefetch runs. */
+		this.heldInitialize = null;
+		/** Called when the held initialize frame is ready to forward. */
+		this.onInitializeReady = null;
+		/** Session ids of finished prefetch sessions: their trailing bootstrap
+		 *  updates (session_info_update etc.) keep being absorbed so they can
+		 *  never be misrouted to a real session. */
+		this.prefetchSids = new Set();
 		/** Last usage_update payload ({size, used}). */
 		this.usage = null;
 		/** initialize result (agent name/version). */
@@ -3541,6 +3588,11 @@ class ExtSurface {
 		const rec = this.internalIds.get(frame.id);
 		if (rec) {
 			this.internalIds.delete(frame.id);
+			if (rec.kind === "awaited") {
+				if (frame.error !== undefined) rec.reject(new Error(frame.error.message ?? "agent error"));
+				else rec.resolve(frame.result);
+				return true;
+			}
 			if (rec.kind === "prompt" || rec.params) {
 				this.noteTurnSettled(frame);
 				this.settleTurn(frame.id, frame.result?.stopReason);
@@ -3747,6 +3799,111 @@ class ExtSurface {
 		this.internalIds.set(id, { kind: "internal" });
 		this.outToAgent.push({ jsonrpc: "2.0", id, method, params });
 		return id;
+	}
+
+	/**
+	 * Emit an adapter-internal request and await its response. The response is
+	 * consumed adapter-side (never reaches the pager); the promise resolves
+	 * with `frame.result` or rejects on `frame.error`.
+	 */
+	requestAgent(method, params) {
+		const id = `xai-int-${++this.internalSeq}`;
+		return new Promise((resolve, reject) => {
+			this.internalIds.set(id, { kind: "awaited", resolve, reject });
+			this.outToAgent.push({ jsonrpc: "2.0", id, method, params });
+		});
+	}
+
+	// -- startup catalog prefetch ---------------------------------------------
+	//
+	// OMP only advertises its slash catalog per-session (~50ms after
+	// session/new). With a cold acp-commands.json the first-ever launch would
+	// otherwise answer initialize with no catalog and the first `/` keystroke
+	// completes builtins only. So on a cold cache the adapter holds the
+	// initialize response, opens a throwaway session to harvest its bootstrap
+	// ACU, closes it (deleting the session file so history stays clean), then
+	// answers initialize with the catalog injected.
+
+	/** True when the initialize response should be held for a catalog prefetch. */
+	shouldPrefetchCatalog() {
+		return this.commands.length === 0 && !this.prefetch;
+	}
+
+	/**
+	 * Hold the initialize response and start the prefetch. `cwd` is the
+	 * adapter's own cwd — the pager hasn't told us its cwd yet, and the
+	 * catalog is cwd-independent for builtins (file commands are re-advertised
+	 * by the real session's ACU anyway).
+	 */
+	startCatalogPrefetch(cwd) {
+		const prefetch = { sid: null, timer: null, done: false };
+		this.prefetch = prefetch;
+		prefetch.timer = setTimeout(() => this.finishCatalogPrefetch(), 1500);
+		this.requestAgent("session/new", { cwd, mcpServers: [] })
+			.then((result) => {
+				if (prefetch.done) {
+					// Timed out already: still close the orphan so it can't linger.
+					const sid = result?.sessionId;
+					if (sid) {
+						this.requestAgent("session/close", { sessionId: sid }).finally(() => deleteSessionFile(sid));
+					}
+					return;
+				}
+				prefetch.sid = result?.sessionId ?? null;
+				// If the ACU beat the response (shouldn't happen — OMP guards the
+				// bootstrap race), finish now.
+				if (this.commands.length > 0) this.finishCatalogPrefetch();
+			})
+			.catch(() => this.finishCatalogPrefetch());
+	}
+
+	/**
+	 * Consume a session/update notification belonging to the prefetch session.
+	 * Returns true when the frame was absorbed (never forward prefetch traffic
+	 * to the pager — it never asked for that session).
+	 */
+	consumePrefetchUpdate(frame) {
+		if (frame?.method !== "session/update") return false;
+		const sid = frame.params?.sessionId;
+		// Trailing updates from an already-closed prefetch session stay absorbed.
+		if (typeof sid === "string" && this.prefetchSids.has(sid)) return true;
+		if (!this.prefetch) return false;
+		// During prefetch the only session that can exist is the throwaway one —
+		// the pager can't session/new before its held initialize resolves, so
+		// any session/update is prefetch traffic even if the sid hasn't been
+		// recorded yet.
+		if (this.prefetch.sid && sid !== this.prefetch.sid) return false;
+		if (!this.prefetch.sid && typeof sid === "string") this.prefetch.sid = sid;
+		const update = frame.params?.update;
+		if (update?.sessionUpdate === "available_commands_update") {
+			this.commands = update.availableCommands ?? [];
+			writeCommandCache(this.commands);
+			this.finishCatalogPrefetch();
+		}
+		return true;
+	}
+
+	/**
+	 * End the prefetch exactly once: close the throwaway session, stamp the
+	 * held initialize response with whatever catalog we have, and release it.
+	 */
+	finishCatalogPrefetch() {
+		const prefetch = this.prefetch;
+		if (!prefetch || prefetch.done) return;
+		prefetch.done = true;
+		clearTimeout(prefetch.timer);
+		this.prefetch = null;
+		const sid = prefetch.sid;
+		if (sid) {
+			this.prefetchSids.add(sid);
+			this.requestAgent("session/close", { sessionId: sid }).finally(() => deleteSessionFile(sid));
+		}
+		const held = this.heldInitialize;
+		this.heldInitialize = null;
+		if (held) {
+			const extras = this.observeToClient(held);
+			this.onInitializeReady?.(held, extras);
+		}
 	}
 
 	/** Refresh the session-list cache via an internal session/list request. */
@@ -4678,6 +4835,13 @@ async function runLive(opts) {
 			return;
 		}
 
+		// Catalog prefetch traffic (throwaway session) is absorbed adapter-side —
+		// the pager never asked for that session.
+		if (ext.consumePrefetchUpdate(frame)) {
+			drainExt();
+			return;
+		}
+
 		// OMP's elicitation/create (ask tool, plan approval) is standard ACP the
 		// pager can't decode; bridge it to the pager's private question views.
 		if (frame.method === "elicitation/create" && frame.id !== undefined) {
@@ -4704,6 +4868,28 @@ async function runLive(opts) {
 			pendingLoadSession.delete(frame.id);
 			pendingReplays.delete(frame.id);
 		}
+		// Cold-cache first launch: hold the initialize response while a
+		// throwaway session harvests the real catalog, so the pager's bootstrap
+		// `_meta.availableCommands` is populated even on the very first run.
+		if (
+			frame.result?.protocolVersion !== undefined &&
+			frame.result?.agentInfo &&
+			ext.shouldPrefetchCatalog()
+		) {
+			ext.heldInitialize = frame;
+			ext.onInitializeReady = (held, heldExtras) => {
+				tape?.record("to_client", held);
+				forward(held);
+				for (const extra of heldExtras) {
+					tape?.record("to_client", extra);
+					forward(extra);
+				}
+			};
+			ext.startCatalogPrefetch(process.cwd());
+			drainExt();
+			return;
+		}
+
 		if (opts.shape) {
 			const change = shapeToClient(frame);
 			if (change) log(`shaped ${change}`);

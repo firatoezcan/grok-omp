@@ -2998,6 +2998,45 @@ mod tests {
         assert_eq!(order, vec!["/acp-one", "/acp-two", "/alpha", "/bravo"]);
     }
 
+    /// The disabled gate (Settings › OMP) removes a command's triggers
+    /// entirely — the reordered empty-query menu must still omit it, not
+    /// resurface it at the top of the ACP band.
+    #[test]
+    fn empty_query_omits_disabled_acp_commands() {
+        let mut ctrl = tie_controller(&["alpha"], &[]);
+        ctrl.registry_mut().set_acp_commands(&[
+            agent_client_protocol::AvailableCommand::new(
+                "acp-one".to_string(),
+                String::new(),
+            ),
+            agent_client_protocol::AvailableCommand::new(
+                "acp-two".to_string(),
+                String::new(),
+            ),
+        ]);
+        ctrl.registry_mut()
+            .set_disabled_commands(&["acp-one".to_string()]);
+        let state = SlashState::default();
+        let models = ModelState::default();
+
+        ctrl.refresh(&state, "/", 1, &models);
+
+        let order: Vec<String> = state
+            .snapshot()
+            .matches
+            .iter()
+            .map(|r| r.display.clone())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["/acp-two", "/alpha"],
+            "disabled ACP command must not appear even at the top of the menu"
+        );
+        // The disabled name still resolves for dispatch gating (is_disabled),
+        // it just emits no trigger.
+        assert!(ctrl.registry().is_disabled("acp-one"));
+    }
+
     /// Recency still wins inside each band: a recently used builtin outranks
     /// other builtins, a recently used ACP command outranks other ACP commands.
     #[test]
