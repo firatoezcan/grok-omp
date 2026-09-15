@@ -2902,6 +2902,20 @@ pub(super) fn render_setting_row(
     } else {
         0
     };
+    // Clamp the value to the space left of the chevron column. Without this a
+    // value wider than the row (e.g. a long agent-command path on an Info row)
+    // fails the `value_x + value_w <= right edge` paint guard below and renders
+    // as a blank line — the row looks unset even though a value exists.
+    let value_max_w = area
+        .width
+        .saturating_sub(ROW_RIGHT_PAD_W + ROW_CHEVRON_COL_W + 1);
+    let value_text_owned: String;
+    let value_text: &str = if value_text.width() as u16 > value_max_w {
+        value_text_owned = truncate_str(value_text, value_max_w as usize);
+        &value_text_owned
+    } else {
+        value_text
+    };
     let value_w = value_text.width() as u16;
 
     // Pill only while expanded: change-time feedback is the toast's job, and a collapsed non-default row would misread as "restart pending" forever

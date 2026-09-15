@@ -12,7 +12,9 @@ import { join, resolve } from "node:path";
 const REPO = resolve(import.meta.dir, "..");
 const PAGER = process.env.GROK_PAGER_BIN ?? join(REPO, "target/debug/xai-grok-pager");
 const ADAPTER = join(REPO, "bridge", "adapter.mjs");
-const STUB = join(REPO, "bridge", "omp-stub-agent.mjs");
+// Relative path: the adapter stamps this verbatim as _meta.ompAgentCommand and
+// the Settings › OMP "Agent command" row must render it inside the modal width.
+const STUB = "bridge/omp-stub-agent.mjs";
 const BUN = process.env.OMP_BRIDGE_BUN ?? "bun";
 
 const tc = await TerminalControl.make({ cwd: REPO });
@@ -42,11 +44,15 @@ try {
 	await session.screen.waitForText(/Settings/i, { timeoutMs: 8000 });
 	await session.screen.waitForIdle({ timeoutMs: 8000, quietForMs: 600 });
 	await session.keyboard.type("/", { paceMs: 30 });
-	await session.keyboard.type("omp", { paceMs: 30 });
+	// Filter by "oh-my-pi", not "omp": "omp" substring-matches dozens of rows
+	// (c-omp-act, pr-omp-t, …) and pushes the OMP section — the last category —
+	// below the viewport fold. "oh-my-pi" is a keyword unique to OMP rows, so
+	// only that section renders and every row fits on screen.
+	await session.keyboard.type("oh-my-pi", { paceMs: 30 });
 	await session.screen.waitForIdle({ timeoutMs: 8000, quietForMs: 600 });
 
 	const { text } = await session.screen.capture({ settleMs: 800, deadlineMs: 8000, allowIncomplete: true });
-	console.log("=== SETTINGS (filter: omp) ===\n" + text);
+	console.log("=== SETTINGS (filter: oh-my-pi) ===\n" + text);
 
 	const checks = {
 		"OMP section header": /\bOMP\b/.test(text),

@@ -107,24 +107,26 @@ const checks = {
 	},
 
 	/**
-	 * C2 — the edit tool row renders its diff hunk: below the title row, the
-	 * removed line ("beta") and the added line ("BETA") both appear.
+	 * C2 — the edit tool row renders its diff hunk: the removed line ("beta")
+	 * and the added line ("BETA") both appear. The tape's edit call carries no
+	 * `locations`/`path` (hashline `rawInput.input`), so the pager renders the
+	 * hunk without a title header — assert the hunk itself, not a title row.
 	 */
 	async c2(tc) {
+		// The tape was recorded with cwd=/tmp/edit-cwd; the pager refuses a
+		// non-existent session cwd, so recreate the scratch dir first.
+		mkdirSync("/tmp/edit-cwd", { recursive: true });
 		const session = await runTurn(tc, "edit-diff.acptape", "run", { cwd: "/tmp/edit-cwd" });
 		try {
 			await session.screen.waitForText("done", { timeoutMs: 30_000 });
 			await settlePastSeed(session);
 			const snap = await session.screen.capture({ settleMs: 500, deadlineMs: 10_000 });
 			const rows = rowsOf(snap.frame);
-			const titleRow = rows.find((r) => r.text.includes("Changing beta to BETA"));
-			if (!titleRow) return { pass: false, detail: "edit title row not rendered" };
-			const below = rows.filter((r) => r.y > titleRow.y);
-			const hasOld = below.some((r) => r.text.includes("beta") && !r.text.includes("BETA"));
-			const hasNew = below.some((r) => r.text.includes("BETA"));
+			const hasOld = rows.some((r) => /\bbeta\b/.test(r.text) && !r.text.includes("BETA"));
+			const hasNew = rows.some((r) => r.text.includes("BETA"));
 			return {
 				pass: snap.reason === "idle" && hasOld && hasNew,
-				detail: `reason=${snap.reason} oldLine=${hasOld} newLine=${hasNew} titleY=${titleRow.y}`,
+				detail: `reason=${snap.reason} oldLine=${hasOld} newLine=${hasNew}`,
 			};
 		} finally {
 			await session.stop();

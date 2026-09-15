@@ -41,7 +41,12 @@ process.stdin.on("data", (c) => {
     const m = JSON.parse(line);
     if (m.method === "initialize") send({ jsonrpc: "2.0", id: m.id, result: { protocolVersion: 1, agentCapabilities: {}, authMethods: [{ id: "agent", name: "agent" }] } });
     else if (m.method === "authenticate") send({ jsonrpc: "2.0", id: m.id, result: {} });
-    else if (m.method === "session/new") send({ jsonrpc: "2.0", id: m.id, result: { sessionId: "stub-sess-1", modes: { currentModeId: "default", availableModes: [{ id: "default" }, { id: "plan" }] } } });
+    else if (m.method === "session/new") {
+      send({ jsonrpc: "2.0", id: m.id, result: { sessionId: "stub-sess-1", modes: { currentModeId: "default", availableModes: [{ id: "default" }, { id: "plan" }] } } });
+      // Real OMP pushes its slash catalog ~50ms after session/new; the adapter
+      // parks commands/list until it lands, so the stub must emit it.
+      setTimeout(() => upd("stub-sess-1", { sessionUpdate: "available_commands_update", availableCommands: [{ name: "security", description: "Run a security review" }, { name: "review", description: "Review the diff" }] }), 50);
+    }
     else if (m.method === "session/prompt") {
       const text = m.params?.prompt?.[0]?.text ?? "";
       const sessionId = m.params?.sessionId;
