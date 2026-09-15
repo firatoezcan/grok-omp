@@ -240,12 +240,16 @@ function readTape(path) {
 
 /**
  * Rewrite the client's advertised capabilities so OMP's ClientBridge never
- * routes file or terminal work back through the pager. Mutates `frame`.
- * @returns {string[]} names of the capabilities removed, for the log
+ * routes file or terminal work back through the pager, and so OMP knows the
+ * adapter can field interactive prompts: `elicitation.form`/`url` requests
+ * are bridged to the pager's private question/elicit cards (see
+ * bridgeElicitation), which is a real capability of this stack even though
+ * the pager itself cannot decode `elicitation/create`. Mutates `frame`.
+ * @returns {{removed: string[], added: string[]}} capability deltas, for the log
  */
 function applyHygiene(frame) {
 	const caps = frame?.params?.clientCapabilities;
-	if (!caps || typeof caps !== "object") return [];
+	if (!caps || typeof caps !== "object") return { removed: [], added: [] };
 	const removed = [];
 	if (caps.fs !== undefined) {
 		delete caps.fs;
@@ -260,7 +264,21 @@ function applyHygiene(frame) {
 		removed.push("auth.terminal");
 		if (Object.keys(caps.auth).length === 0) delete caps.auth;
 	}
-	return removed;
+	const added = [];
+	if (caps.elicitation === undefined) {
+		caps.elicitation = { form: {}, url: {} };
+		added.push("elicitation.form", "elicitation.url");
+	} else if (typeof caps.elicitation === "object") {
+		if (caps.elicitation.form === undefined) {
+			caps.elicitation.form = {};
+			added.push("elicitation.form");
+		}
+		if (caps.elicitation.url === undefined) {
+			caps.elicitation.url = {};
+			added.push("elicitation.url");
+		}
+	}
+	return { removed, added };
 }
 
 // ---------------------------------------------------------------------------
@@ -723,6 +741,16 @@ function schemaPropToQuestion(key, prop, message) {
 			question,
 			options: prop.enum.map((v) => ({ label: String(v), description: "" })),
 			multiSelect: false,
+			id: key,
+		};
+	}
+	// Multi-select: an array prop whose items enumerate the choices maps onto
+	// the question view's multi-select mode; answers go back as a string array.
+	if (prop.type === "array" && Array.isArray(prop.items?.enum) && prop.items.enum.length) {
+		return {
+			question,
+			options: prop.items.enum.map((v) => ({ label: String(v), description: "" })),
+			multiSelect: true,
 			id: key,
 		};
 	}
@@ -4187,7 +4215,12 @@ class ExtSurface {
 				const labels = answers[qText];
 				const first = Array.isArray(labels) ? labels[0] : labels;
 				const notes = annotations[qText]?.notes;
-				if (prop?.type === "boolean") {
+				if (prop?.type === "array") {
+					// Multi-select: the schema wants a string array, so keep the
+					// label list verbatim even when only one option was picked.
+					const list = Array.isArray(labels) ? labels : labels !== undefined ? [labels] : undefined;
+					if (list !== undefined) content[key] = list;
+				} else if (prop?.type === "boolean") {
 					const v = first ?? notes;
 					if (v !== undefined) content[key] = v === "Yes" || v === "true" || v === true;
 				} else if (prop?.type === "number" || prop?.type === "integer") {
@@ -4719,8 +4752,9 @@ async function runLive(opts) {
 		}
 
 		if (opts.hygiene && frame.method === "initialize") {
-			const removed = applyHygiene(frame);
+			const { removed, added } = applyHygiene(frame);
 			if (removed.length) log(`capability hygiene: removed ${removed.join(", ")} from initialize`);
+			if (added.length) log(`capability hygiene: added ${added.join(", ")} to initialize`);
 		}
 		if (!opts.mcp && frame.method === "session/new" && frame.params?.mcpServers !== undefined) {
 			// OMP reads `params.mcpServers.length` unguarded — deleting the field
@@ -4859,6 +4893,24 @@ async function runLive(opts) {
 			}
 			// Unrepresentable schema: forward verbatim → method_not_found → OMP
 			// auto-approves, same as a client without elicitation.form.
+		}
+
+		// OMP's `elicitation/complete` dismisses a URL-mode elicitation after the
+		// user finished the external flow. The bridged card waits on the pager's
+		// private `_x.ai/mcp/elicit_complete`; translate so it actually closes.
+		if (frame.method === "elicitation/complete" && frame.id === undefined) {
+			const p = frame.params ?? {};
+			if (typeof p.sessionId === "string" && typeof p.elicitationId === "string") {
+				const translated = ext.notif("_x.ai/mcp/elicit_complete", {
+					sessionId: p.sessionId,
+					elicitationId: p.elicitationId,
+					serverName: "omp",
+				});
+				tape?.record("to_client", translated);
+				forward(translated);
+			}
+			drainExt();
+			return;
 		}
 
 		// Attach the advisor tailer once a session is known: session/new and
