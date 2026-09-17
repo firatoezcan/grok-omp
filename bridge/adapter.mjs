@@ -722,6 +722,25 @@ function actionOutcome(status, message, requiresReload = false) {
 }
 
 /**
+ * OMP's askDialog encodes choices as oneOf/anyOf `{const, title, description}`
+ * entries rather than a plain `enum`. Lift them into the pager's option list;
+ * `values` maps each displayed label back to its schema `const` when the two
+ * differ, so the response carries the value OMP validates against.
+ */
+function choiceList(entries) {
+	if (!Array.isArray(entries) || !entries.length) return null;
+	const options = [];
+	const values = new Map();
+	for (const e of entries) {
+		if (!e || typeof e !== "object" || e.const === undefined) return null;
+		const label = typeof e.title === "string" && e.title ? e.title : String(e.const);
+		options.push({ label, description: typeof e.description === "string" ? e.description : "" });
+		if (e.const !== label) values.set(label, e.const);
+	}
+	return { options, values };
+}
+
+/**
  * One JSON-schema property → one pager Question. Returns null when the shape
  * can't be represented (caller falls through to verbatim forwarding, which
  * yields method_not_found → OMP auto-approve, same as no elicitation.form).
@@ -744,15 +763,22 @@ function schemaPropToQuestion(key, prop, message) {
 			id: key,
 		};
 	}
+	// OMP's askDialog encodes single choice as oneOf and multi choice as
+	// array+items.anyOf, both with {const,title,description} entries.
+	const single = choiceList(prop.oneOf ?? prop.anyOf);
+	if (single) {
+		return { question, options: single.options, multiSelect: false, id: key, values: single.values };
+	}
 	// Multi-select: an array prop whose items enumerate the choices maps onto
 	// the question view's multi-select mode; answers go back as a string array.
-	if (prop.type === "array" && Array.isArray(prop.items?.enum) && prop.items.enum.length) {
-		return {
-			question,
-			options: prop.items.enum.map((v) => ({ label: String(v), description: "" })),
-			multiSelect: true,
-			id: key,
-		};
+	if (prop.type === "array") {
+		const multi =
+			(Array.isArray(prop.items?.enum) && prop.items.enum.length
+				? { options: prop.items.enum.map((v) => ({ label: String(v), description: "" })), values: new Map() }
+				: null) ?? choiceList(prop.items?.anyOf ?? prop.items?.oneOf);
+		if (multi) {
+			return { question, options: multi.options, multiSelect: true, id: key, values: multi.values };
+		}
 	}
 	if (prop.type === "boolean") {
 		return {
@@ -4168,15 +4194,23 @@ class ExtSurface {
 		if (props && typeof props === "object") {
 			const questions = [];
 			const keyByQuestion = new Map();
+			const constByQuestion = new Map();
 			for (const [key, prop] of Object.entries(props)) {
+				// OMP's askDialog adds a `<key>__other` freeform prop per question;
+				// the pager's question view already appends its own "Other" row,
+				// so rendering it as a second question would double the card.
+				// elicitResultToOmp folds the typed text back into this key.
+				if (key.endsWith("__other") && props[key.slice(0, -7)]) continue;
 				const q = schemaPropToQuestion(key, prop, p.message);
 				if (!q) return null;
+				if (q.values?.size) constByQuestion.set(q.question, q.values);
+				delete q.values;
 				questions.push(q);
 				// The pager keys answers/annotations by question text, not id.
 				keyByQuestion.set(q.question, key);
 			}
 			if (!questions.length) return null;
-			this.bridgedElicits.set(pagerId, { ompId: frame.id, kind: "ask", props, keyByQuestion });
+			this.bridgedElicits.set(pagerId, { ompId: frame.id, kind: "ask", props, keyByQuestion, constByQuestion });
 			return {
 				jsonrpc: "2.0",
 				id: pagerId,
@@ -4211,15 +4245,27 @@ class ExtSurface {
 			const answers = result.answers ?? {};
 			const annotations = result.annotations ?? {};
 			for (const [key, prop] of Object.entries(rec.props ?? {})) {
+				// `__other` companions were folded into their base question at
+				// bridge time; they're written from the base prop's pass below.
+				if (key.endsWith("__other") && rec.props[key.slice(0, -7)]) continue;
 				const qText = [...(rec.keyByQuestion?.entries() ?? [])].find(([, k]) => k === key)?.[0] ?? key;
 				const labels = answers[qText];
 				const first = Array.isArray(labels) ? labels[0] : labels;
 				const notes = annotations[qText]?.notes;
+				const toConst = (v) => rec.constByQuestion?.get(qText)?.get(v) ?? v;
+				// OMP's askDialog reads custom text from `<key>__other`; the
+				// pager reports it as an "Other" selection + notes.
+				const otherKey = `${key}__other`;
+				const hasOther = rec.props[otherKey] !== undefined;
 				if (prop?.type === "array") {
 					// Multi-select: the schema wants a string array, so keep the
 					// label list verbatim even when only one option was picked.
-					const list = Array.isArray(labels) ? labels : labels !== undefined ? [labels] : undefined;
-					if (list !== undefined) content[key] = list;
+					let list = Array.isArray(labels) ? labels : labels !== undefined ? [labels] : undefined;
+					if (hasOther && notes !== undefined && list?.includes("Other")) {
+						list = list.filter((l) => l !== "Other");
+						content[otherKey] = notes;
+					}
+					if (list !== undefined && list.length) content[key] = list.map(toConst);
 				} else if (prop?.type === "boolean") {
 					const v = first ?? notes;
 					if (v !== undefined) content[key] = v === "Yes" || v === "true" || v === true;
@@ -4227,13 +4273,17 @@ class ExtSurface {
 					const raw = first === "Other" ? notes : (first ?? notes);
 					const n = Number(raw);
 					if (raw !== undefined && Number.isFinite(n)) content[key] = n;
+				} else if (hasOther && first === "Other" && notes !== undefined) {
+					// Single-choice "Other": OMP expects the typed text under
+					// `__other` and the base prop unset (customInput wins).
+					content[otherKey] = notes;
 				} else {
 					// Freeform answers arrive as labels:["Other"] + notes holding
 					// the typed text — prefer notes in that case.
 					const v = first === "Other" && notes !== undefined
 						? notes
-						: (Array.isArray(labels) && labels.length > 1 ? labels : first) ?? notes;
-					if (v !== undefined) content[key] = v;
+						: (Array.isArray(labels) && labels.length > 1 ? labels : toConst(first)) ?? notes;
+					if (v !== undefined) content[key] = Array.isArray(v) ? v.map(toConst) : v;
 				}
 			}
 			return { action: "accept", content };
