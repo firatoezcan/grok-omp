@@ -2226,6 +2226,9 @@ class ExtSurface {
 		this.internalIds = new Map();
 		/** pager request id → {ompId, kind, prop} for bridged elicitations. */
 		this.bridgedElicits = new Map();
+		/** OMP elicitationId → pager request id, for `elicitation/complete`
+		 *  retraction of still-unanswered bridged cards. */
+		this.elicitIds = new Map();
 		this.internalSeq = 0;
 		/** Client-bound frames to emit after the current one. */
 		this.outToClient = [];
@@ -3711,6 +3714,7 @@ class ExtSurface {
 		const rec = this.bridgedElicits.get(frame.id);
 		if (!rec) return null;
 		this.bridgedElicits.delete(frame.id);
+		if (rec.elicitationId !== undefined) this.elicitIds.delete(rec.elicitationId);
 		const result = frame.error !== undefined ? { action: "cancel" } : this.elicitResultToOmp(rec, frame.result);
 		return { jsonrpc: "2.0", id: rec.ompId, result };
 	}
@@ -4163,7 +4167,8 @@ class ExtSurface {
 		// OMP's plan approval: a select over ["Approve and execute","Refine plan"]
 		// on an "Approve plan …" message → the pager's plan-approval view.
 		if (enumVals?.includes("Approve and execute") && typeof p.message === "string" && p.message.startsWith("Approve plan")) {
-			this.bridgedElicits.set(pagerId, { ompId: frame.id, kind: "plan" });
+			this.bridgedElicits.set(pagerId, { ompId: frame.id, kind: "plan", elicitationId: p.elicitationId });
+			if (typeof p.elicitationId === "string") this.elicitIds.set(p.elicitationId, pagerId);
 			return {
 				jsonrpc: "2.0",
 				id: pagerId,
@@ -4173,7 +4178,8 @@ class ExtSurface {
 		}
 
 		if (p.mode === "url" && typeof p.url === "string") {
-			this.bridgedElicits.set(pagerId, { ompId: frame.id, kind: "mcp" });
+			this.bridgedElicits.set(pagerId, { ompId: frame.id, kind: "mcp", elicitationId: p.elicitationId ?? pagerId });
+			this.elicitIds.set(p.elicitationId ?? pagerId, pagerId);
 			return {
 				jsonrpc: "2.0",
 				id: pagerId,
@@ -4209,8 +4215,8 @@ class ExtSurface {
 				// The pager keys answers/annotations by question text, not id.
 				keyByQuestion.set(q.question, key);
 			}
-			if (!questions.length) return null;
-			this.bridgedElicits.set(pagerId, { ompId: frame.id, kind: "ask", props, keyByQuestion, constByQuestion });
+			this.bridgedElicits.set(pagerId, { ompId: frame.id, kind: "ask", props, keyByQuestion, constByQuestion, elicitationId: p.elicitationId });
+			if (typeof p.elicitationId === "string") this.elicitIds.set(p.elicitationId, pagerId);
 			return {
 				jsonrpc: "2.0",
 				id: pagerId,
@@ -4945,12 +4951,15 @@ async function runLive(opts) {
 			// auto-approves, same as a client without elicitation.form.
 		}
 
-		// OMP's `elicitation/complete` dismisses a URL-mode elicitation after the
-		// user finished the external flow. The bridged card waits on the pager's
-		// private `_x.ai/mcp/elicit_complete`; translate so it actually closes.
+		// OMP's `elicitation/complete` dismisses an elicitation after the agent
+		// stopped awaiting it: a URL-mode card whose external flow finished, or
+		// any bridged card the caller aborted (e.g. the OAuth manual-code prompt
+		// once the loopback redirect already authenticated).
 		if (frame.method === "elicitation/complete" && frame.id === undefined) {
 			const p = frame.params ?? {};
 			if (typeof p.sessionId === "string" && typeof p.elicitationId === "string") {
+				// Waiting-stage URL cards close on the pager's private
+				// `_x.ai/mcp/elicit_complete`; translate so it actually closes.
 				const translated = ext.notif("_x.ai/mcp/elicit_complete", {
 					sessionId: p.sessionId,
 					elicitationId: p.elicitationId,
@@ -4958,6 +4967,23 @@ async function runLive(opts) {
 				});
 				tape?.record("to_client", translated);
 				forward(translated);
+				// A still-unanswered bridged card (URL consent, question, plan)
+				// is retracted via the pager's generic interaction-resolved
+				// dismissal, and OMP's pending `elicitation/create` is answered
+				// `cancel` so nothing keeps waiting on it.
+				const pagerId = ext.elicitIds.get(p.elicitationId);
+				const rec = pagerId !== undefined ? ext.bridgedElicits.get(pagerId) : undefined;
+				if (pagerId !== undefined && rec) {
+					ext.bridgedElicits.delete(pagerId);
+					ext.elicitIds.delete(p.elicitationId);
+					const dismiss = ext.notif("_x.ai/session/update", {
+						sessionId: p.sessionId,
+						update: { sessionUpdate: "interaction_resolved", tool_call_id: pagerId },
+					});
+					tape?.record("to_client", dismiss);
+					forward(dismiss);
+					ext.outToAgent.push({ jsonrpc: "2.0", id: rec.ompId, result: { action: "cancel" } });
+				}
 			}
 			drainExt();
 			return;
